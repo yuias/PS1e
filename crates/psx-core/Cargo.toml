@@ -1,0 +1,9 @@
+[package]
+name = "psx-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Platform-independent PlayStation 1 emulator core"
+
+[dependencies]
+tracing.workspace = true

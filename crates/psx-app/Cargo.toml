@@ -1,0 +1,12 @@
+[package]
+name = "psx-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native PS1e frontend: egui debug shell on wgpu"
+
+[dependencies]
+psx-core = { path = "../psx-core" }
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+eframe = { version = "0.32", features = ["wgpu"] }
