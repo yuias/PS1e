@@ -1,36 +1,81 @@
-//! SPU register skeleton.
+//! SPU: 24-voice ADPCM synthesizer.
 //!
-//! No audio is produced yet. This models just enough for sound drivers to
-//! make progress: a raw register file (writes read back), SPU RAM with
-//! manual/DMA transfers, SPUSTAT mirroring SPUCNT, and IRQ9 generation.
+//! Implements voice playback (ADPCM block decoding, pitch stepping, ADSR
+//! envelopes per the PSX-SPX rate algorithm), key on/off/ENDX, main volume,
+//! manual/DMA RAM transfers, and IRQ9 both from transfer writes and from a
+//! voice fetching the IRQ address (sound drivers use a looping voice over
+//! the IRQ address as their tick).
 //!
-//! IRQ9 sources modeled:
-//! - a transfer write landing on the IRQ address (exact), and
-//! - a periodic "heartbeat" while the IRQ is enabled and voices are keyed
-//!   on — approximating a looping voice crossing the IRQ address, which
-//!   sound drivers (e.g. Namco's) use as their tick. Real voice address
-//!   progression replaces this once the SPU mixes audio.
+//! Not yet modeled: reverb, noise generator, pitch modulation (FM), volume
+//! sweeps (treated as fixed max), gaussian interpolation (nearest sample),
+//! and CD-audio mixing.
 
 use crate::bus::Irq;
+use std::collections::VecDeque;
 use tracing::{debug, trace};
 
 pub const SPU_RAM_SIZE: usize = 512 * 1024;
-
-/// ~480 Hz heartbeat: fast enough for driver ticks, slow enough to be cheap.
-const HEARTBEAT_CYCLES: u64 = 70_000;
+/// One output sample every 768 CPU cycles = 44100 Hz.
+pub const CYCLES_PER_SAMPLE: u64 = 768;
 
 const REG_BASE: u32 = 0x1f80_1c00;
+/// Keep at most ~1.5s of audio buffered so headless runs stay bounded.
+const OUTPUT_CAP: usize = 65536 * 2;
+
+const ADPCM_POS: [i32; 5] = [0, 60, 115, 98, 122];
+const ADPCM_NEG: [i32; 5] = [0, 0, -52, -55, -60];
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Phase {
+    Off,
+    Attack,
+    Decay,
+    Sustain,
+    Release,
+}
+
+#[derive(Clone)]
+struct Voice {
+    /// Current ADPCM block address (byte address in SPU RAM).
+    cur_addr: u32,
+    /// Loop return address captured from the loop-start flag (byte address).
+    repeat_addr: u32,
+    /// 4.12 fixed-point position within the decoded block.
+    pitch_counter: u32,
+    decoded: [i16; 28],
+    hist: (i32, i32),
+    phase: Phase,
+    /// 15-bit envelope level.
+    adsr_vol: i32,
+    /// Samples until the next envelope step.
+    env_wait: u32,
+}
+
+impl Default for Voice {
+    fn default() -> Self {
+        Self {
+            cur_addr: 0,
+            repeat_addr: 0,
+            pitch_counter: 0,
+            decoded: [0; 28],
+            hist: (0, 0),
+            phase: Phase::Off,
+            adsr_vol: 0,
+            env_wait: 0,
+        }
+    }
+}
 
 pub struct Spu {
     /// Raw 16-bit register file for 0x1f801c00..0x1f801e00.
     regs: [u16; 0x100],
     pub ram: Box<[u8]>,
-    /// Current transfer address in bytes (register value is in 8-byte units).
+    voices: Vec<Voice>,
+    endx: u32,
     xfer_addr: u32,
     irq_flag: bool,
-    /// Bitmask of voices currently keyed on (24 voices).
-    voices_on: u32,
-    next_heartbeat: u64,
+    /// Interleaved stereo output, drained by the frontend.
+    output: VecDeque<i16>,
 }
 
 impl Spu {
@@ -38,15 +83,35 @@ impl Spu {
         Self {
             regs: [0; 0x100],
             ram: vec![0; SPU_RAM_SIZE].into_boxed_slice(),
+            voices: vec![Voice::default(); 24],
+            endx: 0,
             xfer_addr: 0,
             irq_flag: false,
-            voices_on: 0,
-            next_heartbeat: 0,
+            output: VecDeque::new(),
         }
     }
 
+    /// Move buffered samples out (interleaved stereo i16).
+    pub fn drain_output(&mut self, out: &mut Vec<i16>) {
+        out.extend(self.output.drain(..));
+    }
+
+    pub fn buffered_samples(&self) -> usize {
+        self.output.len() / 2
+    }
+
+    // --- Register helpers ---------------------------------------------
+
+    fn reg(&self, ofs: usize) -> u16 {
+        self.regs[ofs / 2]
+    }
+
+    fn voice_reg(&self, v: usize, ofs: usize) -> u16 {
+        self.reg(v * 0x10 + ofs)
+    }
+
     fn spucnt(&self) -> u16 {
-        self.regs[(0x1aa) / 2]
+        self.reg(0x1aa)
     }
 
     fn irq_enabled(&self) -> bool {
@@ -55,7 +120,7 @@ impl Spu {
     }
 
     fn irq_addr(&self) -> u32 {
-        self.regs[(0x1a4) / 2] as u32 * 8
+        self.reg(0x1a4) as u32 * 8
     }
 
     fn raise_irq(&mut self, irq: &mut Irq) {
@@ -66,26 +131,32 @@ impl Spu {
         irq.raise(9);
     }
 
-    /// Periodic heartbeat while voices play (see module docs).
-    pub fn tick(&mut self, now: u64, irq: &mut Irq) {
-        if now < self.next_heartbeat {
-            return;
-        }
-        self.next_heartbeat = now + HEARTBEAT_CYCLES;
-        if self.irq_enabled() && self.voices_on != 0 {
-            self.raise_irq(irq);
+    /// Volume register: sweep mode (bit 15) is approximated as full volume.
+    fn volume(reg: u16) -> i32 {
+        if reg & 0x8000 != 0 {
+            0x7fff
+        } else {
+            ((reg as i16) << 1) as i32
         }
     }
+
+    // --- MMIO ----------------------------------------------------------
 
     pub fn read16(&mut self, p: u32) -> u16 {
         let ofs = (p - REG_BASE) as usize;
         match ofs {
+            // Voice current ADSR volume
+            _ if ofs < 0x180 && ofs & 0xf == 0xc => {
+                self.voices[ofs >> 4].adsr_vol as u16
+            }
+            // Voice repeat address (live: updated by loop-start flags)
+            _ if ofs < 0x180 && ofs & 0xf == 0xe => {
+                (self.voices[ofs >> 4].repeat_addr / 8) as u16
+            }
+            0x19c => self.endx as u16,
+            0x19e => (self.endx >> 16) as u16,
             // SPUSTAT: low 6 bits mirror SPUCNT; bit 6 is the IRQ flag.
-            // Transfer-busy bits stay 0 (transfers complete instantly).
             0x1ae => (self.spucnt() & 0x3f) | (self.irq_flag as u16) << 6,
-            // Voice ADSR current volume: report silence so drivers never
-            // wait on a fading envelope
-            _ if ofs < 0x180 && ofs & 0xf == 0xc => 0,
             _ => self.regs[ofs / 2],
         }
     }
@@ -115,42 +186,217 @@ impl Spu {
                     self.irq_flag = false;
                 }
                 self.regs[ofs / 2] = val;
+                debug!(target: "psx_core::spu", "SPUCNT = {val:#06x}");
             }
-            0x188 => {
-                self.voices_on |= val as u32;
-                self.regs[ofs / 2] = val;
-            }
-            0x18a => {
-                self.voices_on |= (val as u32) << 16;
-                self.regs[ofs / 2] = val;
-            }
-            0x18c => {
-                self.voices_on &= !(val as u32);
-                self.regs[ofs / 2] = val;
-            }
-            0x18e => {
-                self.voices_on &= !((val as u32) << 16);
+            0x188 => self.key_on((val as u32) & 0xffff),
+            0x18a => self.key_on(((val as u32) << 16) & 0x00ff_0000),
+            0x18c => self.key_off((val as u32) & 0xffff),
+            0x18e => self.key_off(((val as u32) << 16) & 0x00ff_0000),
+            // Writing repeat address overrides the captured loop point
+            _ if ofs < 0x180 && ofs & 0xf == 0xe => {
+                self.voices[ofs >> 4].repeat_addr = val as u32 * 8;
                 self.regs[ofs / 2] = val;
             }
             _ => self.regs[ofs / 2] = val,
         }
-        if ofs == 0x1aa {
-            debug!(target: "psx_core::spu", "SPUCNT = {val:#06x}");
+    }
+
+    fn key_on(&mut self, mask: u32) {
+        for v in 0..24 {
+            if mask & (1 << v) == 0 {
+                continue;
+            }
+            let start = self.voice_reg(v, 0x6) as u32 * 8;
+            let voice = &mut self.voices[v];
+            voice.cur_addr = start;
+            voice.repeat_addr = start;
+            voice.pitch_counter = 0x1c << 12; // force first block fetch
+            voice.hist = (0, 0);
+            voice.phase = Phase::Attack;
+            voice.adsr_vol = 0;
+            voice.env_wait = 0;
+            self.endx &= !(1 << v);
+        }
+        if mask != 0 {
+            trace!(target: "psx_core::spu", "key on {mask:#08x}");
         }
     }
 
-    /// DMA channel 4: words to SPU RAM through the transfer address.
+    fn key_off(&mut self, mask: u32) {
+        for v in 0..24 {
+            if mask & (1 << v) != 0 && self.voices[v].phase != Phase::Off {
+                self.voices[v].phase = Phase::Release;
+                self.voices[v].env_wait = 0;
+            }
+        }
+    }
+
+    // --- DMA -----------------------------------------------------------
+
     pub fn dma_write_word(&mut self, w: u32, irq: &mut Irq) {
         self.write16(REG_BASE + 0x1a8, w as u16, irq);
         self.write16(REG_BASE + 0x1a8, (w >> 16) as u16, irq);
     }
 
-    /// DMA channel 4 reads (SPU RAM -> CPU), rarely used.
     pub fn dma_read_word(&mut self) -> u32 {
-        let a = (self.xfer_addr as usize) & (SPU_RAM_SIZE - 1);
-        let w = u32::from_le_bytes(self.ram[a & !3..(a & !3) + 4].try_into().unwrap());
+        let a = (self.xfer_addr as usize) & (SPU_RAM_SIZE - 1) & !3;
+        let w = u32::from_le_bytes(self.ram[a..a + 4].try_into().unwrap());
         self.xfer_addr = (self.xfer_addr + 4) & (SPU_RAM_SIZE as u32 - 1);
         w
+    }
+
+    // --- Mixing --------------------------------------------------------
+
+    /// Produce one stereo output sample (called every 768 CPU cycles).
+    pub fn generate_sample(&mut self, irq: &mut Irq) {
+        let mut mix_l = 0i32;
+        let mut mix_r = 0i32;
+        let enabled = self.spucnt() & (1 << 15) != 0;
+        let muted = self.spucnt() & (1 << 14) == 0;
+
+        for v in 0..24 {
+            if self.voices[v].phase == Phase::Off {
+                continue;
+            }
+            let sample = self.step_voice(v, irq);
+            let vol_l = Self::volume(self.voice_reg(v, 0x0));
+            let vol_r = Self::volume(self.voice_reg(v, 0x2));
+            mix_l += sample * vol_l >> 15;
+            mix_r += sample * vol_r >> 15;
+        }
+
+        let main_l = Self::volume(self.reg(0x180));
+        let main_r = Self::volume(self.reg(0x182));
+        let (mut l, mut r) = if enabled && !muted {
+            (mix_l * main_l >> 15, mix_r * main_r >> 15)
+        } else {
+            (0, 0)
+        };
+        l = l.clamp(-0x8000, 0x7fff);
+        r = r.clamp(-0x8000, 0x7fff);
+
+        if self.output.len() >= OUTPUT_CAP {
+            self.output.pop_front();
+            self.output.pop_front();
+        }
+        self.output.push_back(l as i16);
+        self.output.push_back(r as i16);
+    }
+
+    /// Advance one voice by one sample: pitch step, block decode, envelope.
+    fn step_voice(&mut self, v: usize, irq: &mut Irq) -> i32 {
+        // Pitch step (0x1000 = 44100 Hz), capped at 4x
+        let pitch = (self.voice_reg(v, 0x4) as u32).min(0x4000);
+        self.voices[v].pitch_counter += pitch;
+        while self.voices[v].pitch_counter >= 28 << 12 {
+            self.voices[v].pitch_counter -= 28 << 12;
+            self.fetch_block(v, irq);
+        }
+        let idx = (self.voices[v].pitch_counter >> 12) as usize;
+        let raw = self.voices[v].decoded[idx.min(27)] as i32;
+
+        self.tick_envelope(v);
+        raw * self.voices[v].adsr_vol >> 15
+    }
+
+    /// Decode the ADPCM block at the voice's current address, then apply
+    /// its loop flags and advance.
+    fn fetch_block(&mut self, v: usize, irq: &mut Irq) {
+        let addr = self.voices[v].cur_addr as usize & (SPU_RAM_SIZE - 1) & !0xf;
+        if self.irq_enabled() {
+            let ia = self.irq_addr() as usize;
+            if (addr..addr + 16).contains(&ia) {
+                self.raise_irq(irq);
+            }
+        }
+
+        let header = self.ram[addr];
+        let flags = self.ram[addr + 1];
+        let shift = (header & 0xf).min(12) as i32;
+        let filter = ((header >> 4) & 7).min(4) as usize;
+        let (mut h0, mut h1) = self.voices[v].hist;
+        for i in 0..28 {
+            let byte = self.ram[addr + 2 + i / 2];
+            let nibble = (byte >> ((i & 1) * 4)) & 0xf;
+            let s = (((nibble as i32) << 28) >> 28 << 12) >> shift;
+            let sample = (s + (h0 * ADPCM_POS[filter] + h1 * ADPCM_NEG[filter] + 32) / 64)
+                .clamp(-0x8000, 0x7fff);
+            self.voices[v].decoded[i] = sample as i16;
+            h1 = h0;
+            h0 = sample;
+        }
+        self.voices[v].hist = (h0, h1);
+
+        if flags & 0x4 != 0 {
+            // Loop start: capture the return point
+            self.voices[v].repeat_addr = addr as u32;
+        }
+        if flags & 0x1 != 0 {
+            // Loop end: jump to the loop point; without the repeat flag the
+            // voice is muted (envelope forced to release at zero)
+            self.endx |= 1 << v;
+            self.voices[v].cur_addr = self.voices[v].repeat_addr;
+            if flags & 0x2 == 0 {
+                self.voices[v].phase = Phase::Release;
+                self.voices[v].adsr_vol = 0;
+            }
+        } else {
+            self.voices[v].cur_addr = (addr as u32 + 16) & (SPU_RAM_SIZE as u32 - 1);
+        }
+    }
+
+    fn tick_envelope(&mut self, v: usize) {
+        let adsr = (self.voice_reg(v, 0x8) as u32) | (self.voice_reg(v, 0xa) as u32) << 16;
+        let sustain_level = (((adsr & 0xf) + 1) * 0x800).min(0x7fff) as i32;
+
+        let voice = &mut self.voices[v];
+        if voice.env_wait > 0 {
+            voice.env_wait -= 1;
+            return;
+        }
+
+        // (rate, decreasing, exponential) for the current phase
+        let (rate, dec, exp) = match voice.phase {
+            Phase::Attack => ((adsr >> 8) & 0x7f, false, adsr & (1 << 15) != 0),
+            Phase::Decay => (((adsr >> 4) & 0xf) * 4, true, true),
+            Phase::Sustain => (
+                (adsr >> 22) & 0x7f,
+                adsr & (1 << 30) != 0,
+                adsr & (1 << 31) != 0,
+            ),
+            Phase::Release => (((adsr >> 16) & 0x1f) * 4, true, adsr & (1 << 21) != 0),
+            Phase::Off => return,
+        };
+
+        // PSX-SPX envelope rate algorithm
+        let shift = (rate >> 2) as i32;
+        let base = if dec {
+            -8 + (rate & 3) as i32
+        } else {
+            7 - (rate & 3) as i32
+        };
+        let mut wait = 1u64 << (shift - 11).max(0);
+        let mut step = base << (11 - shift).max(0);
+        if exp {
+            if !dec && voice.adsr_vol > 0x6000 {
+                wait *= 4;
+            }
+            if dec {
+                step = step * voice.adsr_vol / 0x8000;
+                if step == 0 {
+                    step = -1; // keep decaying even at low levels
+                }
+            }
+        }
+        voice.env_wait = wait.min(u32::MAX as u64) as u32 - 1;
+        voice.adsr_vol = (voice.adsr_vol + step).clamp(0, 0x7fff);
+
+        match voice.phase {
+            Phase::Attack if voice.adsr_vol >= 0x7fff => voice.phase = Phase::Decay,
+            Phase::Decay if voice.adsr_vol <= sustain_level => voice.phase = Phase::Sustain,
+            Phase::Release if voice.adsr_vol == 0 => voice.phase = Phase::Off,
+            _ => {}
+        }
     }
 }
 
@@ -175,9 +421,46 @@ mod tests {
             spu.write16(REG_BASE + 0x1a8, i, &mut irq);
         }
         assert!(irq.stat & (1 << 9) != 0);
-        // SPUSTAT reflects the IRQ flag until SPUCNT bit 6 is cleared
         assert!(spu.read16(REG_BASE + 0x1ae) & (1 << 6) != 0);
         spu.write16(REG_BASE + 0x1aa, 0x8000, &mut irq);
         assert!(spu.read16(REG_BASE + 0x1ae) & (1 << 6) == 0);
+    }
+
+    /// A looping ADPCM block of maximal nibbles should produce non-silent
+    /// output once keyed on with instant attack.
+    #[test]
+    fn keyed_voice_produces_audio() {
+        let mut spu = Spu::new();
+        let mut irq = Irq::default();
+        // Block at 0x1000: shift 0, filter 0, loop end+repeat, nibble 0x7
+        let base = 0x1000usize;
+        spu.ram[base] = 0x00;
+        spu.ram[base + 1] = 0x03; // end + repeat
+        for i in 0..14 {
+            spu.ram[base + 2 + i] = 0x77;
+        }
+        spu.write16(REG_BASE + 0x1aa, 0xc000, &mut irq); // enable + unmute
+        spu.write16(REG_BASE + 0x180, 0x3fff, &mut irq); // main vol L
+        spu.write16(REG_BASE + 0x182, 0x3fff, &mut irq);
+        spu.write16(REG_BASE + 0x0, 0x3fff, &mut irq); // voice 0 vol L
+        spu.write16(REG_BASE + 0x2, 0x3fff, &mut irq);
+        spu.write16(REG_BASE + 0x4, 0x1000, &mut irq); // pitch = 44100
+        spu.write16(REG_BASE + 0x6, (base / 8) as u16, &mut irq); // start
+        spu.write16(REG_BASE + 0x8, 0x000f, &mut irq); // instant attack, max sustain
+        spu.write16(REG_BASE + 0xa, 0x0000, &mut irq);
+        spu.write16(REG_BASE + 0x188, 1, &mut irq); // key on voice 0
+
+        let mut peak = 0i32;
+        for _ in 0..2000 {
+            spu.generate_sample(&mut irq);
+        }
+        let mut buf = Vec::new();
+        spu.drain_output(&mut buf);
+        for s in buf {
+            peak = peak.max(s.unsigned_abs() as i32);
+        }
+        assert!(peak > 0x100, "expected audible output, peak={peak}");
+        // ENDX latched by the loop-end flag
+        assert!(spu.read16(REG_BASE + 0x19c) & 1 != 0);
     }
 }

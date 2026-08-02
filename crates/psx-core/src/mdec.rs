@@ -7,7 +7,7 @@
 //! instantly; decoded pixels sit in an output FIFO drained by reads or DMA1.
 
 use std::collections::VecDeque;
-use tracing::{trace, warn};
+use tracing::trace;
 
 const EOB: u16 = 0xfe00;
 const ZIGZAG: [usize; 64] = [

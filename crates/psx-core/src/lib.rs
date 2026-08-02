@@ -29,6 +29,7 @@ pub struct PsxSystem {
     pub bus: Bus,
     scheduler: Scheduler,
     cycles: u64,
+    next_sample: u64,
     tty: String,
 }
 
@@ -41,6 +42,7 @@ impl PsxSystem {
             bus: Bus::new(bios)?,
             scheduler,
             cycles: 0,
+            next_sample: spu::CYCLES_PER_SAMPLE,
             tty: String::new(),
         })
     }
@@ -75,7 +77,10 @@ impl PsxSystem {
         let bus::Bus { cdrom, sio, spu, irq, .. } = &mut self.bus;
         cdrom.tick(self.cycles, irq);
         sio.tick(self.cycles, irq);
-        spu.tick(self.cycles, irq);
+        while self.cycles >= self.next_sample {
+            spu.generate_sample(irq);
+            self.next_sample += spu::CYCLES_PER_SAMPLE;
+        }
 
         while let Some(event) = self.scheduler.pop_due(self.cycles) {
             self.handle_event(event);
