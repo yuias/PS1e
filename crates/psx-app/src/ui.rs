@@ -40,6 +40,8 @@ pub struct App {
     vram_tex: Option<egui::TextureHandle>,
     audio: Option<Audio>,
     sample_scratch: Vec<i16>,
+    /// Master volume applied on top of the SPU output (0..=1).
+    volume: f32,
 }
 
 impl App {
@@ -53,6 +55,7 @@ impl App {
             vram_tex: None,
             audio: Audio::new(),
             sample_scratch: Vec::new(),
+            volume: 0.5,
         }
     }
 
@@ -138,6 +141,9 @@ impl eframe::App for App {
             self.sys.run_cycles(cycles);
             self.sample_scratch.clear();
             self.sys.bus.spu.drain_output(&mut self.sample_scratch);
+            for s in &mut self.sample_scratch {
+                *s = (*s as f32 * self.volume) as i16;
+            }
             if let Some(audio) = &self.audio {
                 audio.push_samples(&self.sample_scratch);
             }
@@ -160,6 +166,13 @@ impl eframe::App for App {
                 }
                 ui.separator();
                 ui.checkbox(&mut self.show_vram, "VRAM viewer");
+                ui.separator();
+                ui.label("🔊");
+                ui.add(
+                    egui::Slider::new(&mut self.volume, 0.0..=1.0)
+                        .show_value(false)
+                        .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+                );
                 ui.separator();
                 ui.monospace(format!(
                     "pc {:#010x}   cycles {}",

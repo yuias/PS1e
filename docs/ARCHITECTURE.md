@@ -84,6 +84,17 @@ project. From this emulator's point of view it is just another 512 KiB ROM
 image loaded at `0xBFC00000`, selectable via CLI/UI. The emulator's rich
 logging (MMIO trace, TTY, PC history) is the primary bring-up tool for it.
 
+## Known accuracy gaps (polish backlog)
+
+- Boot pacing: control still passes to the game slightly earlier than real
+  hardware (observed with SLPS-01770). Suspects: per-command CD latencies
+  (ACK/Init/GetID), CPU timing at 1 cycle/instruction (no memory wait
+  states or I-cache), instant DMA. Revisit during the accuracy milestone.
+- GPU: no dithering, rectangle texture flip, or line-accurate timing.
+- SPU: no noise, FM, volume sweeps or gaussian interpolation; XA uses
+  nearest-neighbor resampling.
+- MDEC 24-bit output ordering unverified against hardware captures.
+
 ## Milestones
 
 1. **CPU bring-up** — workspace, bus, R3000A interpreter; retail BIOS executes,
