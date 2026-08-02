@@ -5,27 +5,37 @@
 
 pub mod bus;
 pub mod cpu;
+pub mod dma;
+pub mod gpu;
 pub mod scheduler;
+pub mod timers;
 
 use bus::Bus;
 use cpu::Cpu;
+use scheduler::{EventKind, Scheduler};
 use tracing::info;
 
 /// CPU clock: 33.8688 MHz.
 pub const CPU_CLOCK_HZ: u64 = 33_868_800;
+/// NTSC field: 263 scanlines.
+pub const CYCLES_PER_FRAME: u64 = timers::CYCLES_PER_LINE * 263;
 
 pub struct PsxSystem {
     pub cpu: Cpu,
     pub bus: Bus,
+    scheduler: Scheduler,
     cycles: u64,
     tty: String,
 }
 
 impl PsxSystem {
     pub fn new(bios: Vec<u8>) -> Result<Self, String> {
+        let mut scheduler = Scheduler::new();
+        scheduler.schedule(CYCLES_PER_FRAME, EventKind::VBlank);
         Ok(Self {
             cpu: Cpu::new(),
             bus: Bus::new(bios)?,
+            scheduler,
             cycles: 0,
             tty: String::new(),
         })
@@ -41,13 +51,17 @@ impl PsxSystem {
         &self.tty
     }
 
-    /// Execute a single CPU instruction.
+    /// Execute a single CPU instruction, then fire any due events.
     pub fn step(&mut self) {
         self.observe_tty();
+        self.bus.now = self.cycles;
         self.cpu.step(&mut self.bus);
-        // TODO: refine with memory wait states and I-cache timing; drive the
-        // scheduler from here once timers/GPU events exist.
+        // TODO: refine with memory wait states and I-cache timing
         self.cycles += 1;
+
+        while let Some(event) = self.scheduler.pop_due(self.cycles) {
+            self.handle_event(event);
+        }
     }
 
     /// Run for roughly `cycles` CPU cycles.
@@ -55,6 +69,20 @@ impl PsxSystem {
         let end = self.cycles + cycles;
         while self.cycles < end {
             self.step();
+        }
+    }
+
+    fn handle_event(&mut self, event: EventKind) {
+        match event {
+            EventKind::VBlank => {
+                self.bus.irq.raise(0);
+                self.bus.gpu.vblank();
+                // Keep lazily-synced components from lagging more than a frame
+                self.bus.timers.sync_all(self.cycles, &mut self.bus.irq);
+                self.scheduler
+                    .schedule(self.cycles + CYCLES_PER_FRAME, EventKind::VBlank);
+            }
+            _ => {}
         }
     }
 

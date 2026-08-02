@@ -4,14 +4,11 @@
 //! ticked every CPU cycle; the system runs the CPU until the earliest
 //! deadline, then fires due events. Accuracy comes from scheduling events at
 //! the exact cycle they occur on hardware.
-//!
-//! Not wired into the system yet — timers/GPU/DMA will attach here in
-//! milestone 2.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EventKind {
     VBlank,
     TimerTarget(u8),
@@ -22,12 +19,11 @@ pub enum EventKind {
 struct Entry {
     deadline: u64,
     seq: u64, // tie-breaker keeping FIFO order for same-cycle events
-    kind_idx: usize,
+    kind: EventKind,
 }
 
 pub struct Scheduler {
     heap: BinaryHeap<Reverse<Entry>>,
-    kinds: Vec<EventKind>,
     seq: u64,
 }
 
@@ -35,18 +31,15 @@ impl Scheduler {
     pub fn new() -> Self {
         Self {
             heap: BinaryHeap::new(),
-            kinds: Vec::new(),
             seq: 0,
         }
     }
 
     pub fn schedule(&mut self, deadline: u64, kind: EventKind) {
-        let kind_idx = self.kinds.len();
-        self.kinds.push(kind);
         self.heap.push(Reverse(Entry {
             deadline,
             seq: self.seq,
-            kind_idx,
+            kind,
         }));
         self.seq += 1;
     }
@@ -61,7 +54,7 @@ impl Scheduler {
         match self.heap.peek() {
             Some(Reverse(e)) if e.deadline <= now => {
                 let Reverse(e) = self.heap.pop().unwrap();
-                Some(self.kinds[e.kind_idx])
+                Some(e.kind)
             }
             _ => None,
         }
