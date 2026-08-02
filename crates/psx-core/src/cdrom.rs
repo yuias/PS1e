@@ -2,12 +2,15 @@
 //!
 //! Command/response FIFO model with delayed interrupt delivery: each command
 //! queues one or more (INTn, response) pairs; a pending pair is delivered
-//! only after its deadline passes AND the previous interrupt was acknowledged,
-//! which matches how the BIOS drives the drive. Timings are rough
-//! approximations for now.
+//! only after its deadline passes AND the previous interrupt was
+//! acknowledged, which matches how the BIOS drives the drive.
 //!
-//! The disc is a raw 2352-byte/sector image (track 1). Audio playback (CD-DA)
-//! is not implemented yet.
+//! Sector streaming is evaluated per sector at delivery time: realtime XA
+//! audio sectors are decoded to PCM (drained into the SPU's CD input by the
+//! system) instead of being announced as data, exactly like the real drive.
+//!
+//! Seek and pause latencies model the mechanics coarsely (distance-based),
+//! so boot/loading pacing resembles real hardware.
 
 use crate::bus::Irq;
 use std::collections::VecDeque;
@@ -21,6 +24,9 @@ const CPU_HZ: u64 = 33_868_800;
 const ACK_DELAY: u64 = 25_000;
 /// Extra latency for the second response of two-phase commands.
 const COMPLETE_DELAY: u64 = 120_000;
+
+const ADPCM_POS: [i32; 5] = [0, 60, 115, 98, 122];
+const ADPCM_NEG: [i32; 5] = [0, 0, -52, -55, -60];
 
 pub struct Disc {
     /// Raw image, 2352-byte sectors, starting at LBA 0 (= MSF 00:02:00).
@@ -59,22 +65,33 @@ pub struct Cdrom {
     index: u8,
     params: VecDeque<u8>,
     response: VecDeque<u8>,
-    /// Queued interrupts: (deadline, INT number, response bytes).
+    /// Queued command interrupts: (deadline, INT number, response bytes).
     pending: VecDeque<(u64, u8, Vec<u8>)>,
     int_enable: u8,
     /// Low 3 bits: currently asserted INT number (0 = none).
     int_flag: u8,
     mode: u8,
+    filter_file: u8,
+    filter_channel: u8,
     motor_on: bool,
     reading: bool,
     /// Seek target (LBA) latched by Setloc, applied by Seek/Read.
     seek_target: u32,
     read_lba: u32,
-    /// Payload of the most recently announced sector (INT1).
+    /// Head position used for distance-based seek latency.
+    head_lba: u32,
+    /// When the next sector passes under the head during reading.
+    next_sector_at: u64,
+    /// Payload of the most recently announced data sector (INT1).
     sector_buffer: Vec<u8>,
     /// Data FIFO exposed at register 2 / DMA channel 3.
     data: Vec<u8>,
     data_pos: usize,
+    /// Decoded XA-ADPCM audio, interleaved stereo at 44.1kHz, drained into
+    /// the SPU by the system.
+    pub xa_out: VecDeque<i16>,
+    xa_hist: [(i32, i32); 2],
+    xa_frac: u32,
 }
 
 impl Cdrom {
@@ -88,13 +105,20 @@ impl Cdrom {
             int_enable: 0,
             int_flag: 0,
             mode: 0,
+            filter_file: 0,
+            filter_channel: 0,
             motor_on: true,
             reading: false,
             seek_target: 0,
             read_lba: 0,
+            head_lba: 0,
+            next_sector_at: 0,
             sector_buffer: Vec::new(),
             data: Vec::new(),
             data_pos: 0,
+            xa_out: VecDeque::new(),
+            xa_hist: [(0, 0); 2],
+            xa_frac: 0,
         }
     }
 
@@ -123,21 +147,17 @@ impl Cdrom {
         }
     }
 
+    /// Coarse mechanical seek latency: 15ms base plus up to ~330ms of
+    /// distance-dependent sled travel.
+    fn seek_cycles(&self, target: u32) -> u64 {
+        let dist = target.abs_diff(self.head_lba) as u64;
+        let ms = 15 + (dist / 1000).min(330);
+        CPU_HZ / 1000 * ms
+    }
+
     // --- Interrupt delivery -------------------------------------------
 
-    /// Deliver a due interrupt if the previous one has been acknowledged.
-    /// Called every instruction; the front-of-queue check is cheap.
-    pub fn tick(&mut self, now: u64, irq: &mut Irq) {
-        if self.int_flag & 7 != 0 {
-            return;
-        }
-        let Some((deadline, _, _)) = self.pending.front() else {
-            return;
-        };
-        if *deadline > now {
-            return;
-        }
-        let (_, int, resp) = self.pending.pop_front().unwrap();
+    fn deliver(&mut self, int: u8, resp: &[u8], irq: &mut Irq) {
         trace!(target: "psx_core::cdrom", "deliver INT{int} {resp:02x?}");
         self.response.clear();
         self.response.extend(resp);
@@ -145,33 +165,85 @@ impl Cdrom {
         if self.int_enable & (1 << (int - 1)) != 0 {
             irq.raise(2);
         }
+    }
 
-        // Streaming: announcing a sector (INT1) stages its payload and
-        // schedules the next one.
-        if int == 1 && self.reading {
-            self.stage_sector();
-            let next = now + self.sector_period();
-            let st = self.stat_byte();
-            self.pending.push_back((next, 1, vec![st]));
+    /// Called every instruction; front-of-queue checks are cheap.
+    pub fn tick(&mut self, now: u64, irq: &mut Irq) {
+        // Queued command responses (need the previous INT acknowledged)
+        if self.int_flag & 7 == 0 {
+            if let Some((deadline, _, _)) = self.pending.front() {
+                if *deadline <= now {
+                    let (_, int, resp) = self.pending.pop_front().unwrap();
+                    self.deliver(int, &resp, irq);
+                    return;
+                }
+            }
+        }
+
+        // Sector streaming
+        if self.reading && now >= self.next_sector_at {
+            self.process_sector(now, irq);
         }
     }
 
-    fn stage_sector(&mut self) {
-        let Some(disc) = &self.disc else { return };
-        let Some(raw) = disc.sector(self.read_lba) else {
-            warn!(target: "psx_core::cdrom", "read past end of disc at LBA {}", self.read_lba);
-            self.reading = false;
-            return;
+    /// Handle the sector currently under the head: route realtime XA audio
+    /// to the decoder, announce data sectors via INT1.
+    fn process_sector(&mut self, now: u64, irq: &mut Irq) {
+        enum Action {
+            Xa(Vec<u8>),
+            XaFiltered,
+            Data(Vec<u8>),
+            End,
+        }
+        let action = match self.disc.as_ref().and_then(|d| d.sector(self.read_lba)) {
+            None => Action::End,
+            Some(raw) => {
+                let (file, channel, submode) = (raw[0x10], raw[0x11], raw[0x12]);
+                // Realtime + audio submode bits, with the XA mode enabled
+                if self.mode & 0x40 != 0 && submode & 0x44 == 0x44 {
+                    let pass = self.mode & 0x08 == 0
+                        || (file == self.filter_file && channel == self.filter_channel);
+                    if pass {
+                        Action::Xa(raw.to_vec())
+                    } else {
+                        Action::XaFiltered
+                    }
+                } else if self.mode & 0x20 != 0 {
+                    Action::Data(raw[0xc..0xc + 0x924].to_vec())
+                } else {
+                    Action::Data(raw[0x18..0x18 + 0x800].to_vec())
+                }
+            }
         };
-        // Mode bit 5: 0x924 bytes from the header, else 0x800 of user data
-        // (mode2 form1: 12 sync + 4 header + 8 subheader = offset 0x18).
-        self.sector_buffer = if self.mode & 0x20 != 0 {
-            raw[0xc..0xc + 0x924].to_vec()
-        } else {
-            raw[0x18..0x18 + 0x800].to_vec()
-        };
-        trace!(target: "psx_core::cdrom", "staged LBA {}", self.read_lba);
+        match action {
+            Action::End => {
+                warn!(target: "psx_core::cdrom",
+                      "read past end of disc at LBA {}", self.read_lba);
+                self.reading = false;
+            }
+            Action::Xa(raw) => {
+                self.decode_xa_sector(&raw);
+                self.advance_sector(now);
+            }
+            Action::XaFiltered => self.advance_sector(now),
+            Action::Data(payload) => {
+                // Hold until the previous interrupt is acknowledged
+                if self.int_flag & 7 != 0 || !self.pending.is_empty() {
+                    return;
+                }
+                trace!(target: "psx_core::cdrom", "staged LBA {}", self.read_lba);
+                self.sector_buffer = payload;
+                let st = self.stat_byte();
+                self.deliver(1, &[st], irq);
+                self.advance_sector(now);
+            }
+        }
+    }
+
+    fn advance_sector(&mut self, now: u64) {
         self.read_lba += 1;
+        self.head_lba = self.read_lba;
+        self.next_sector_at = now + self.sector_period();
     }
 
     fn push_int(&mut self, now: u64, delay: u64, int: u8, resp: Vec<u8>) {
@@ -183,6 +255,68 @@ impl Cdrom {
             .unwrap_or(now)
             .max(now);
         self.pending.push_back((base + delay, int, resp));
+    }
+
+    // --- XA-ADPCM ------------------------------------------------------
+
+    /// Decode one form2 realtime audio sector (18 sound groups) into
+    /// 44.1kHz stereo PCM.
+    fn decode_xa_sector(&mut self, raw: &[u8]) {
+        let coding = raw[0x13];
+        let stereo = coding & 3 == 1;
+        let rate = if coding & 0x0c == 0x04 { 18_900 } else { 37_800 };
+        let bits8 = coding & 0x30 == 0x10;
+        let data = &raw[0x18..0x18 + 2304];
+
+        let mut unit_buf = [[0i32; 28]; 2];
+        for group in data.chunks(128) {
+            let params = &group[..16];
+            let d = &group[16..];
+            let units = if bits8 { 4 } else { 8 };
+            for u in 0..units {
+                let hdr = params[4 + u];
+                let shift = (hdr & 0xf).min(12) as i32;
+                let filter = ((hdr >> 4) & 3) as usize;
+                let ch = if stereo { u & 1 } else { 0 };
+                for i in 0..28 {
+                    let s = if bits8 {
+                        (d[i * 4 + u] as i8 as i32) << 8
+                    } else {
+                        let b = d[i * 4 + u / 2];
+                        let n = (b >> ((u & 1) * 4)) & 0xf;
+                        (((n as i32) << 28) >> 28) << 12
+                    } >> shift;
+                    let h = &mut self.xa_hist[ch];
+                    let v = (s + (h.0 * ADPCM_POS[filter] + h.1 * ADPCM_NEG[filter] + 32) / 64)
+                        .clamp(-0x8000, 0x7fff);
+                    h.1 = h.0;
+                    h.0 = v;
+                    unit_buf[ch][i] = v;
+                }
+                let complete_pair = !stereo || u & 1 == 1;
+                if complete_pair {
+                    for i in 0..28 {
+                        let l = unit_buf[0][i];
+                        let r = if stereo { unit_buf[1][i] } else { l };
+                        self.push_xa_frame(l as i16, r as i16, rate);
+                    }
+                }
+            }
+        }
+        // Bound the buffer (~2s) in case nothing drains it
+        while self.xa_out.len() > 88_200 * 2 {
+            self.xa_out.pop_front();
+        }
+    }
+
+    /// Nearest-neighbor resample from the XA rate to the SPU's 44100 Hz.
+    fn push_xa_frame(&mut self, l: i16, r: i16, src_rate: u32) {
+        self.xa_frac += 44_100;
+        while self.xa_frac >= src_rate {
+            self.xa_frac -= src_rate;
+            self.xa_out.push_back(l);
+            self.xa_out.push_back(r);
+        }
     }
 
     // --- Register interface -------------------------------------------
@@ -243,9 +377,7 @@ impl Cdrom {
             (3, 0) => {
                 // Request register: bit 7 (BFRD) latches the staged sector
                 // into the data FIFO; clearing it empties the FIFO. A newly
-                // staged sector replaces any partially-read remainder —
-                // keeping stale bytes would make the next read fail
-                // validation and send games into a re-read loop.
+                // staged sector replaces any partially-read remainder.
                 if val & 0x80 != 0 {
                     if !self.sector_buffer.is_empty() {
                         self.data = std::mem::take(&mut self.sector_buffer);
@@ -264,7 +396,6 @@ impl Cdrom {
                 }
             }
             (1, _) | (2, _) | (3, _) => {
-                // Sound map / volume registers: no SPU routing yet
                 trace!(target: "psx_core::cdrom", "audio reg write idx{} r{} = {val:#04x}",
                        self.index, p & 3);
             }
@@ -291,38 +422,37 @@ impl Cdrom {
                 self.push_int(now, ACK_DELAY, 3, vec![st]);
             }
             0x06 | 0x1b => {
-                // ReadN / ReadS: restarting a read supersedes any sectors
-                // still queued from a previous read — leaving them in place
-                // would deliver stale announcements ahead of the new INT3.
-                self.pending.retain(|(_, int, _)| *int != 1);
+                // ReadN / ReadS: implicit seek to the Setloc target
+                let seek = self.seek_cycles(self.seek_target);
                 self.read_lba = self.seek_target;
                 self.reading = true;
                 self.motor_on = true;
+                self.next_sector_at = now + ACK_DELAY + seek + self.sector_period();
                 let st = self.stat_byte();
                 self.push_int(now, ACK_DELAY, 3, vec![st]);
-                self.push_int(now, self.sector_period(), 1, vec![st]);
             }
             0x08 => {
                 // Stop
                 self.reading = false;
-                self.pending.retain(|(_, int, _)| *int != 1);
                 self.push_int(now, ACK_DELAY, 3, vec![self.stat_byte()]);
                 self.motor_on = false;
-                self.push_int(now, COMPLETE_DELAY, 2, vec![self.stat_byte()]);
+                self.push_int(now, CPU_HZ / 2, 2, vec![self.stat_byte()]);
             }
             0x09 => {
-                // Pause
+                // Pause: ~70ms at single speed, half at double
                 self.push_int(now, ACK_DELAY, 3, vec![self.stat_byte()]);
                 self.reading = false;
-                // Drop not-yet-delivered sector announcements
-                self.pending.retain(|(_, int, _)| *int != 1);
-                self.push_int(now, COMPLETE_DELAY, 2, vec![self.stat_byte()]);
+                let pause = if self.mode & 0x80 != 0 {
+                    CPU_HZ / 1000 * 35
+                } else {
+                    CPU_HZ / 1000 * 70
+                };
+                self.push_int(now, pause, 2, vec![self.stat_byte()]);
             }
             0x0a => {
                 // Init: reset mode, stop reading
                 self.mode = 0;
                 self.reading = false;
-                self.pending.retain(|(_, int, _)| *int != 1);
                 self.motor_on = true;
                 let st = self.stat_byte();
                 self.push_int(now, ACK_DELAY, 3, vec![st]);
@@ -331,6 +461,10 @@ impl Cdrom {
             0x0b | 0x0c => self.push_int(now, ACK_DELAY, 3, vec![st]), // Mute / Demute
             0x0d => {
                 // Setfilter(file, channel)
+                if params.len() >= 2 {
+                    self.filter_file = params[0];
+                    self.filter_channel = params[1];
+                }
                 self.push_int(now, ACK_DELAY, 3, vec![st]);
             }
             0x0e => {
@@ -364,12 +498,13 @@ impl Cdrom {
                 self.push_int(now, ACK_DELAY, 3, vec![st, mm, ss]);
             }
             0x15 | 0x16 => {
-                // SeekL / SeekP
+                // SeekL / SeekP with distance-based latency
+                let seek = self.seek_cycles(self.seek_target);
                 self.read_lba = self.seek_target;
+                self.head_lba = self.seek_target;
                 self.reading = false;
-                self.pending.retain(|(_, int, _)| *int != 1);
                 self.push_int(now, ACK_DELAY, 3, vec![st]);
-                self.push_int(now, COMPLETE_DELAY, 2, vec![self.stat_byte()]);
+                self.push_int(now, seek, 2, vec![self.stat_byte()]);
             }
             0x19 => {
                 // Test: only the BIOS-version sub-command is meaningful here
@@ -398,9 +533,9 @@ impl Cdrom {
                 }
             }
             0x1e => {
-                // ReadTOC
+                // ReadTOC: a full TOC scan takes about a second
                 self.push_int(now, ACK_DELAY, 3, vec![st]);
-                self.push_int(now, COMPLETE_DELAY, 2, vec![self.stat_byte()]);
+                self.push_int(now, CPU_HZ, 2, vec![self.stat_byte()]);
             }
             _ => {
                 warn!(target: "psx_core::cdrom", "unknown command {cmd:#04x}");
@@ -489,12 +624,42 @@ mod tests {
         let t = 100_000 + ACK_DELAY + 1;
         let (int, _) = acked(&mut cd, &mut irq, t);
         assert_eq!(int, 3);
-        let t = t + CPU_HZ / 75 + 1;
+        // Includes the implicit-seek latency before the first sector
+        let t = t + cd.seek_cycles(0) + CPU_HZ / 75 + ACK_DELAY + 1;
         let (int, _) = acked(&mut cd, &mut irq, t);
         assert_eq!(int, 1); // first sector announced
-        // Latch it into the data FIFO and read the marker
         cd.write8(0, 0, 0);
         cd.write8(3, 0x80, t);
         assert_eq!(cd.read8(2), 0xab);
+    }
+
+    #[test]
+    fn realtime_xa_sector_is_decoded_not_announced() {
+        let mut cd = Cdrom::new();
+        let mut irq = Irq::default();
+        cd.int_enable = 0x1f;
+        let mut img = vec![0u8; RAW_SECTOR];
+        img[0x12] = 0x44; // submode: realtime + audio
+        img[0x13] = 0x01; // coding: stereo, 37800 Hz, 4-bit
+        for i in 0..2304 {
+            img[0x18 + i] = 0x11; // arbitrary non-zero nibbles
+        }
+        cd.insert_disc(Disc::new(img).unwrap());
+        cd.write8(2, 0xc0, 0); // Setmode: double speed + XA enable
+        cd.write8(1, 0x0e, 0);
+        cd.write8(0, 1, 0);
+        acked(&mut cd, &mut irq, ACK_DELAY + 1);
+        cd.write8(0, 0, 0);
+        cd.write8(1, 0x06, 200_000); // ReadN from LBA 0
+        cd.write8(0, 1, 0);
+        let t = 200_000 + ACK_DELAY + 1;
+        let (int, _) = acked(&mut cd, &mut irq, t);
+        assert_eq!(int, 3);
+        let t = t + cd.seek_cycles(0) + CPU_HZ / 150 + ACK_DELAY + 1;
+        let (int, _) = acked(&mut cd, &mut irq, t);
+        assert_eq!(int, 0, "XA sector must not raise INT1");
+        // 18 groups * 8 units * 28 samples = 2016 stereo frames at 37800 Hz
+        // -> ~2352 frames after resampling to 44100
+        assert!(cd.xa_out.len() / 2 > 2000, "got {} frames", cd.xa_out.len() / 2);
     }
 }

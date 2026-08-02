@@ -76,6 +76,13 @@ pub struct Spu {
     irq_flag: bool,
     /// Interleaved stereo output, drained by the frontend.
     output: VecDeque<i16>,
+    /// CD/XA audio input frames, mixed in at 44.1kHz.
+    cd_in: VecDeque<(i16, i16)>,
+    /// Reverb work-area cursor (bytes, relative to mBASE) and held output;
+    /// the reverb core runs at 22050 Hz (every other sample).
+    rev_cur: usize,
+    rev_phase: bool,
+    rev_out: (i32, i32),
 }
 
 impl Spu {
@@ -88,7 +95,20 @@ impl Spu {
             xfer_addr: 0,
             irq_flag: false,
             output: VecDeque::new(),
+            cd_in: VecDeque::new(),
+            rev_cur: 0,
+            rev_phase: false,
+            rev_out: (0, 0),
         }
+    }
+
+    /// Feed one 44.1kHz stereo frame of CD/XA audio.
+    pub fn push_cd_audio(&mut self, l: i16, r: i16) {
+        // Bound to ~1s in case the SPU is disabled while the drive streams
+        if self.cd_in.len() >= 44_100 {
+            self.cd_in.pop_front();
+        }
+        self.cd_in.push_back((l, r));
     }
 
     /// Move buffered samples out (interleaved stereo i16).
@@ -249,10 +269,15 @@ impl Spu {
 
     /// Produce one stereo output sample (called every 768 CPU cycles).
     pub fn generate_sample(&mut self, irq: &mut Irq) {
+        let cnt = self.spucnt();
+        let enabled = cnt & (1 << 15) != 0;
+        let muted = cnt & (1 << 14) == 0;
+        let eon = (self.reg(0x198) as u32) | (self.reg(0x19a) as u32) << 16;
+
         let mut mix_l = 0i32;
         let mut mix_r = 0i32;
-        let enabled = self.spucnt() & (1 << 15) != 0;
-        let muted = self.spucnt() & (1 << 14) == 0;
+        let mut rev_l = 0i32;
+        let mut rev_r = 0i32;
 
         for v in 0..24 {
             if self.voices[v].phase == Phase::Off {
@@ -261,14 +286,45 @@ impl Spu {
             let sample = self.step_voice(v, irq);
             let vol_l = Self::volume(self.voice_reg(v, 0x0));
             let vol_r = Self::volume(self.voice_reg(v, 0x2));
-            mix_l += sample * vol_l >> 15;
-            mix_r += sample * vol_r >> 15;
+            let (sl, sr) = (sample * vol_l >> 15, sample * vol_r >> 15);
+            mix_l += sl;
+            mix_r += sr;
+            if eon & (1 << v) != 0 {
+                rev_l += sl;
+                rev_r += sr;
+            }
+        }
+
+        // CD / XA audio input
+        let (cd_l, cd_r) = self.cd_in.pop_front().unwrap_or((0, 0));
+        if cnt & 1 != 0 {
+            let cvl = self.reg(0x1b0) as i16 as i32;
+            let cvr = self.reg(0x1b2) as i16 as i32;
+            let (cl, cr) = (cd_l as i32 * cvl >> 15, cd_r as i32 * cvr >> 15);
+            mix_l += cl;
+            mix_r += cr;
+            if cnt & (1 << 2) != 0 {
+                rev_l += cl;
+                rev_r += cr;
+            }
+        }
+
+        // Reverb core runs at 22050 Hz; output held between steps
+        self.rev_phase = !self.rev_phase;
+        if self.rev_phase {
+            self.rev_out = self.reverb_step(
+                rev_l.clamp(-0x8000, 0x7fff),
+                rev_r.clamp(-0x8000, 0x7fff),
+            );
         }
 
         let main_l = Self::volume(self.reg(0x180));
         let main_r = Self::volume(self.reg(0x182));
         let (mut l, mut r) = if enabled && !muted {
-            (mix_l * main_l >> 15, mix_r * main_r >> 15)
+            (
+                (mix_l * main_l >> 15) + self.rev_out.0,
+                (mix_r * main_r >> 15) + self.rev_out.1,
+            )
         } else {
             (0, 0)
         };
@@ -281,6 +337,95 @@ impl Spu {
         }
         self.output.push_back(l as i16);
         self.output.push_back(r as i16);
+    }
+
+    /// One 22050 Hz reverb step (PSX-SPX reverb formula, applied verbatim).
+    fn reverb_step(&mut self, in_l: i32, in_r: i32) -> (i32, i32) {
+        // Reverb register block at 0x1dc0: volumes are signed, addresses
+        // are in 8-byte units within the work area [mBASE*8 .. 512K).
+        let rv = |n: usize| self.reg(0x1c0 + n * 2) as i16 as i32;
+        let ra = |n: usize| self.reg(0x1c0 + n * 2) as i64 * 8;
+        let (d_apf1, d_apf2) = (ra(0), ra(1));
+        let (v_iir, v_wall) = (rv(2), rv(7));
+        let combs = [rv(3), rv(4), rv(5), rv(6)];
+        let (v_apf1, v_apf2) = (rv(8), rv(9));
+        let (m_lsame, m_rsame) = (ra(10), ra(11));
+        let m_comb_l = [ra(12), ra(14), ra(20), ra(22)];
+        let m_comb_r = [ra(13), ra(15), ra(21), ra(23)];
+        let (d_lsame, d_rsame) = (ra(16), ra(17));
+        let (m_ldiff, m_rdiff) = (ra(18), ra(19));
+        let (d_ldiff, d_rdiff) = (ra(24), ra(25));
+        let (m_lapf1, m_rapf1) = (ra(26), ra(27));
+        let (m_lapf2, m_rapf2) = (ra(28), ra(29));
+        let (v_lin, v_rin) = (rv(30), rv(31));
+
+        let base = ((self.reg(0x1a2) as usize) * 8).min(SPU_RAM_SIZE - 2);
+        let len = (SPU_RAM_SIZE - base) as i64;
+        let cur = self.rev_cur as i64;
+        let ptr = |off: i64| base + ((cur + off).rem_euclid(len) as usize & !1);
+        let rd = |ram: &[u8], off: i64| {
+            let p = ptr(off);
+            i16::from_le_bytes([ram[p], ram[p + 1]]) as i32
+        };
+        let write_enable = self.spucnt() & (1 << 7) != 0;
+
+        let sat = |v: i32| v.clamp(-0x8000, 0x7fff);
+        let mul = |a: i32, v: i32| (a * v) >> 15;
+
+        let lin = mul(in_l, v_lin);
+        let rin = mul(in_r, v_rin);
+
+        // Same-side and cross-side wall reflections (one-pole IIR each)
+        let mut wr_list: [(i64, i32); 2 + 4] = [(0, 0); 6];
+        let refl = |input: i32, d_src: i64, m_dst: i64, ram: &[u8]| {
+            let prev = rd(ram, m_dst - 2);
+            sat(mul(input + mul(rd(ram, d_src), v_wall) - prev, v_iir) + prev)
+        };
+        wr_list[0] = (m_lsame, refl(lin, d_lsame, m_lsame, &self.ram));
+        wr_list[1] = (m_rsame, refl(rin, d_rsame, m_rsame, &self.ram));
+        wr_list[2] = (m_ldiff, refl(lin, d_rdiff, m_ldiff, &self.ram));
+        wr_list[3] = (m_rdiff, refl(rin, d_ldiff, m_rdiff, &self.ram));
+
+        // Comb filters
+        let mut out_l = 0i32;
+        let mut out_r = 0i32;
+        for k in 0..4 {
+            out_l += mul(rd(&self.ram, m_comb_l[k]), combs[k]);
+            out_r += mul(rd(&self.ram, m_comb_r[k]), combs[k]);
+        }
+        out_l = sat(out_l);
+        out_r = sat(out_r);
+
+        // Two all-pass stages
+        let apf = |out: i32, m: i64, d: i64, v: i32, ram: &[u8]| {
+            let tap = rd(ram, m - d);
+            let w = sat(out - mul(tap, v));
+            (w, sat(mul(w, v) + tap))
+        };
+        let (w, o) = apf(out_l, m_lapf1, d_apf1, v_apf1, &self.ram);
+        wr_list[4] = (m_lapf1, w);
+        out_l = o;
+        let (w, o) = apf(out_r, m_rapf1, d_apf1, v_apf1, &self.ram);
+        wr_list[5] = (m_rapf1, w);
+        out_r = o;
+        // Second all-pass writes go through the same gate; apply inline
+        let (w2l, o) = apf(out_l, m_lapf2, d_apf2, v_apf2, &self.ram);
+        out_l = o;
+        let (w2r, o) = apf(out_r, m_rapf2, d_apf2, v_apf2, &self.ram);
+        out_r = o;
+
+        if write_enable {
+            for (m, v) in wr_list.iter().chain([(m_lapf2, w2l), (m_rapf2, w2r)].iter()) {
+                let p = ptr(*m);
+                self.ram[p..p + 2].copy_from_slice(&(*v as i16).to_le_bytes());
+            }
+        }
+
+        self.rev_cur = ((cur + 2).rem_euclid(len)) as usize;
+
+        let v_lout = self.reg(0x184) as i16 as i32;
+        let v_rout = self.reg(0x186) as i16 as i32;
+        (mul(out_l, v_lout), mul(out_r, v_rout))
     }
 
     /// Advance one voice by one sample: pitch step, block decode, envelope.

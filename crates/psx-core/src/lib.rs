@@ -77,6 +77,11 @@ impl PsxSystem {
         let bus::Bus { cdrom, sio, spu, irq, .. } = &mut self.bus;
         cdrom.tick(self.cycles, irq);
         sio.tick(self.cycles, irq);
+        // Route decoded XA audio into the SPU's CD input
+        while let Some(l) = cdrom.xa_out.pop_front() {
+            let r = cdrom.xa_out.pop_front().unwrap_or(0);
+            spu.push_cd_audio(l, r);
+        }
         while self.cycles >= self.next_sample {
             spu.generate_sample(irq);
             self.next_sample += spu::CYCLES_PER_SAMPLE;
