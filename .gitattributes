@@ -1,0 +1,5 @@
+# Keep source files LF in the repo regardless of the checkout platform: a stray
+# CRLF rewrite turns a small edit into a whole-file diff (SS194e/f).
+*.rs text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
