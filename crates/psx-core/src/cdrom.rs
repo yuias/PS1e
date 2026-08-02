@@ -242,9 +242,12 @@ impl Cdrom {
             (2, 1) => self.int_enable = val & 0x1f,
             (3, 0) => {
                 // Request register: bit 7 (BFRD) latches the staged sector
-                // into the data FIFO; clearing it empties the FIFO.
+                // into the data FIFO; clearing it empties the FIFO. A newly
+                // staged sector replaces any partially-read remainder —
+                // keeping stale bytes would make the next read fail
+                // validation and send games into a re-read loop.
                 if val & 0x80 != 0 {
-                    if self.data_pos >= self.data.len() {
+                    if !self.sector_buffer.is_empty() {
                         self.data = std::mem::take(&mut self.sector_buffer);
                         self.data_pos = 0;
                     }
@@ -288,7 +291,10 @@ impl Cdrom {
                 self.push_int(now, ACK_DELAY, 3, vec![st]);
             }
             0x06 | 0x1b => {
-                // ReadN / ReadS
+                // ReadN / ReadS: restarting a read supersedes any sectors
+                // still queued from a previous read — leaving them in place
+                // would deliver stale announcements ahead of the new INT3.
+                self.pending.retain(|(_, int, _)| *int != 1);
                 self.read_lba = self.seek_target;
                 self.reading = true;
                 self.motor_on = true;
@@ -299,6 +305,7 @@ impl Cdrom {
             0x08 => {
                 // Stop
                 self.reading = false;
+                self.pending.retain(|(_, int, _)| *int != 1);
                 self.push_int(now, ACK_DELAY, 3, vec![self.stat_byte()]);
                 self.motor_on = false;
                 self.push_int(now, COMPLETE_DELAY, 2, vec![self.stat_byte()]);
@@ -315,6 +322,7 @@ impl Cdrom {
                 // Init: reset mode, stop reading
                 self.mode = 0;
                 self.reading = false;
+                self.pending.retain(|(_, int, _)| *int != 1);
                 self.motor_on = true;
                 let st = self.stat_byte();
                 self.push_int(now, ACK_DELAY, 3, vec![st]);
@@ -359,6 +367,7 @@ impl Cdrom {
                 // SeekL / SeekP
                 self.read_lba = self.seek_target;
                 self.reading = false;
+                self.pending.retain(|(_, int, _)| *int != 1);
                 self.push_int(now, ACK_DELAY, 3, vec![st]);
                 self.push_int(now, COMPLETE_DELAY, 2, vec![self.stat_byte()]);
             }

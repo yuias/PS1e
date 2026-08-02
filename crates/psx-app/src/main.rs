@@ -15,6 +15,7 @@ struct Args {
     headless: bool,
     cycles: u64,
     dump_vram: Option<String>,
+    peek: Option<u32>,
 }
 
 fn parse_args() -> Args {
@@ -24,6 +25,7 @@ fn parse_args() -> Args {
         headless: false,
         cycles: 30_000_000,
         dump_vram: None,
+        peek: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -38,6 +40,15 @@ fn parse_args() -> Args {
                     .expect("--cycles needs a number")
             }
             "--dump-vram" => args.dump_vram = Some(it.next().expect("--dump-vram needs a path")),
+            "--peek" => {
+                args.peek = Some(
+                    u32::from_str_radix(
+                        it.next().expect("--peek needs a hex address").trim_start_matches("0x"),
+                        16,
+                    )
+                    .expect("--peek needs a hex address"),
+                )
+            }
             other => {
                 eprintln!("unknown argument: {other}");
                 std::process::exit(2);
@@ -64,7 +75,7 @@ fn main() -> eframe::Result {
     }
 
     if args.headless {
-        run_headless(sys, args.cycles, args.dump_vram.as_deref());
+        run_headless(sys, args.cycles, args.dump_vram.as_deref(), args.peek);
         return Ok(());
     }
 
@@ -108,7 +119,7 @@ fn load_disc(path: &str) -> psx_core::cdrom::Disc {
     psx_core::cdrom::Disc::new(data).expect("invalid disc image")
 }
 
-fn run_headless(mut sys: PsxSystem, cycles: u64, dump_vram: Option<&str>) {
+fn run_headless(mut sys: PsxSystem, cycles: u64, dump_vram: Option<&str>, peek: Option<u32>) {
     tracing::info!("running headless for {cycles} cycles");
     sys.run_cycles(cycles);
     tracing::info!(
@@ -126,6 +137,30 @@ fn run_headless(mut sys: PsxSystem, cycles: u64, dump_vram: Option<&str>) {
     for ofs in (pc.saturating_sub(16)..pc + 16).step_by(4) {
         let w = u32::from_le_bytes(sys.bus.ram[ofs..ofs + 4].try_into().unwrap());
         println!("{:#010x}: {w:08x}{}", ofs, if ofs == pc { "  <- pc" } else { "" });
+    }
+    // Dump the kernel event table (EvCB pointer at 0x120): one line per
+    // entry as [index] class spec status — resolves TestEvent handles.
+    let ram = &sys.bus.ram;
+    let word = |a: usize| u32::from_le_bytes(ram[a & 0x1f_fffc..(a & 0x1f_fffc) + 4].try_into().unwrap());
+    let evcb = word(0x120) as usize & 0x001f_ffff;
+    let evcb_size = word(0x124) as usize / 0x1c;
+    if evcb != 0 {
+        println!("--- events (EvCB at {evcb:#x}, {evcb_size} entries) ---");
+        for i in 0..evcb_size.min(32) {
+            let base = evcb + i * 0x1c;
+            let (class, status, spec) = (word(base), word(base + 4), word(base + 8));
+            if class != 0 {
+                println!("[{i:#04x}] class={class:#010x} spec={spec:#06x} status={status:#06x}");
+            }
+        }
+    }
+    if let Some(addr) = peek {
+        println!("--- peek {addr:#010x} ---");
+        let base = (addr & 0x001f_fffc) as usize;
+        for ofs in (base..base + 96).step_by(4) {
+            let w = u32::from_le_bytes(sys.bus.ram[ofs..ofs + 4].try_into().unwrap());
+            println!("{:#010x}: {w:08x}", ofs);
+        }
     }
     if let Some(path) = dump_vram {
         write_vram_bmp(path, &sys.bus.gpu.vram);

@@ -8,8 +8,10 @@ pub mod cdrom;
 pub mod cpu;
 pub mod dma;
 pub mod gpu;
+pub mod mdec;
 pub mod scheduler;
 pub mod sio;
+pub mod spu;
 pub mod timers;
 
 use bus::Bus;
@@ -70,8 +72,10 @@ impl PsxSystem {
         // TODO: refine with memory wait states and I-cache timing
         self.cycles += 1;
 
-        let bus::Bus { cdrom, irq, .. } = &mut self.bus;
+        let bus::Bus { cdrom, sio, spu, irq, .. } = &mut self.bus;
         cdrom.tick(self.cycles, irq);
+        sio.tick(self.cycles, irq);
+        spu.tick(self.cycles, irq);
 
         while let Some(event) = self.scheduler.pop_due(self.cycles) {
             self.handle_event(event);
@@ -100,15 +104,26 @@ impl PsxSystem {
         }
     }
 
-    /// Observation-only PC watch on the kernel `putchar` entry points
-    /// (A0h:3Ch, B0h:3Dh). Mirrors TTY output into the log and debug UI
-    /// without altering execution — safe for LLE BIOS bring-up.
+    /// Observation-only PC watch on the kernel entry points (A0h/B0h/C0h).
+    /// Mirrors TTY output into the log and debug UI and traces interesting
+    /// kernel calls, without altering execution — safe for LLE BIOS bring-up.
     fn observe_tty(&mut self) {
         let pc = self.cpu.pc & 0x1fff_ffff;
         if pc != 0xa0 && pc != 0xb0 {
             return;
         }
         let call = self.cpu.regs[9]; // $t1 selects the kernel function
+        if pc == 0xb0 {
+            let (a0, a1) = (self.cpu.regs[4], self.cpu.regs[5]);
+            match call {
+                // OpenEvent(class, spec, mode, func) / EnableEvent(event)
+                0x08 => tracing::debug!(target: "psx_core::kernel",
+                        "OpenEvent(class={a0:#010x}, spec={a1:#06x})"),
+                0x0c => tracing::debug!(target: "psx_core::kernel",
+                        "EnableEvent({a0:#010x})"),
+                _ => tracing::trace!(target: "psx_core::kernel", "B0({call:#04x}, {a0:#x})"),
+            }
+        }
         let is_putchar = (pc == 0xa0 && call == 0x3c) || (pc == 0xb0 && call == 0x3d);
         if is_putchar {
             let ch = self.cpu.regs[4] as u8 as char; // $a0

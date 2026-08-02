@@ -7,6 +7,12 @@
 use crate::bus::Irq;
 use tracing::trace;
 
+/// /ACK arrives roughly 100us after the byte transfer on real hardware.
+/// Raising it during the JOY_DATA write is too early: the kernel ISR writes
+/// TX first and acknowledges the previous IRQ afterwards, which would wipe
+/// an instantly-raised interrupt and stall the transaction.
+const ACK_DELAY_CYCLES: u64 = 1500;
+
 /// Button bits (active low on the wire). Bit set in `buttons` = pressed.
 pub mod button {
     pub const SELECT: u16 = 1 << 0;
@@ -42,6 +48,8 @@ pub struct Sio {
     seq: u8,
     device: Device,
     irq_flag: bool,
+    /// Cycle at which the pending /ACK interrupt fires.
+    ack_at: Option<u64>,
     /// Currently pressed buttons (host convention: set = pressed).
     pub buttons: u16,
 }
@@ -56,7 +64,21 @@ impl Sio {
             seq: 0,
             device: Device::None,
             irq_flag: false,
+            ack_at: None,
             buttons: 0,
+        }
+    }
+
+    /// Fire a due /ACK interrupt. Called every instruction; cheap check.
+    pub fn tick(&mut self, now: u64, irq: &mut Irq) {
+        if let Some(at) = self.ack_at {
+            if now >= at {
+                self.ack_at = None;
+                self.irq_flag = true;
+                if self.ctrl & (1 << 12) != 0 {
+                    irq.raise(7);
+                }
+            }
         }
     }
 
@@ -100,6 +122,7 @@ impl Sio {
                     self.seq = 0;
                     self.device = Device::None;
                     self.irq_flag = false;
+                    self.ack_at = None;
                 }
                 // Deselecting /JOYn ends the transaction
                 if val & (1 << 1) == 0 {
@@ -113,7 +136,7 @@ impl Sio {
     }
 
     /// TX write: exchange one byte with the selected device.
-    pub fn write_data(&mut self, tx: u8, irq: &mut Irq) {
+    pub fn write_data(&mut self, tx: u8, now: u64) {
         // Needs TX enable and a selected device to reach anything
         if self.ctrl & 1 == 0 || self.ctrl & (1 << 1) == 0 {
             self.rx = Some(0xff);
@@ -139,10 +162,7 @@ impl Sio {
         self.rx = Some(response);
         self.seq += 1;
         if ack {
-            self.irq_flag = true;
-            if self.ctrl & (1 << 12) != 0 {
-                irq.raise(7);
-            }
+            self.ack_at = Some(now + ACK_DELAY_CYCLES);
         }
     }
 
@@ -181,16 +201,26 @@ mod tests {
     fn digital_pad_handshake() {
         let mut sio = Sio::new();
         let mut irq = Irq::default();
+        let mut now = 0u64;
         sio.buttons = button::CROSS | button::START;
         sio.write_reg16(0xa, 0x1003); // TX enable, select, ack IRQ enable
-        for (tx, expect) in [(0x01u8, 0xffu8), (0x42, 0x41), (0x00, 0x5a)] {
-            sio.write_data(tx, &mut irq);
-            assert_eq!(sio.read_data(), expect);
+        fn exchange(sio: &mut Sio, irq: &mut Irq, now: &mut u64, tx: u8) -> u8 {
+            sio.write_data(tx, *now);
+            *now += ACK_DELAY_CYCLES + 1;
+            sio.tick(*now, irq);
+            sio.read_data()
         }
-        sio.write_data(0, &mut irq);
-        assert_eq!(sio.read_data(), !(button::START as u8)); // low byte
-        sio.write_data(0, &mut irq);
-        assert_eq!(sio.read_data(), (!(button::CROSS) >> 8) as u8);
-        assert!(irq.stat & (1 << 7) != 0);
+        assert_eq!(exchange(&mut sio, &mut irq, &mut now, 0x01), 0xff);
+        assert!(irq.stat & (1 << 7) != 0, "ACK IRQ arrives after a delay");
+        assert_eq!(exchange(&mut sio, &mut irq, &mut now, 0x42), 0x41);
+        assert_eq!(exchange(&mut sio, &mut irq, &mut now, 0x00), 0x5a);
+        assert_eq!(
+            exchange(&mut sio, &mut irq, &mut now, 0x00),
+            !(button::START as u8)
+        );
+        assert_eq!(
+            exchange(&mut sio, &mut irq, &mut now, 0x00),
+            (!(button::CROSS) >> 8) as u8
+        );
     }
 }

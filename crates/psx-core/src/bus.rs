@@ -9,7 +9,9 @@
 use crate::cdrom::Cdrom;
 use crate::dma::Dma;
 use crate::gpu::Gpu;
+use crate::mdec::Mdec;
 use crate::sio::Sio;
+use crate::spu::Spu;
 use crate::timers::Timers;
 use tracing::{debug, trace, warn};
 
@@ -19,6 +21,19 @@ pub const SCRATCHPAD_SIZE: usize = 1024;
 
 /// KSEG2 cache-control register (not part of the 512 MiB physical map).
 const CACHE_CONTROL: u32 = 0xfffe_0130;
+
+/// Total words of a block-mode BCR value (0 fields mean the maximum).
+fn dma_block_words(bcr: u32) -> u32 {
+    let unit = match bcr & 0xffff {
+        0 => 0x10000u32,
+        n => n,
+    };
+    let blocks = match (bcr >> 16) & 0xffff {
+        0 => 1u32,
+        n => n,
+    };
+    unit * blocks
+}
 
 /// Interrupt controller (I_STAT / I_MASK).
 #[derive(Default)]
@@ -48,6 +63,8 @@ pub struct Bus {
     pub timers: Timers,
     pub cdrom: Cdrom,
     pub sio: Sio,
+    pub spu: Spu,
+    pub mdec: Mdec,
     /// Current CPU cycle, updated by the system before each step; used by
     /// components that catch up lazily (timers).
     pub now: u64,
@@ -79,6 +96,8 @@ impl Bus {
             timers: Timers::new(),
             cdrom: Cdrom::new(),
             sio: Sio::new(),
+            spu: Spu::new(),
+            mdec: Mdec::new(),
             now: 0,
             mem_ctrl: [0; 9],
             ram_size: 0,
@@ -199,11 +218,13 @@ impl Bus {
             }
             0x1f80_1810 => self.gpu.gpuread(),
             0x1f80_1814 => self.gpu.status(),
-            // SPU registers: read back as 0 until the SPU exists
-            0x1f80_1c00..0x1f80_2000 => {
-                trace!(target: "psx_core::spu", "stub read {p:#010x}");
-                0
+            0x1f80_1820 => self.mdec.read_data(),
+            0x1f80_1824 => self.mdec.status(),
+            // SPU registers are 16-bit; a 32-bit read combines two
+            0x1f80_1c00..0x1f80_1e00 => {
+                (self.spu.read16(p) as u32) | (self.spu.read16(p + 2) as u32) << 16
             }
+            0x1f80_1e00..0x1f80_2000 => 0,
             // Expansion 2 (DUART/POST)
             0x1f80_2000..0x1f80_2080 => 0,
             CACHE_CONTROL => self.cache_control,
@@ -266,10 +287,7 @@ impl Bus {
             0x1f80_1060 => self.ram_size = val,
             0x1f80_1070 => self.irq.stat &= val, // write-0-to-acknowledge
             0x1f80_1074 => self.irq.mask = val,
-            0x1f80_1040 => {
-                let Bus { sio, irq, .. } = self;
-                sio.write_data(val as u8, irq);
-            }
+            0x1f80_1040 => self.sio.write_data(val as u8, self.now),
             0x1f80_1044..0x1f80_1050 => {
                 if width == 4 && p == 0x1f80_1048 {
                     self.sio.write_reg16(0x8, val as u16);
@@ -284,7 +302,20 @@ impl Bus {
                 self.sio1_regs[i] = val;
             }
             0x1f80_1080..0x1f80_1100 => {
-                if let Some(ch) = self.dma.write_reg(p, val) {
+                // Merge sub-word writes (games write DICR halves separately).
+                let aligned = p & !3;
+                let val32 = if width == 4 {
+                    val
+                } else {
+                    // For DICR, exclude the flag bits from the merge: they
+                    // are write-1-to-acknowledge and must not be re-written.
+                    let cur = self.dma.read_reg(aligned)
+                        & if aligned == 0x1f80_10f4 { 0x00ff_ffff } else { !0 };
+                    let shift = (p & 3) * 8;
+                    let mask = (if width == 2 { 0xffffu32 } else { 0xff }) << shift;
+                    (cur & !mask) | ((val << shift) & mask)
+                };
+                if let Some(ch) = self.dma.write_reg(aligned, val32) {
                     self.run_dma(ch);
                 }
             }
@@ -295,8 +326,17 @@ impl Bus {
             0x1f80_1800..0x1f80_1804 => self.cdrom.write8(p, val as u8, self.now),
             0x1f80_1810 => self.gpu.gp0(val),
             0x1f80_1814 => self.gpu.gp1(val),
-            0x1f80_1c00..0x1f80_2000 => {
-                trace!(target: "psx_core::spu", "stub write {p:#010x} = {val:#06x}");
+            0x1f80_1820 => self.mdec.write_data(val),
+            0x1f80_1824 => self.mdec.write_control(val),
+            0x1f80_1c00..0x1f80_1e00 => {
+                let Bus { spu, irq, .. } = self;
+                spu.write16(p, val as u16, irq);
+                if width == 4 {
+                    spu.write16(p + 2, (val >> 16) as u16, irq);
+                }
+            }
+            0x1f80_1e00..0x1f80_2000 => {
+                trace!(target: "psx_core::spu", "write past register area {p:#010x}");
             }
             0x1f80_2000..0x1f80_2080 => {
                 // Expansion 2: 0x1f802041 is the 7-segment POST display
@@ -317,8 +357,11 @@ impl Bus {
     /// Run a whole transfer for `ch` immediately (no bus timing yet).
     fn run_dma(&mut self, ch: usize) {
         match ch {
+            0 => self.dma_mdec_in(),
+            1 => self.dma_mdec_out(),
             2 => self.dma_gpu(),
             3 => self.dma_cdrom(),
+            4 => self.dma_spu(),
             6 => self.dma_otc(),
             _ => warn!(target: "psx_core::dma", "DMA{ch} not implemented"),
         }
@@ -341,6 +384,60 @@ impl Bus {
         for _ in 0..words {
             let w = self.cdrom.dma_read_word();
             self.write_ram32(addr, w);
+            addr = addr.wrapping_add(4);
+        }
+    }
+
+    /// Channel 0: compressed data into the MDEC.
+    fn dma_mdec_in(&mut self) {
+        let c = self.dma.ch[0];
+        let words = dma_block_words(c.bcr);
+        trace!(target: "psx_core::dma", "MDEC-in {words} words");
+        let mut addr = c.madr;
+        for _ in 0..words {
+            let w = self.read_ram32(addr);
+            self.mdec.write_data(w);
+            addr = addr.wrapping_add(4);
+        }
+    }
+
+    /// Channel 1: decoded pixels out of the MDEC.
+    fn dma_mdec_out(&mut self) {
+        let c = self.dma.ch[1];
+        let words = dma_block_words(c.bcr);
+        trace!(target: "psx_core::dma", "MDEC-out {words} words");
+        let mut addr = c.madr;
+        for _ in 0..words {
+            let w = self.mdec.read_data();
+            self.write_ram32(addr, w);
+            addr = addr.wrapping_add(4);
+        }
+    }
+
+    /// Channel 4: SPU RAM transfers through the data port.
+    fn dma_spu(&mut self) {
+        let c = self.dma.ch[4];
+        let unit = match c.bcr & 0xffff {
+            0 => 0x10000u32,
+            n => n,
+        };
+        let blocks = match (c.bcr >> 16) & 0xffff {
+            0 => 1u32,
+            n => n,
+        };
+        let words = unit * blocks;
+        trace!(target: "psx_core::dma", "SPU dma {words} words {} RAM",
+               if c.from_ram() { "from" } else { "to" });
+        let mut addr = c.madr;
+        for _ in 0..words {
+            if c.from_ram() {
+                let w = self.read_ram32(addr);
+                let Bus { spu, irq, .. } = self;
+                spu.dma_write_word(w, irq);
+            } else {
+                let w = self.spu.dma_read_word();
+                self.write_ram32(addr, w);
+            }
             addr = addr.wrapping_add(4);
         }
     }
