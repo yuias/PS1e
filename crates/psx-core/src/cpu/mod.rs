@@ -11,8 +11,10 @@
 //! and multiplier/divider latency are modeled at the system level later.
 
 mod cop0;
+mod gte;
 
 pub use cop0::{Cop0, Exception};
+pub use gte::Gte;
 
 use crate::bus::Bus;
 use tracing::{trace, warn};
@@ -36,6 +38,7 @@ pub struct Cpu {
     /// The current instruction is a branch/jump (the next one is a delay slot).
     is_branch: bool,
     pub cop0: Cop0,
+    pub gte: Gte,
 }
 
 pub const RESET_VECTOR: u32 = 0xbfc0_0000;
@@ -54,6 +57,7 @@ impl Cpu {
             in_delay_slot: false,
             is_branch: false,
             cop0: Cop0::default(),
+            gte: Gte::new(),
         }
     }
 
@@ -302,7 +306,7 @@ impl Cpu {
             0x0f => self.set_reg(rt, imm << 16),                          // LUI
 
             0x10 => self.op_cop0(instr, rs, rt, rd),
-            0x12 => self.op_cop2(instr, rs, rt),
+            0x12 => self.op_cop2(instr, rs, rt, rd),
             0x11 | 0x13 => self.exception(Exception::CoprocessorUnusable),
 
             0x20 => {
@@ -429,11 +433,26 @@ impl Cpu {
                 }
             }
             0x32 => {
-                // LWC2 (GTE data load) — GTE not implemented yet
-                warn!(target: "psx_core::gte", "LWC2 stub at {:#010x}", self.current_pc);
+                // LWC2: memory -> GTE data register (no CPU load delay)
+                let addr = self.regs[rs].wrapping_add(imm_se);
+                if addr & 3 != 0 {
+                    self.cop0.bad_vaddr = addr;
+                    self.exception(Exception::AdEL);
+                } else {
+                    let v = bus.read32(addr);
+                    self.gte.write_data(rt as u32, v);
+                }
             }
             0x3a => {
-                warn!(target: "psx_core::gte", "SWC2 stub at {:#010x}", self.current_pc);
+                // SWC2: GTE data register -> memory
+                let addr = self.regs[rs].wrapping_add(imm_se);
+                if addr & 3 != 0 {
+                    self.cop0.bad_vaddr = addr;
+                    self.exception(Exception::AdES);
+                } else if !self.cop0.cache_isolated() {
+                    let v = self.gte.read_data(rt as u32);
+                    bus.write32(addr, v);
+                }
             }
             0x30 | 0x31 | 0x33 | 0x38 | 0x39 | 0x3b => {
                 // LWC0/1/3, SWC0/1/3: coprocessor absent
@@ -471,19 +490,23 @@ impl Cpu {
         }
     }
 
-    fn op_cop2(&mut self, instr: u32, rs: usize, rt: usize) {
-        // GTE stub: log and return zeros so control flow can proceed.
+    fn op_cop2(&mut self, instr: u32, rs: usize, rt: usize, rd: usize) {
         if instr & (1 << 25) != 0 {
-            warn!(target: "psx_core::gte", "GTE command {:#010x} stubbed", instr & 0x1ff_ffff);
+            self.gte.execute(instr & 0x1ff_ffff);
             return;
         }
         match rs {
-            0x00 | 0x02 => {
-                // MFC2 / CFC2
-                warn!(target: "psx_core::gte", "MFC2/CFC2 stubbed");
-                self.set_load(rt, 0);
+            0x00 => {
+                // MFC2 has a load delay, like memory loads
+                let v = self.gte.read_data(rd as u32);
+                self.set_load(rt, v);
             }
-            0x04 | 0x06 => warn!(target: "psx_core::gte", "MTC2/CTC2 stubbed"),
+            0x02 => {
+                let v = self.gte.read_control(rd as u32);
+                self.set_load(rt, v);
+            }
+            0x04 => self.gte.write_data(rd as u32, self.regs[rt]),
+            0x06 => self.gte.write_control(rd as u32, self.regs[rt]),
             _ => self.illegal(instr),
         }
     }
