@@ -3,6 +3,7 @@
 //! `--headless` runs the core without a window for CI and BIOS bring-up:
 //!   psx-app --headless --cycles 30000000 [--bios assets/SCPH-1000.bin]
 
+mod audio;
 mod ui;
 
 use psx_core::PsxSystem;
@@ -131,6 +132,10 @@ fn run_headless(mut sys: PsxSystem, cycles: u64, dump_vram: Option<&str>, peek: 
         sys.bus.irq.stat,
         sys.bus.irq.mask,
     );
+    let mut samples = Vec::new();
+    sys.bus.spu.drain_output(&mut samples);
+    let peak = samples.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+    tracing::info!("audio: {} samples buffered, peak {peak}", samples.len() / 2);
     print!("--- TTY ---\n{}\n-----------\n", sys.tty_output());
     // Dump the instructions around PC to identify wait loops during bring-up
     let pc = (sys.cpu.pc & 0x001f_ffff) as usize;

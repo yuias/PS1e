@@ -1,5 +1,6 @@
 //! egui debug shell: run control, CPU registers, TTY console.
 
+use crate::audio::Audio;
 use eframe::egui;
 use psx_core::sio::button;
 use psx_core::{CPU_CLOCK_HZ, PsxSystem};
@@ -37,6 +38,8 @@ pub struct App {
     show_vram: bool,
     display_tex: Option<egui::TextureHandle>,
     vram_tex: Option<egui::TextureHandle>,
+    audio: Option<Audio>,
+    sample_scratch: Vec<i16>,
 }
 
 impl App {
@@ -48,6 +51,38 @@ impl App {
             show_vram: false,
             display_tex: None,
             vram_tex: None,
+            audio: Audio::new(),
+            sample_scratch: Vec::new(),
+        }
+    }
+
+    /// The display area as an egui image, honoring the 24-bit display mode
+    /// (packed RGB888 in VRAM, e.g. FMV frames).
+    fn display_image(&self) -> egui::ColorImage {
+        let gpu = &self.sys.bus.gpu;
+        let (w, h) = gpu.display_resolution();
+        let (sx, sy) = gpu.display_vram_start();
+        if !gpu.is_24bit() {
+            return self.vram_image(sx, sy, w, h);
+        }
+        let vram = &self.sys.bus.gpu.vram;
+        let mut pixels = Vec::with_capacity((w * h) as usize);
+        for y in 0..h {
+            let row = (((sy + y) & 0x1ff) as usize) * 1024;
+            for x in 0..w {
+                // Pixel x starts at byte offset sx*2 + x*3 within the row
+                let byte = sx as usize * 2 + x as usize * 3;
+                let read = |b: usize| {
+                    let half = vram[row + ((byte + b) / 2) % 1024];
+                    (half >> (((byte + b) & 1) * 8)) as u8
+                };
+                pixels.push(egui::Color32::from_rgb(read(0), read(1), read(2)));
+            }
+        }
+        egui::ColorImage {
+            size: [w as usize, h as usize],
+            source_size: egui::Vec2::new(w as f32, h as f32),
+            pixels,
         }
     }
 
@@ -87,9 +122,25 @@ impl eframe::App for App {
         self.sys.set_buttons(buttons);
 
         if self.running {
-            // One video frame worth of CPU time per UI frame (assumes ~60 fps
-            // UI; will be replaced by proper pacing once the GPU exists).
-            self.sys.run_cycles(CPU_CLOCK_HZ / 60);
+            // Pace by wall clock, not repaint rate (high-refresh monitors
+            // would otherwise fast-forward the game). Nudge by the audio
+            // buffer level to counteract clock drift.
+            let dt = ctx.input(|i| i.stable_dt).clamp(0.001, 0.05) as f64;
+            let mut cycles = (dt * CPU_CLOCK_HZ as f64) as u64;
+            if let Some(audio) = &self.audio {
+                let buffered = audio.buffered_frames();
+                if buffered < 2205 {
+                    cycles += cycles / 10; // <50ms buffered: catch up
+                } else if buffered > 8820 {
+                    cycles -= cycles / 10; // >200ms: back off
+                }
+            }
+            self.sys.run_cycles(cycles);
+            self.sample_scratch.clear();
+            self.sys.bus.spu.drain_output(&mut self.sample_scratch);
+            if let Some(audio) = &self.audio {
+                audio.push_samples(&self.sample_scratch);
+            }
             ctx.request_repaint();
         }
 
@@ -156,11 +207,8 @@ impl eframe::App for App {
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            let gpu = &self.sys.bus.gpu;
-            let (w, h) = gpu.display_resolution();
-            let (sx, sy) = gpu.display_vram_start();
-            let enabled = gpu.display_enabled();
-            let image = self.vram_image(sx, sy, w, h);
+            let enabled = self.sys.bus.gpu.display_enabled();
+            let image = self.display_image();
             let tex = match &mut self.display_tex {
                 Some(t) => {
                     t.set(image, egui::TextureOptions::NEAREST);

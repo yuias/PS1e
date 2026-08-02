@@ -10,3 +10,4 @@ psx-core = { path = "../psx-core" }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 eframe = { version = "0.32", features = ["wgpu"] }
+cpal = "0.16"
