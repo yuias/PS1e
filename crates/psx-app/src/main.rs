@@ -11,6 +11,7 @@ const DEFAULT_BIOS: &str = "assets/SCPH-1000.bin";
 
 struct Args {
     bios: String,
+    disc: Option<String>,
     headless: bool,
     cycles: u64,
     dump_vram: Option<String>,
@@ -19,6 +20,7 @@ struct Args {
 fn parse_args() -> Args {
     let mut args = Args {
         bios: DEFAULT_BIOS.to_string(),
+        disc: None,
         headless: false,
         cycles: 30_000_000,
         dump_vram: None,
@@ -28,6 +30,7 @@ fn parse_args() -> Args {
         match a.as_str() {
             "--headless" => args.headless = true,
             "--bios" => args.bios = it.next().expect("--bios needs a path"),
+            "--disc" => args.disc = Some(it.next().expect("--disc needs a path")),
             "--cycles" => {
                 args.cycles = it
                     .next()
@@ -55,7 +58,10 @@ fn main() -> eframe::Result {
     let args = parse_args();
     let bios = std::fs::read(&args.bios)
         .unwrap_or_else(|e| panic!("failed to read BIOS '{}': {e}", args.bios));
-    let sys = PsxSystem::new(bios.clone()).expect("failed to create system");
+    let mut sys = PsxSystem::new(bios.clone()).expect("failed to create system");
+    if let Some(path) = &args.disc {
+        sys.insert_disc(load_disc(path));
+    }
 
     if args.headless {
         run_headless(sys, args.cycles, args.dump_vram.as_deref());
@@ -74,6 +80,32 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |_cc| Ok(Box::new(ui::App::new(sys, bios)))),
     )
+}
+
+/// Load a disc image: either a raw .bin, or a .cue referencing one .bin.
+fn load_disc(path: &str) -> psx_core::cdrom::Disc {
+    let p = std::path::Path::new(path);
+    let bin_path = if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("cue")) {
+        let cue = std::fs::read_to_string(p)
+            .unwrap_or_else(|e| panic!("failed to read cue '{path}': {e}"));
+        // Minimal parse: take the first FILE "..." line
+        let name = cue
+            .lines()
+            .find_map(|l| {
+                let l = l.trim();
+                l.strip_prefix("FILE ")?.split('"').nth(1).map(String::from)
+            })
+            .unwrap_or_else(|| panic!("no FILE entry in cue '{path}'"));
+        if cue.matches("FILE ").count() > 1 {
+            tracing::warn!("multi-file cue sheets not supported; using first file only");
+        }
+        p.parent().unwrap_or(std::path::Path::new(".")).join(name)
+    } else {
+        p.to_path_buf()
+    };
+    let data = std::fs::read(&bin_path)
+        .unwrap_or_else(|e| panic!("failed to read disc image '{}': {e}", bin_path.display()));
+    psx_core::cdrom::Disc::new(data).expect("invalid disc image")
 }
 
 fn run_headless(mut sys: PsxSystem, cycles: u64, dump_vram: Option<&str>) {

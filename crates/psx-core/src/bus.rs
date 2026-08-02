@@ -6,8 +6,10 @@
 //! are logged and stubbed so BIOS bring-up can make progress while components
 //! are still missing.
 
+use crate::cdrom::Cdrom;
 use crate::dma::Dma;
 use crate::gpu::Gpu;
+use crate::sio::Sio;
 use crate::timers::Timers;
 use tracing::{debug, trace, warn};
 
@@ -44,6 +46,8 @@ pub struct Bus {
     pub gpu: Gpu,
     pub dma: Dma,
     pub timers: Timers,
+    pub cdrom: Cdrom,
+    pub sio: Sio,
     /// Current CPU cycle, updated by the system before each step; used by
     /// components that catch up lazily (timers).
     pub now: u64,
@@ -52,9 +56,9 @@ pub struct Bus {
     mem_ctrl: [u32; 9],
     ram_size: u32,
     cache_control: u32,
-    /// SIO0/SIO1 registers 0x1f801040..0x1f801060, stored raw (stub: no
-    /// controller is connected, JOY_DATA reads 0xff and never ACKs).
-    sio_regs: [u32; 8],
+    /// SIO1 (serial port) registers 0x1f801050..0x1f801060, stored raw
+    /// (stub: nothing connected).
+    sio1_regs: [u32; 4],
 }
 
 impl Bus {
@@ -73,11 +77,13 @@ impl Bus {
             gpu: Gpu::new(),
             dma: Dma::new(),
             timers: Timers::new(),
+            cdrom: Cdrom::new(),
+            sio: Sio::new(),
             now: 0,
             mem_ctrl: [0; 9],
             ram_size: 0,
             cache_control: 0,
-            sio_regs: [0; 8],
+            sio1_regs: [0; 4],
         })
     }
 
@@ -117,13 +123,9 @@ impl Bus {
             0x1fc0_0000..0x1fc8_0000 => self.bios[(p - 0x1fc0_0000) as usize],
             // Expansion 1 (parallel port): open bus reads as 0xff
             0x1f00_0000..0x1f80_0000 => 0xff,
-            // CD-ROM controller stub: byte registers. Status reports the
-            // parameter FIFO empty/writable so command writes proceed.
-            0x1f80_1800..0x1f80_1804 => {
-                trace!(target: "psx_core::cdrom", "stub read {p:#010x}");
-                if p & 3 == 0 { 0x18 } else { 0 }
-            }
-            0x1f80_1040 | 0x1f80_1050 => 0xff, // JOY/SIO data: nothing connected
+            0x1f80_1800..0x1f80_1804 => self.cdrom.read8(p),
+            0x1f80_1040 => self.sio.read_data(),
+            0x1f80_1050 => 0xff, // SIO1 data: nothing connected
             _ => {
                 let w = self.read32_io(p & !3);
                 (w >> ((p & 3) * 8)) as u8
@@ -181,9 +183,15 @@ impl Bus {
             0x1f80_1060 => self.ram_size,
             0x1f80_1070 => self.irq.stat,
             0x1f80_1074 => self.irq.mask,
-            // JOY/SIO status: TX ready, RX empty, no /ACK
-            0x1f80_1044 | 0x1f80_1054 => 0b101,
-            0x1f80_1040..0x1f80_1060 => self.sio_regs[((p - 0x1f80_1040) / 4) as usize],
+            0x1f80_1040 => self.sio.read_data() as u32,
+            0x1f80_1044 => self.sio.read_stat(),
+            0x1f80_1048 => {
+                (self.sio.read_reg16(0x8) as u32) | (self.sio.read_reg16(0xa) as u32) << 16
+            }
+            0x1f80_104c => (self.sio.read_reg16(0xe) as u32) << 16,
+            // SIO1 status: TX ready, RX empty
+            0x1f80_1054 => 0b101,
+            0x1f80_1050..0x1f80_1060 => self.sio1_regs[((p - 0x1f80_1050) / 4) as usize],
             0x1f80_1080..0x1f80_1100 => self.dma.read_reg(p),
             0x1f80_1100..0x1f80_1130 => {
                 let Bus { timers, irq, now, .. } = self;
@@ -258,16 +266,22 @@ impl Bus {
             0x1f80_1060 => self.ram_size = val,
             0x1f80_1070 => self.irq.stat &= val, // write-0-to-acknowledge
             0x1f80_1074 => self.irq.mask = val,
-            0x1f80_1040..0x1f80_1060 => {
-                trace!(target: "psx_core::sio", "stub write {p:#010x} = {val:#x}");
-                let i = ((p - 0x1f80_1040) / 4) as usize;
-                let shift = (p & 3) * 8;
-                let mask = match width {
-                    1 => 0xffu32 << shift,
-                    2 => 0xffffu32 << shift,
-                    _ => 0xffff_ffff,
-                };
-                self.sio_regs[i] = (self.sio_regs[i] & !mask) | ((val << shift) & mask);
+            0x1f80_1040 => {
+                let Bus { sio, irq, .. } = self;
+                sio.write_data(val as u8, irq);
+            }
+            0x1f80_1044..0x1f80_1050 => {
+                if width == 4 && p == 0x1f80_1048 {
+                    self.sio.write_reg16(0x8, val as u16);
+                    self.sio.write_reg16(0xa, (val >> 16) as u16);
+                } else {
+                    self.sio.write_reg16(p, val as u16);
+                }
+            }
+            0x1f80_1050..0x1f80_1060 => {
+                trace!(target: "psx_core::sio", "SIO1 stub write {p:#010x} = {val:#x}");
+                let i = ((p - 0x1f80_1050) / 4) as usize;
+                self.sio1_regs[i] = val;
             }
             0x1f80_1080..0x1f80_1100 => {
                 if let Some(ch) = self.dma.write_reg(p, val) {
@@ -278,9 +292,7 @@ impl Bus {
                 let Bus { timers, irq, now, .. } = self;
                 timers.write(p, val, *now, irq);
             }
-            0x1f80_1800..0x1f80_1804 => {
-                debug!(target: "psx_core::cdrom", "stub write {p:#010x} = {val:#04x}");
-            }
+            0x1f80_1800..0x1f80_1804 => self.cdrom.write8(p, val as u8, self.now),
             0x1f80_1810 => self.gpu.gp0(val),
             0x1f80_1814 => self.gpu.gp1(val),
             0x1f80_1c00..0x1f80_2000 => {
@@ -306,6 +318,7 @@ impl Bus {
     fn run_dma(&mut self, ch: usize) {
         match ch {
             2 => self.dma_gpu(),
+            3 => self.dma_cdrom(),
             6 => self.dma_otc(),
             _ => warn!(target: "psx_core::dma", "DMA{ch} not implemented"),
         }
@@ -313,6 +326,22 @@ impl Bus {
         self.dma.ch[ch].finish();
         if self.dma.complete(ch) {
             self.irq.raise(3);
+        }
+    }
+
+    /// Channel 3: CD-ROM sector data into RAM.
+    fn dma_cdrom(&mut self) {
+        let c = self.dma.ch[3];
+        let words = match c.bcr & 0xffff {
+            0 => 0x10000u32,
+            n => n,
+        };
+        trace!(target: "psx_core::dma", "CDROM dma {words} words to {:#08x}", c.madr);
+        let mut addr = c.madr;
+        for _ in 0..words {
+            let w = self.cdrom.dma_read_word();
+            self.write_ram32(addr, w);
+            addr = addr.wrapping_add(4);
         }
     }
 

@@ -4,10 +4,12 @@
 //! (native, wasm) drive [`PsxSystem`] and present its output.
 
 pub mod bus;
+pub mod cdrom;
 pub mod cpu;
 pub mod dma;
 pub mod gpu;
 pub mod scheduler;
+pub mod sio;
 pub mod timers;
 
 use bus::Bus;
@@ -51,6 +53,15 @@ impl PsxSystem {
         &self.tty
     }
 
+    pub fn insert_disc(&mut self, disc: cdrom::Disc) {
+        self.bus.cdrom.insert_disc(disc);
+    }
+
+    /// Update controller state (bits per [`sio::button`], set = pressed).
+    pub fn set_buttons(&mut self, buttons: u16) {
+        self.bus.sio.buttons = buttons;
+    }
+
     /// Execute a single CPU instruction, then fire any due events.
     pub fn step(&mut self) {
         self.observe_tty();
@@ -58,6 +69,9 @@ impl PsxSystem {
         self.cpu.step(&mut self.bus);
         // TODO: refine with memory wait states and I-cache timing
         self.cycles += 1;
+
+        let bus::Bus { cdrom, irq, .. } = &mut self.bus;
+        cdrom.tick(self.cycles, irq);
 
         while let Some(event) = self.scheduler.pop_due(self.cycles) {
             self.handle_event(event);

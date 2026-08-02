@@ -1,7 +1,26 @@
 //! egui debug shell: run control, CPU registers, TTY console.
 
 use eframe::egui;
+use psx_core::sio::button;
 use psx_core::{CPU_CLOCK_HZ, PsxSystem};
+
+/// Keyboard -> digital pad mapping.
+const KEYMAP: [(egui::Key, u16); 14] = [
+    (egui::Key::ArrowUp, button::UP),
+    (egui::Key::ArrowDown, button::DOWN),
+    (egui::Key::ArrowLeft, button::LEFT),
+    (egui::Key::ArrowRight, button::RIGHT),
+    (egui::Key::X, button::CROSS),
+    (egui::Key::C, button::CIRCLE),
+    (egui::Key::S, button::SQUARE),
+    (egui::Key::D, button::TRIANGLE),
+    (egui::Key::Q, button::L1),
+    (egui::Key::E, button::R1),
+    (egui::Key::Num1, button::L2),
+    (egui::Key::Num3, button::R2),
+    (egui::Key::Enter, button::START),
+    (egui::Key::Backspace, button::SELECT),
+];
 
 const REG_NAMES: [&str; 32] = [
     "zero", "at", "v0", "v1", "a0", "a1", "a2", "a3", //
@@ -59,6 +78,14 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let buttons = ctx.input(|i| {
+            KEYMAP
+                .iter()
+                .filter(|(k, _)| i.key_down(*k))
+                .fold(0u16, |acc, (_, b)| acc | b)
+        });
+        self.sys.set_buttons(buttons);
+
         if self.running {
             // One video frame worth of CPU time per UI frame (assumes ~60 fps
             // UI; will be replaced by proper pacing once the GPU exists).
