@@ -4,14 +4,13 @@
 //!   psx-app --headless --cycles 30000000 [--bios assets/SCPH-1000.bin]
 
 mod audio;
+mod config;
 mod ui;
 
 use psx_core::PsxSystem;
 
-const DEFAULT_BIOS: &str = "assets/SCPH-1000.bin";
-
 struct Args {
-    bios: String,
+    bios: Option<String>,
     disc: Option<String>,
     headless: bool,
     cycles: u64,
@@ -21,7 +20,7 @@ struct Args {
 
 fn parse_args() -> Args {
     let mut args = Args {
-        bios: DEFAULT_BIOS.to_string(),
+        bios: None,
         disc: None,
         headless: false,
         cycles: 30_000_000,
@@ -32,7 +31,7 @@ fn parse_args() -> Args {
     while let Some(a) = it.next() {
         match a.as_str() {
             "--headless" => args.headless = true,
-            "--bios" => args.bios = it.next().expect("--bios needs a path"),
+            "--bios" => args.bios = Some(it.next().expect("--bios needs a path")),
             "--disc" => args.disc = Some(it.next().expect("--disc needs a path")),
             "--cycles" => {
                 args.cycles = it
@@ -68,8 +67,24 @@ fn main() -> eframe::Result {
         .init();
 
     let args = parse_args();
-    let bios = std::fs::read(&args.bios)
-        .unwrap_or_else(|e| panic!("failed to read BIOS '{}': {e}", args.bios));
+    let (cfg, cfg_path) = config::Config::load();
+
+    // CLI takes precedence over the config file
+    let bios_path = args
+        .bios
+        .clone()
+        .map(std::path::PathBuf::from)
+        .or_else(|| cfg.bios.clone())
+        .unwrap_or_else(|| {
+            eprintln!("No BIOS configured.");
+            eprintln!("Set `bios = \"...\"` in the config file or pass --bios <path>.");
+            if let Some(p) = &cfg_path {
+                eprintln!("Config file: {}", p.display());
+            }
+            std::process::exit(2);
+        });
+    let bios = std::fs::read(&bios_path)
+        .unwrap_or_else(|e| panic!("failed to read BIOS '{}': {e}", bios_path.display()));
     let mut sys = PsxSystem::new(bios.clone()).expect("failed to create system");
     if let Some(path) = &args.disc {
         sys.insert_disc(load_disc(path));
@@ -90,7 +105,7 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "PS1e",
         options,
-        Box::new(move |_cc| Ok(Box::new(ui::App::new(sys, bios)))),
+        Box::new(move |_cc| Ok(Box::new(ui::App::new(sys, bios, cfg, cfg_path)))),
     )
 }
 

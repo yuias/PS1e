@@ -11,3 +11,5 @@ tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 eframe = { version = "0.32", features = ["wgpu"] }
 cpal = "0.16"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"

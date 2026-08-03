@@ -1,7 +1,9 @@
 //! egui debug shell: run control, CPU registers, TTY console.
 
 use crate::audio::Audio;
+use crate::config::Config;
 use eframe::egui;
+use std::path::PathBuf;
 use psx_core::sio::button;
 use psx_core::{CPU_CLOCK_HZ, PsxSystem};
 
@@ -42,10 +44,12 @@ pub struct App {
     sample_scratch: Vec<i16>,
     /// Master volume applied on top of the SPU output (0..=1).
     volume: f32,
+    config: Config,
+    config_path: Option<PathBuf>,
 }
 
 impl App {
-    pub fn new(sys: PsxSystem, bios: Vec<u8>) -> Self {
+    pub fn new(sys: PsxSystem, bios: Vec<u8>, config: Config, config_path: Option<PathBuf>) -> Self {
         Self {
             sys,
             bios,
@@ -55,10 +59,26 @@ impl App {
             vram_tex: None,
             audio: Audio::new(),
             sample_scratch: Vec::new(),
-            volume: 0.5,
+            volume: config.volume.clamp(0.0, 1.0),
+            config,
+            config_path,
         }
     }
+}
 
+impl Drop for App {
+    /// Persist settings changed from the UI (currently just the volume).
+    fn drop(&mut self) {
+        if let Some(path) = &self.config_path {
+            if (self.config.volume - self.volume).abs() > f32::EPSILON {
+                self.config.volume = self.volume;
+                self.config.save(path);
+            }
+        }
+    }
+}
+
+impl App {
     /// The display area as an egui image, honoring the 24-bit display mode
     /// (packed RGB888 in VRAM, e.g. FMV frames).
     fn display_image(&self) -> egui::ColorImage {
