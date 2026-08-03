@@ -75,6 +75,9 @@ pub struct Cdrom {
     filter_channel: u8,
     motor_on: bool,
     reading: bool,
+    /// CD audio mute (Mute/Demute commands). Muted XA decodes are
+    /// discarded — games mute right before Pause to cut the tail.
+    muted: bool,
     /// Seek target (LBA) latched by Setloc, applied by Seek/Read.
     seek_target: u32,
     read_lba: u32,
@@ -82,6 +85,11 @@ pub struct Cdrom {
     head_lba: u32,
     /// When the next sector passes under the head during reading.
     next_sector_at: u64,
+    /// Header + subheader (mm,ss,ff,mode,file,channel,submode,coding) of
+    /// the last sector that passed under the head — GetlocL returns this.
+    /// Games poll it during XA playback to spot the EOF submode flag that
+    /// terminates a voice clip.
+    last_header: [u8; 8],
     /// Payload of the most recently announced data sector (INT1).
     sector_buffer: Vec<u8>,
     /// Data FIFO exposed at register 2 / DMA channel 3.
@@ -120,10 +128,12 @@ impl Cdrom {
             filter_channel: 0,
             motor_on: true,
             reading: false,
+            muted: false,
             seek_target: 0,
             read_lba: 0,
             head_lba: 0,
             next_sector_at: 0,
+            last_header: [0; 8],
             sector_buffer: Vec::new(),
             data: Vec::new(),
             data_pos: 0,
@@ -211,9 +221,11 @@ impl Cdrom {
             Data(Vec<u8>),
             End,
         }
+        let mut header = [0u8; 8];
         let action = match self.disc.as_ref().and_then(|d| d.sector(self.read_lba)) {
             None => Action::End,
             Some(raw) => {
+                header.copy_from_slice(&raw[0x0c..0x14]);
                 let (file, channel, submode) = (raw[0x10], raw[0x11], raw[0x12]);
                 // Realtime + audio submode bits, with the XA mode enabled
                 if self.mode & 0x40 != 0 && submode & 0x44 == 0x44 {
@@ -238,25 +250,39 @@ impl Cdrom {
                 self.reading = false;
             }
             Action::Xa(raw) => {
+                if self.muted {
+                    // Muted playback doesn't reach the SPU; the drive keeps
+                    // its normal pace (nothing gates it)
+                    self.last_header = header;
+                    self.advance_sector(now);
+                    return;
+                }
                 // Back-pressure: voice files are often stored WITHOUT
                 // interleave (every sector is audio), which arrives ~14x
                 // faster than playback. The real decoder chain gates the
                 // drive through its buffering; model that by holding the
                 // sector until the decoded backlog drains below ~2 sectors.
+                // The header (GetlocL) only updates once the sector is
+                // actually consumed.
                 if self.xa_out.len() / 2 > 9_408 {
                     return;
                 }
+                self.last_header = header;
                 trace!(target: "psx_core::cdrom",
                        "XA sector LBA {} file {} ch {}", self.read_lba, raw[0x10], raw[0x11]);
                 self.decode_xa_sector(&raw);
                 self.advance_sector(now);
             }
-            Action::XaFiltered => self.advance_sector(now),
+            Action::XaFiltered => {
+                self.last_header = header;
+                self.advance_sector(now);
+            }
             Action::Data(payload) => {
                 // Hold until the previous interrupt is acknowledged
                 if self.int_flag & 7 != 0 || !self.pending.is_empty() {
                     return;
                 }
+                self.last_header = header;
                 trace!(target: "psx_core::cdrom", "staged LBA {}", self.read_lba);
                 self.sector_buffer = payload;
                 let st = self.stat_byte();
@@ -478,11 +504,17 @@ impl Cdrom {
                 self.push_int(now, COMPLETE_DELAY, 2, vec![self.stat_byte()]);
             }
             0x06 | 0x1b => {
-                // ReadN / ReadS: implicit seek to the Setloc target
+                // ReadN / ReadS: implicit seek to the Setloc target.
+                // Undelivered XA from a previous stream is flushed so clips
+                // don't bleed into each other.
                 let seek = self.seek_cycles(self.seek_target);
                 self.read_lba = self.seek_target;
                 self.reading = true;
                 self.motor_on = true;
+                self.xa_out.clear();
+                self.xa_hist = [(0, 0); 2];
+                self.xa_prev = (0, 0);
+                self.xa_phase = 0;
                 self.next_sector_at = now + ACK_DELAY + seek + self.sector_period();
                 let st = self.stat_byte();
                 self.push_int(now, ACK_DELAY, 3, vec![st]);
@@ -514,7 +546,17 @@ impl Cdrom {
                 self.push_int(now, ACK_DELAY, 3, vec![st]);
                 self.push_int(now, COMPLETE_DELAY, 2, vec![st]);
             }
-            0x0b | 0x0c => self.push_int(now, ACK_DELAY, 3, vec![st]), // Mute / Demute
+            0x0b => {
+                // Mute: silence CD audio immediately, including anything
+                // already decoded but not yet mixed
+                self.muted = true;
+                self.xa_out.clear();
+                self.push_int(now, ACK_DELAY, 3, vec![st]);
+            }
+            0x0c => {
+                self.muted = false;
+                self.push_int(now, ACK_DELAY, 3, vec![st]);
+            }
             0x0d => {
                 // Setfilter(file, channel)
                 if params.len() >= 2 {
@@ -531,9 +573,10 @@ impl Cdrom {
                 self.push_int(now, ACK_DELAY, 3, vec![st]);
             }
             0x10 => {
-                // GetlocL: header of the last read sector (approximate)
-                let (mm, ss, ff) = lba_to_bcd_msf(self.read_lba);
-                self.push_int(now, ACK_DELAY, 3, vec![mm, ss, ff, self.mode, 0, 0, 0, 0]);
+                // GetlocL: real header + subheader of the last read sector.
+                // The subheader matters: XA voice clips end with an
+                // EOF-flagged sector that games poll for here.
+                self.push_int(now, ACK_DELAY, 3, self.last_header.to_vec());
             }
             0x11 => {
                 // GetlocP: track position (single data track assumed)
@@ -687,6 +730,37 @@ mod tests {
         cd.write8(0, 0, 0);
         cd.write8(3, 0x80, t);
         assert_eq!(cd.read8(2), 0xab);
+    }
+
+    #[test]
+    fn getlocl_reports_real_subheader_including_eof() {
+        let mut cd = Cdrom::new();
+        let mut irq = Irq::default();
+        cd.int_enable = 0x1f;
+        let mut img = vec![0u8; RAW_SECTOR];
+        img[0x0c..0x0f].copy_from_slice(&[0x00, 0x02, 0x00]); // header MSF
+        img[0x10] = 2; // file
+        img[0x11] = 1; // channel
+        img[0x12] = 0xc4; // submode: EOF + realtime + audio
+        img[0x13] = 0x00; // coding: mono 37800
+        cd.insert_disc(Disc::new(img).unwrap());
+        cd.write8(2, 0xc0, 0);
+        cd.write8(1, 0x0e, 0); // Setmode XA
+        cd.write8(0, 1, 0);
+        acked(&mut cd, &mut irq, ACK_DELAY + 1);
+        cd.write8(0, 0, 0);
+        cd.write8(1, 0x06, 0); // ReadN LBA 0
+        cd.write8(0, 1, 0);
+        let t = ACK_DELAY + 2;
+        acked(&mut cd, &mut irq, t);
+        let t = t + cd.seek_cycles(0) + CPU_HZ / 150 + ACK_DELAY;
+        cd.tick(t, &mut irq); // XA sector consumed silently
+        cd.write8(0, 0, 0);
+        cd.write8(1, 0x10, t); // GetlocL
+        cd.write8(0, 1, 0);
+        let (int, resp) = acked(&mut cd, &mut irq, t + ACK_DELAY + 1);
+        assert_eq!(int, 3);
+        assert_eq!(resp, vec![0x00, 0x02, 0x00, 0x00, 2, 1, 0xc4, 0x00]);
     }
 
     #[test]
