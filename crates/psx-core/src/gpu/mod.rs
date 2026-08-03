@@ -144,7 +144,20 @@ impl Gpu {
     }
 
     pub fn display_resolution(&self) -> (u32, u32) {
-        (self.hres as u32, self.vres as u32)
+        // Visible height comes from the GP1(07) vertical range, not a fixed
+        // 240/480: BIOSes/games display fewer lines (e.g. 232) and showing
+        // more scans out garbage below the framebuffer.
+        let lines = self
+            .display_v_range
+            .1
+            .saturating_sub(self.display_v_range.0) as u32;
+        let lines = if lines == 0 { 240 } else { lines.min(256) };
+        let h = if self.vres == 480 {
+            (lines * 2).min(480)
+        } else {
+            lines
+        };
+        (self.hres as u32, h)
     }
 
     pub fn display_vram_start(&self) -> (u32, u32) {
