@@ -117,6 +117,11 @@ impl Spu {
         }
     }
 
+    /// Buffered CD-input frames (for the drive's back-pressure check).
+    pub fn cd_in_level(&self) -> usize {
+        self.cd_in.len()
+    }
+
     /// Feed one 44.1kHz stereo frame of CD/XA audio.
     pub fn push_cd_audio(&mut self, l: i16, r: i16) {
         // Bound to ~1s in case the SPU is disabled while the drive streams

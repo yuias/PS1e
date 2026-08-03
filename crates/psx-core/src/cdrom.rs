@@ -238,6 +238,14 @@ impl Cdrom {
                 self.reading = false;
             }
             Action::Xa(raw) => {
+                // Back-pressure: voice files are often stored WITHOUT
+                // interleave (every sector is audio), which arrives ~14x
+                // faster than playback. The real decoder chain gates the
+                // drive through its buffering; model that by holding the
+                // sector until the decoded backlog drains below ~2 sectors.
+                if self.xa_out.len() / 2 > 9_408 {
+                    return;
+                }
                 trace!(target: "psx_core::cdrom",
                        "XA sector LBA {} file {} ch {}", self.read_lba, raw[0x10], raw[0x11]);
                 self.decode_xa_sector(&raw);
@@ -679,6 +687,47 @@ mod tests {
         cd.write8(0, 0, 0);
         cd.write8(3, 0x80, t);
         assert_eq!(cd.read8(2), 0xab);
+    }
+
+    #[test]
+    fn contiguous_xa_is_throttled_to_playback_rate() {
+        // 20 back-to-back mono audio sectors (no interleave, like voice
+        // files): the drive must gate on the decoder instead of dropping.
+        let mut cd = Cdrom::new();
+        let mut irq = Irq::default();
+        cd.int_enable = 0x1f;
+        let mut img = vec![0u8; RAW_SECTOR * 20];
+        for s in 0..20 {
+            img[s * RAW_SECTOR + 0x12] = 0x44; // realtime + audio
+            img[s * RAW_SECTOR + 0x13] = 0x00; // mono 37800Hz 4bit
+        }
+        cd.insert_disc(Disc::new(img).unwrap());
+        cd.write8(2, 0xc0, 0); // double speed + XA
+        cd.write8(1, 0x0e, 0);
+        cd.write8(0, 1, 0);
+        acked(&mut cd, &mut irq, ACK_DELAY + 1);
+        cd.write8(0, 0, 0);
+        cd.write8(1, 0x06, 0); // ReadN from LBA 0
+        cd.write8(0, 1, 0);
+        acked(&mut cd, &mut irq, ACK_DELAY + 1);
+
+        // Drain like the SPU: 1 frame per 768 cycles
+        let mut now = ACK_DELAY + 2;
+        let mut consumed = 0u64;
+        // Mono 37800 sector -> 4704 output frames; 20 sectors ~ 2.1s audio
+        for _ in 0..150_000_000u64 / 768 {
+            now += 768;
+            cd.tick(now, &mut irq);
+            if cd.xa_out.len() >= 2 {
+                cd.xa_out.pop_front();
+                cd.xa_out.pop_front();
+                consumed += 1;
+            }
+        }
+        assert_eq!(cd.xa_dropped, 0, "back-pressure must prevent drops");
+        assert_eq!(cd.xa_sectors, 20);
+        // All frames delivered at the consumption rate
+        assert_eq!(consumed, cd.xa_frames);
     }
 
     #[test]

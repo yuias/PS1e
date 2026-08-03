@@ -79,8 +79,11 @@ impl PsxSystem {
         let bus::Bus { cdrom, sio, spu, irq, .. } = &mut self.bus;
         cdrom.tick(self.cycles, irq);
         sio.tick(self.cycles, irq);
-        // Route decoded XA audio into the SPU's CD input
-        while let Some(l) = cdrom.xa_out.pop_front() {
+        // Route decoded XA audio into the SPU's CD input. Cap the SPU-side
+        // level so backlog stays in the drive's buffer, where it throttles
+        // further sector reads (see cdrom back-pressure).
+        while spu.cd_in_level() < 9_408 {
+            let Some(l) = cdrom.xa_out.pop_front() else { break };
             let r = cdrom.xa_out.pop_front().unwrap_or(0);
             spu.push_cd_audio(l, r);
         }
