@@ -74,6 +74,12 @@ pub struct Gpu {
     /// Toggles every frame (GPUSTAT bit 31).
     pub odd_frame: bool,
 
+    /// When set, every executed GP0/GP1 command is decoded to the
+    /// `psx_core::gpu::cmd` tracing target at debug level.
+    pub log_commands: bool,
+    /// Vblank count since reset; tags command-log entries with the frame.
+    pub frame_count: u64,
+
     /// Buffered VRAM->CPU transfer data, popped via GPUREAD.
     read_queue: VecDeque<u32>,
 
@@ -132,6 +138,8 @@ impl Gpu {
             dma_direction: 0,
             irq_pending: false,
             odd_frame: false,
+            log_commands: false,
+            frame_count: 0,
             read_queue: VecDeque::new(),
             frame: Frame::default(),
         }
@@ -174,6 +182,7 @@ impl Gpu {
     /// Called by the system once per vblank.
     pub fn vblank(&mut self) {
         self.odd_frame = !self.odd_frame;
+        self.frame_count += 1;
         self.capture_frame();
     }
 
@@ -324,6 +333,11 @@ impl Gpu {
         } else {
             vec![head, self.poly_last_vertex, v2]
         };
+        if self.log_commands {
+            debug!(target: "psx_core::gpu::cmd",
+                   "[f{}] GP0(..) polyline seg {:?}->{:?}",
+                   self.frame_count, vertex(self.poly_last_vertex), vertex(v2));
+        }
         self.draw_line_command(&cmd);
         self.poly_last_color = c2 & 0x00ff_ffff;
         self.poly_last_vertex = v2;
@@ -362,6 +376,9 @@ impl Gpu {
     }
 
     fn execute(&mut self, op: u8, cmd: &[u32]) {
+        if self.log_commands {
+            self.log_command(op, cmd);
+        }
         match op {
             0x00 => {}                     // nop
             0x01 => {}                     // clear texture cache (no cache yet)
@@ -427,15 +444,130 @@ impl Gpu {
         }
     }
 
+    /// Decode one executed GP0 command into a human-readable log line.
+    /// Nops are skipped to keep the stream readable.
+    fn log_command(&self, op: u8, cmd: &[u32]) {
+        use std::fmt::Write;
+        let desc = match op {
+            0x00 => return,
+            0x01 => "clear texture cache".to_string(),
+            0x02 => {
+                let (x, y) = unpack_coord(cmd[1]);
+                let (w, h) = ((cmd[2] & 0x3ff) as u16, ((cmd[2] >> 16) & 0x1ff) as u16);
+                format!("fill rect {w}x{h} at ({x},{y}) color={:06x}", cmd[0] & 0xff_ffff)
+            }
+            0x1f => "irq request".to_string(),
+            0x20..=0x3f => {
+                let quad = op & 0x08 != 0;
+                let gouraud = op & 0x10 != 0;
+                let textured = op & 0x04 != 0;
+                let stride = 1 + textured as usize + gouraud as usize;
+                let mut verts = String::new();
+                for i in 0..if quad { 4 } else { 3 } {
+                    let (x, y) = vertex(cmd[1 + i * stride]);
+                    let _ = write!(verts, "({x},{y})");
+                }
+                format!(
+                    "{} {}{}{}{}verts={verts} color={:06x}",
+                    if quad { "quad" } else { "tri" },
+                    if gouraud { "gouraud " } else { "flat " },
+                    if textured { "textured " } else { "" },
+                    if op & 0x02 != 0 { "semi " } else { "" },
+                    if textured && op & 0x01 != 0 { "raw " } else { "" },
+                    cmd[0] & 0xff_ffff,
+                )
+            }
+            0x40..=0x5f => {
+                let gouraud = op & 0x10 != 0;
+                let v1 = cmd[if gouraud { 3 } else { 2 }];
+                format!(
+                    "line{}{} {:?}->{:?} color={:06x}",
+                    if gouraud { " gouraud" } else { "" },
+                    if op & 0x08 != 0 { " (polyline start)" } else { "" },
+                    vertex(cmd[1]),
+                    vertex(v1),
+                    cmd[0] & 0xff_ffff,
+                )
+            }
+            0x60..=0x7f => {
+                let textured = op & 0x04 != 0;
+                let (w, h) = match (op >> 3) & 3 {
+                    0 => {
+                        let s = cmd[2 + textured as usize];
+                        ((s & 0x3ff) as u16, ((s >> 16) & 0x1ff) as u16)
+                    }
+                    1 => (1, 1),
+                    2 => (8, 8),
+                    _ => (16, 16),
+                };
+                format!(
+                    "rect{} {w}x{h} at {:?} color={:06x}",
+                    if textured { " textured" } else { "" },
+                    vertex(cmd[1]),
+                    cmd[0] & 0xff_ffff,
+                )
+            }
+            0x80..=0x9f => {
+                let (sx, sy) = unpack_coord(cmd[1]);
+                let (dx, dy) = unpack_coord(cmd[2]);
+                let (w, h) = unpack_size(cmd[3]);
+                format!("vram copy {w}x{h} ({sx},{sy})->({dx},{dy})")
+            }
+            0xa0..=0xbf => {
+                let (x, y) = unpack_coord(cmd[1]);
+                let (w, h) = unpack_size(cmd[2]);
+                format!("cpu->vram {w}x{h} at ({x},{y})")
+            }
+            0xc0..=0xdf => {
+                let (x, y) = unpack_coord(cmd[1]);
+                let (w, h) = unpack_size(cmd[2]);
+                format!("vram->cpu {w}x{h} at ({x},{y})")
+            }
+            0xe1 => format!("texpage {:06x}", cmd[0] & 0xff_ffff),
+            0xe2 => format!("tex window {:06x}", cmd[0] & 0xff_ffff),
+            0xe3 => format!("draw area min ({},{})", cmd[0] & 0x3ff, (cmd[0] >> 10) & 0x1ff),
+            0xe4 => format!("draw area max ({},{})", cmd[0] & 0x3ff, (cmd[0] >> 10) & 0x1ff),
+            0xe5 => {
+                let x = ((cmd[0] & 0x7ff) << 21) as i32 >> 21;
+                let y = (((cmd[0] >> 11) & 0x7ff) << 21) as i32 >> 21;
+                format!("draw offset ({x},{y})")
+            }
+            0xe6 => format!("mask force={} check={}", cmd[0] & 1, (cmd[0] >> 1) & 1),
+            _ => format!("unknown {:08x}", cmd[0]),
+        };
+        debug!(target: "psx_core::gpu::cmd", "[f{}] GP0({op:02x}) {desc}", self.frame_count);
+    }
+
     /// GP1: display control.
     pub fn gp1(&mut self, word: u32) {
         let op = word >> 24;
+        if self.log_commands {
+            let name = match op {
+                0x00 => "reset",
+                0x01 => "reset command buffer",
+                0x02 => "ack irq",
+                0x03 => "display enable",
+                0x04 => "dma direction",
+                0x05 => "display vram start",
+                0x06 => "display h-range",
+                0x07 => "display v-range",
+                0x08 => "display mode",
+                0x10..=0x1f => "get info",
+                _ => "unknown",
+            };
+            debug!(target: "psx_core::gpu::cmd",
+                   "[f{}] GP1({op:02x}) {name} {:06x}", self.frame_count, word & 0xff_ffff);
+        }
         match op {
             0x00 => {
-                // Full state reset; VRAM contents survive a GP1 reset
+                // Full state reset; VRAM contents, the command-log switch and
+                // the frame counter survive a GP1 reset
                 let vram = std::mem::take(&mut self.vram);
+                let (log, frames) = (self.log_commands, self.frame_count);
                 *self = Gpu::new();
                 self.vram = vram;
+                self.log_commands = log;
+                self.frame_count = frames;
             }
             0x01 => {
                 self.fifo.clear();
@@ -570,6 +702,13 @@ impl Default for Gpu {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Vertex word as the signed 11-bit coordinates the rasterizer sees.
+fn vertex(w: u32) -> (i32, i32) {
+    let x = ((w & 0x7ff) << 21) as i32 >> 21;
+    let y = (((w >> 16) & 0x7ff) << 21) as i32 >> 21;
+    (x, y)
 }
 
 /// Vertex-style coordinate word: x in bits 0..10, y in bits 16..25.

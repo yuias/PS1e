@@ -213,6 +213,8 @@ impl eframe::App for App {
                 }
                 ui.separator();
                 ui.checkbox(&mut self.show_vram, "VRAM viewer");
+                ui.checkbox(&mut self.sys.bus.gpu.log_commands, "GPU cmd log")
+                    .on_hover_text("decode every GP0/GP1 command to the log (debug level)");
                 ui.separator();
                 ui.label("🔊");
                 ui.add(
