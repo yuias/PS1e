@@ -6,9 +6,10 @@
 //! voice fetching the IRQ address (sound drivers use a looping voice over
 //! the IRQ address as their tick).
 //!
-//! Not yet modeled: reverb, noise generator, pitch modulation (FM), volume
-//! sweeps (treated as fixed max), gaussian interpolation (nearest sample),
-//! and CD-audio mixing.
+//! Also modeled: reverb, the noise generator, pitch modulation (PMON) and
+//! 4-point interpolation (Catmull-Rom; audibly equivalent to the hardware
+//! gaussian table — swap the table in for bit-accuracy later). Volume
+//! sweeps are still treated as fixed maximum.
 
 use crate::bus::Irq;
 use std::collections::VecDeque;
@@ -43,6 +44,8 @@ struct Voice {
     /// 4.12 fixed-point position within the decoded block.
     pitch_counter: u32,
     decoded: [i16; 28],
+    /// Tail of the previous block, for interpolation across boundaries.
+    carry: [i16; 3],
     hist: (i32, i32),
     phase: Phase,
     /// 15-bit envelope level.
@@ -58,6 +61,7 @@ impl Default for Voice {
             repeat_addr: 0,
             pitch_counter: 0,
             decoded: [0; 28],
+            carry: [0; 3],
             hist: (0, 0),
             phase: Phase::Off,
             adsr_vol: 0,
@@ -83,6 +87,11 @@ pub struct Spu {
     rev_cur: usize,
     rev_phase: bool,
     rev_out: (i32, i32),
+    /// Noise generator (LFSR clocked by SPUCNT bits 8-13).
+    noise_lfsr: u16,
+    noise_timer: i32,
+    /// Per-voice output of the current sample, for pitch modulation.
+    last_out: [i32; 24],
 }
 
 impl Spu {
@@ -99,6 +108,9 @@ impl Spu {
             rev_cur: 0,
             rev_phase: false,
             rev_out: (0, 0),
+            noise_lfsr: 1,
+            noise_timer: 0,
+            last_out: [0; 24],
         }
     }
 
@@ -232,6 +244,8 @@ impl Spu {
             voice.repeat_addr = start;
             voice.pitch_counter = 0x1c << 12; // force first block fetch
             voice.hist = (0, 0);
+            voice.decoded = [0; 28];
+            voice.carry = [0; 3];
             voice.phase = Phase::Attack;
             voice.adsr_vol = 0;
             voice.env_wait = 0;
@@ -279,11 +293,17 @@ impl Spu {
         let mut rev_l = 0i32;
         let mut rev_r = 0i32;
 
+        self.step_noise();
+        let noise_on = (self.reg(0x194) as u32) | (self.reg(0x196) as u32) << 16;
+        let pmon = (self.reg(0x190) as u32) | (self.reg(0x192) as u32) << 16;
+
         for v in 0..24 {
             if self.voices[v].phase == Phase::Off {
+                self.last_out[v] = 0;
                 continue;
             }
-            let sample = self.step_voice(v, irq);
+            let sample = self.step_voice(v, irq, noise_on, pmon);
+            self.last_out[v] = sample;
             let vol_l = Self::volume(self.voice_reg(v, 0x0));
             let vol_r = Self::volume(self.voice_reg(v, 0x2));
             let (sl, sr) = (sample * vol_l >> 15, sample * vol_r >> 15);
@@ -428,17 +448,52 @@ impl Spu {
         (mul(out_l, v_lout), mul(out_r, v_rout))
     }
 
+    /// Clock the noise LFSR (rate from SPUCNT bits 8-13).
+    fn step_noise(&mut self) {
+        let cnt = self.spucnt() as u32;
+        let shift = (cnt >> 10) & 0xf;
+        let step = 4 + ((cnt >> 8) & 3) as i32;
+        self.noise_timer -= step;
+        while self.noise_timer < 0 {
+            self.noise_timer += 0x20000 >> shift;
+            let l = self.noise_lfsr;
+            let parity = ((l >> 15) ^ (l >> 12) ^ (l >> 11) ^ (l >> 10) ^ 1) & 1;
+            self.noise_lfsr = (l << 1) | parity;
+        }
+    }
+
     /// Advance one voice by one sample: pitch step, block decode, envelope.
-    fn step_voice(&mut self, v: usize, irq: &mut Irq) -> i32 {
-        // Pitch step (0x1000 = 44100 Hz), capped at 4x
-        let pitch = (self.voice_reg(v, 0x4) as u32).min(0x4000);
-        self.voices[v].pitch_counter += pitch;
+    fn step_voice(&mut self, v: usize, irq: &mut Irq, noise_on: u32, pmon: u32) -> i32 {
+        // Pitch step (0x1000 = 44100 Hz), capped at 4x. PMON scales the
+        // step by the previous voice's current output.
+        let mut step = (self.voice_reg(v, 0x4) as u32).min(0x4000) as i32;
+        if v > 0 && pmon & (1 << v) != 0 {
+            let factor = self.last_out[v - 1].clamp(-0x8000, 0x7fff);
+            step = (step * (0x8000 + factor)) >> 15;
+        }
+        self.voices[v].pitch_counter += step.clamp(0, 0x4000) as u32;
         while self.voices[v].pitch_counter >= 28 << 12 {
             self.voices[v].pitch_counter -= 28 << 12;
             self.fetch_block(v, irq);
         }
-        let idx = (self.voices[v].pitch_counter >> 12) as usize;
-        let raw = self.voices[v].decoded[idx.min(27)] as i32;
+
+        let raw = if noise_on & (1 << v) != 0 {
+            self.noise_lfsr as i16 as i32
+        } else {
+            // 4-point interpolation around the current position; the two
+            // middle points span the fractional interval
+            let voice = &self.voices[v];
+            let idx = (voice.pitch_counter >> 12) as i32;
+            let t = (voice.pitch_counter & 0xfff) as i32;
+            let at = |k: i32| -> i32 {
+                if k < 0 {
+                    voice.carry[(3 + k) as usize] as i32
+                } else {
+                    voice.decoded[k.min(27) as usize] as i32
+                }
+            };
+            catmull_rom(at(idx - 3), at(idx - 2), at(idx - 1), at(idx), t)
+        };
 
         self.tick_envelope(v);
         raw * self.voices[v].adsr_vol >> 15
@@ -459,6 +514,9 @@ impl Spu {
         let flags = self.ram[addr + 1];
         let shift = (header & 0xf).min(12) as i32;
         let filter = ((header >> 4) & 7).min(4) as usize;
+        // Preserve the block tail for interpolation continuity
+        let tail = &self.voices[v].decoded[25..28];
+        self.voices[v].carry = [tail[0], tail[1], tail[2]];
         let (mut h0, mut h1) = self.voices[v].hist;
         for i in 0..28 {
             let byte = self.ram[addr + 2 + i / 2];
@@ -549,6 +607,20 @@ impl Default for Spu {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Catmull-Rom interpolation between p1 and p2 (t is a 12-bit fraction).
+fn catmull_rom(p0: i32, p1: i32, p2: i32, p3: i32, t: i32) -> i32 {
+    // Evaluate in 20.12 fixed point: 0.5*(2p1 + (p2-p0)t + (2p0-5p1+4p2-p3)t^2
+    // + (3p1-3p2+p3-p0)t^3)
+    let t = t as i64;
+    let (p0, p1, p2, p3) = (p0 as i64, p1 as i64, p2 as i64, p3 as i64);
+    let a = 3 * (p1 - p2) + p3 - p0;
+    let b = 2 * p0 - 5 * p1 + 4 * p2 - p3;
+    let c = p2 - p0;
+    let v = ((a * t >> 12) + b) * t >> 12;
+    let v = (v + c) * t >> 12;
+    (((v + 2 * p1) / 2) as i32).clamp(-0x8000, 0x7fff)
 }
 
 #[cfg(test)]

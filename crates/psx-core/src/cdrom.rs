@@ -91,7 +91,10 @@ pub struct Cdrom {
     /// the SPU by the system.
     pub xa_out: VecDeque<i16>,
     xa_hist: [(i32, i32); 2],
-    xa_frac: u32,
+    /// Resampler state: previous input frame and output phase in [0, 1)
+    /// scaled by the source rate.
+    xa_prev: (i16, i16),
+    xa_phase: u32,
 }
 
 impl Cdrom {
@@ -118,7 +121,8 @@ impl Cdrom {
             data_pos: 0,
             xa_out: VecDeque::new(),
             xa_hist: [(0, 0); 2],
-            xa_frac: 0,
+            xa_prev: (0, 0),
+            xa_phase: 0,
         }
     }
 
@@ -309,14 +313,21 @@ impl Cdrom {
         }
     }
 
-    /// Nearest-neighbor resample from the XA rate to the SPU's 44100 Hz.
+    /// Linear resample from the XA rate to the SPU's 44100 Hz. Output
+    /// samples between the previous and current input frame interpolate
+    /// on the phase accumulator.
     fn push_xa_frame(&mut self, l: i16, r: i16, src_rate: u32) {
-        self.xa_frac += 44_100;
-        while self.xa_frac >= src_rate {
-            self.xa_frac -= src_rate;
-            self.xa_out.push_back(l);
-            self.xa_out.push_back(r);
+        while self.xa_phase < 44_100 {
+            let t = self.xa_phase as i32;
+            let lerp = |a: i16, b: i16| {
+                (a as i32 + (b as i32 - a as i32) * t / 44_100) as i16
+            };
+            self.xa_out.push_back(lerp(self.xa_prev.0, l));
+            self.xa_out.push_back(lerp(self.xa_prev.1, r));
+            self.xa_phase += src_rate;
         }
+        self.xa_phase -= 44_100;
+        self.xa_prev = (l, r);
     }
 
     // --- Register interface -------------------------------------------
