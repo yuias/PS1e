@@ -296,7 +296,14 @@ impl eframe::App for App {
             let scale = (avail.x / 4.0).min(avail.y / 3.0);
             let size = egui::Vec2::new(scale * 4.0, scale * 3.0);
             ui.centered_and_justified(|ui| {
-                ui.add(egui::Image::new(&tex).fit_to_exact_size(size));
+                // maintain_aspect_ratio(false): the framebuffer's pixel aspect
+                // (e.g. 320x480 interlace, 512x240) rarely matches the 4:3
+                // output; egui would otherwise letterbox to the texture aspect.
+                ui.add(
+                    egui::Image::new(&tex)
+                        .fit_to_exact_size(size)
+                        .maintain_aspect_ratio(false),
+                );
             });
         });
 
