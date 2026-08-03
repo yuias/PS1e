@@ -100,31 +100,36 @@ impl Drop for App {
 }
 
 impl App {
-    /// The display area as an egui image, honoring the 24-bit display mode
-    /// (packed RGB888 in VRAM, e.g. FMV frames).
+    /// The last vblank frame as an egui image (15-bit or packed RGB888).
+    /// Rendering the vblank snapshot instead of live VRAM avoids catching
+    /// half-drawn frames (visible as irregular flicker).
     fn display_image(&self) -> egui::ColorImage {
-        let gpu = &self.sys.bus.gpu;
-        let (w, h) = gpu.display_resolution();
-        let (sx, sy) = gpu.display_vram_start();
-        if !gpu.is_24bit() {
-            return self.vram_image(sx, sy, w, h);
+        let frame = &self.sys.bus.gpu.frame;
+        let (w, h, stride) = (
+            frame.width as usize,
+            frame.height as usize,
+            frame.stride as usize,
+        );
+        let mut pixels = Vec::with_capacity(w * h);
+        if frame.pixels.len() < stride * h {
+            return egui::ColorImage::default(); // no frame captured yet
         }
-        let vram = &self.sys.bus.gpu.vram;
-        let mut pixels = Vec::with_capacity((w * h) as usize);
         for y in 0..h {
-            let row = (((sy + y) & 0x1ff) as usize) * 1024;
+            let row = &frame.pixels[y * stride..(y + 1) * stride];
             for x in 0..w {
-                // Pixel x starts at byte offset sx*2 + x*3 within the row
-                let byte = sx as usize * 2 + x as usize * 3;
-                let read = |b: usize| {
-                    let half = vram[row + ((byte + b) / 2) % 1024];
-                    (half >> (((byte + b) & 1) * 8)) as u8
-                };
-                pixels.push(egui::Color32::from_rgb(read(0), read(1), read(2)));
+                pixels.push(if frame.is_24bit {
+                    let byte = x * 3;
+                    let read = |b: usize| (row[(byte + b) / 2] >> (((byte + b) & 1) * 8)) as u8;
+                    egui::Color32::from_rgb(read(0), read(1), read(2))
+                } else {
+                    let px = row[x];
+                    let e = |c: u16| ((c << 3) | (c >> 2)) as u8;
+                    egui::Color32::from_rgb(e(px & 0x1f), e((px >> 5) & 0x1f), e((px >> 10) & 0x1f))
+                });
             }
         }
         egui::ColorImage {
-            size: [w as usize, h as usize],
+            size: [w, h],
             source_size: egui::Vec2::new(w as f32, h as f32),
             pixels,
         }
@@ -262,7 +267,7 @@ impl eframe::App for App {
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            let enabled = self.sys.bus.gpu.display_enabled();
+            let enabled = self.sys.bus.gpu.frame.enabled;
             let image = self.display_image();
             let tex = match &mut self.display_tex {
                 Some(t) => {

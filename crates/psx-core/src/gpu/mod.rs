@@ -76,6 +76,22 @@ pub struct Gpu {
 
     /// Buffered VRAM->CPU transfer data, popped via GPUREAD.
     read_queue: VecDeque<u32>,
+
+    /// Display area captured at the last vblank — what the TV shows.
+    /// Presenting this instead of live VRAM avoids mid-frame flicker.
+    pub frame: Frame,
+}
+
+/// A vblank snapshot of the display area, as raw VRAM halfwords per row
+/// (`stride` halfwords each; 24-bit rows pack 2 pixels into 3 halfwords).
+#[derive(Default)]
+pub struct Frame {
+    pub pixels: Vec<u16>,
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub is_24bit: bool,
+    pub enabled: bool,
 }
 
 impl Gpu {
@@ -117,6 +133,7 @@ impl Gpu {
             irq_pending: false,
             odd_frame: false,
             read_queue: VecDeque::new(),
+            frame: Frame::default(),
         }
     }
 
@@ -144,6 +161,31 @@ impl Gpu {
     /// Called by the system once per vblank.
     pub fn vblank(&mut self) {
         self.odd_frame = !self.odd_frame;
+        self.capture_frame();
+    }
+
+    /// Latch the display area into [`Frame`].
+    fn capture_frame(&mut self) {
+        let (w, h) = self.display_resolution();
+        let (sx, sy) = self.display_vram_start();
+        let stride = if self.color_24bit { (w * 3).div_ceil(2) } else { w };
+        self.frame.width = w;
+        self.frame.height = h;
+        self.frame.stride = stride;
+        self.frame.is_24bit = self.color_24bit;
+        self.frame.enabled = !self.display_disabled;
+        self.frame.pixels.clear();
+        self.frame
+            .pixels
+            .reserve((stride * h) as usize);
+        for y in 0..h {
+            let row = (((sy + y) & 0x1ff) as usize) * VRAM_WIDTH;
+            for x in 0..stride {
+                self.frame
+                    .pixels
+                    .push(self.vram[row + (((sx + x) & 0x3ff) as usize)]);
+            }
+        }
     }
 
     // --- Register interface -------------------------------------------
