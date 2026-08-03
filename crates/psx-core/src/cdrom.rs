@@ -73,6 +73,11 @@ pub struct Cdrom {
     mode: u8,
     filter_file: u8,
     filter_channel: u8,
+    /// With the XA filter bit off, the drive latches the file/channel of
+    /// the first ADPCM sector after a read starts and plays only that
+    /// stream — this is how games play one voice out of a multiplexed
+    /// bank without ever calling Setfilter.
+    xa_latch: Option<(u8, u8)>,
     motor_on: bool,
     reading: bool,
     /// CD audio mute (Mute/Demute commands). Muted XA decodes are
@@ -126,6 +131,7 @@ impl Cdrom {
             mode: 0,
             filter_file: 0,
             filter_channel: 0,
+            xa_latch: None,
             motor_on: true,
             reading: false,
             muted: false,
@@ -229,8 +235,18 @@ impl Cdrom {
                 let (file, channel, submode) = (raw[0x10], raw[0x11], raw[0x12]);
                 // Realtime + audio submode bits, with the XA mode enabled
                 if self.mode & 0x40 != 0 && submode & 0x44 == 0x44 {
-                    let pass = self.mode & 0x08 == 0
-                        || (file == self.filter_file && channel == self.filter_channel);
+                    let pass = if self.mode & 0x08 != 0 {
+                        file == self.filter_file && channel == self.filter_channel
+                    } else {
+                        // Filter off: first stream wins (see xa_latch)
+                        match self.xa_latch {
+                            None => {
+                                self.xa_latch = Some((file, channel));
+                                true
+                            }
+                            Some(latch) => latch == (file, channel),
+                        }
+                    };
                     if pass {
                         Action::Xa(raw.to_vec())
                     } else {
@@ -515,6 +531,7 @@ impl Cdrom {
                 self.xa_hist = [(0, 0); 2];
                 self.xa_prev = (0, 0);
                 self.xa_phase = 0;
+                self.xa_latch = None;
                 self.next_sector_at = now + ACK_DELAY + seek + self.sector_period();
                 let st = self.stat_byte();
                 self.push_int(now, ACK_DELAY, 3, vec![st]);
@@ -558,11 +575,12 @@ impl Cdrom {
                 self.push_int(now, ACK_DELAY, 3, vec![st]);
             }
             0x0d => {
-                // Setfilter(file, channel)
+                // Setfilter(file, channel); also re-arms the implicit latch
                 if params.len() >= 2 {
                     self.filter_file = params[0];
                     self.filter_channel = params[1];
                 }
+                self.xa_latch = None;
                 self.push_int(now, ACK_DELAY, 3, vec![st]);
             }
             0x0e => {
@@ -761,6 +779,43 @@ mod tests {
         let (int, resp) = acked(&mut cd, &mut irq, t + ACK_DELAY + 1);
         assert_eq!(int, 3);
         assert_eq!(resp, vec![0x00, 0x02, 0x00, 0x00, 2, 1, 0xc4, 0x00]);
+    }
+
+    #[test]
+    fn xa_latch_plays_only_the_first_stream_of_a_multiplexed_bank() {
+        // Bank of sectors with file numbers cycling 1,2,1,2..: without
+        // Setfilter, only the stream of the first sector may decode.
+        let mut cd = Cdrom::new();
+        let mut irq = Irq::default();
+        cd.int_enable = 0x1f;
+        let mut img = vec![0u8; RAW_SECTOR * 8];
+        for s in 0..8 {
+            img[s * RAW_SECTOR + 0x10] = 1 + (s as u8 & 1); // file 1/2
+            img[s * RAW_SECTOR + 0x11] = 1;
+            img[s * RAW_SECTOR + 0x12] = 0x64; // realtime + form2 + audio
+            img[s * RAW_SECTOR + 0x13] = 0x00;
+        }
+        cd.insert_disc(Disc::new(img).unwrap());
+        cd.write8(2, 0xe0, 0); // double speed + XA + whole sector, filter OFF
+        cd.write8(1, 0x0e, 0);
+        cd.write8(0, 1, 0);
+        acked(&mut cd, &mut irq, ACK_DELAY + 1);
+        cd.write8(0, 0, 0);
+        cd.write8(1, 0x1b, 0); // ReadS from LBA 0 (first sector: file 1)
+        cd.write8(0, 1, 0);
+        acked(&mut cd, &mut irq, ACK_DELAY + 1);
+        let mut now = ACK_DELAY + 2;
+        // Drain aggressively so back-pressure never holds
+        for _ in 0..2_000_000 {
+            now += 768;
+            cd.tick(now, &mut irq);
+            cd.xa_out.clear();
+            if cd.xa_sectors + 4 >= 8 {
+                break;
+            }
+        }
+        // Only the 4 file-1 sectors decode; file-2 sectors pass by
+        assert_eq!(cd.xa_sectors, 4);
     }
 
     #[test]
