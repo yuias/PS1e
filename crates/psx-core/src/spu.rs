@@ -82,6 +82,8 @@ pub struct Spu {
     output: VecDeque<i16>,
     /// CD/XA audio input frames, mixed in at 44.1kHz.
     cd_in: VecDeque<(i16, i16)>,
+    /// Frames lost to the input cap (drift diagnostics).
+    pub cd_dropped: u64,
     /// Reverb work-area cursor (bytes, relative to mBASE) and held output;
     /// the reverb core runs at 22050 Hz (every other sample).
     rev_cur: usize,
@@ -105,6 +107,7 @@ impl Spu {
             irq_flag: false,
             output: VecDeque::new(),
             cd_in: VecDeque::new(),
+            cd_dropped: 0,
             rev_cur: 0,
             rev_phase: false,
             rev_out: (0, 0),
@@ -119,6 +122,11 @@ impl Spu {
         // Bound to ~1s in case the SPU is disabled while the drive streams
         if self.cd_in.len() >= 44_100 {
             self.cd_in.pop_front();
+            self.cd_dropped += 1;
+            if self.cd_dropped == 1 || self.cd_dropped % 44_100 == 0 {
+                tracing::warn!(target: "psx_core::spu",
+                    "CD input overflowing ({} frames dropped)", self.cd_dropped);
+            }
         }
         self.cd_in.push_back((l, r));
     }

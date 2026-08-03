@@ -15,7 +15,10 @@ struct Args {
     headless: bool,
     cycles: u64,
     dump_vram: Option<String>,
+    dump_wav: Option<String>,
     peek: Option<u32>,
+    /// Headless: tap START every 2 seconds to get past title screens.
+    mash_start: bool,
 }
 
 fn parse_args() -> Args {
@@ -25,12 +28,15 @@ fn parse_args() -> Args {
         headless: false,
         cycles: 30_000_000,
         dump_vram: None,
+        dump_wav: None,
         peek: None,
+        mash_start: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
             "--headless" => args.headless = true,
+            "--mash-start" => args.mash_start = true,
             "--bios" => args.bios = Some(it.next().expect("--bios needs a path")),
             "--disc" => args.disc = Some(it.next().expect("--disc needs a path")),
             "--cycles" => {
@@ -40,6 +46,7 @@ fn parse_args() -> Args {
                     .expect("--cycles needs a number")
             }
             "--dump-vram" => args.dump_vram = Some(it.next().expect("--dump-vram needs a path")),
+            "--dump-wav" => args.dump_wav = Some(it.next().expect("--dump-wav needs a path")),
             "--peek" => {
                 args.peek = Some(
                     u32::from_str_radix(
@@ -118,7 +125,14 @@ fn main() -> eframe::Result {
     }
 
     if args.headless {
-        run_headless(sys, args.cycles, args.dump_vram.as_deref(), args.peek);
+        run_headless(
+            sys,
+            args.cycles,
+            args.dump_vram.as_deref(),
+            args.dump_wav.as_deref(),
+            args.peek,
+            args.mash_start,
+        );
         return Ok(());
     }
 
@@ -162,9 +176,45 @@ fn load_disc(path: &str) -> psx_core::cdrom::Disc {
     psx_core::cdrom::Disc::new(data).expect("invalid disc image")
 }
 
-fn run_headless(mut sys: PsxSystem, cycles: u64, dump_vram: Option<&str>, peek: Option<u32>) {
+fn run_headless(
+    mut sys: PsxSystem,
+    cycles: u64,
+    dump_vram: Option<&str>,
+    dump_wav: Option<&str>,
+    peek: Option<u32>,
+    mash_start: bool,
+) {
     tracing::info!("running headless for {cycles} cycles");
-    sys.run_cycles(cycles);
+    // Chunked run so we can inject input and collect audio along the way
+    const CHUNK: u64 = psx_core::CPU_CLOCK_HZ / 10;
+    let mut wav_samples: Vec<i16> = Vec::new();
+    let mut done = 0u64;
+    while done < cycles {
+        if mash_start {
+            // Alternate START and CROSS taps (0.5s each out of every 2s)
+            // so both title screens and menus advance
+            let phase = done / CHUNK % 40;
+            sys.set_buttons(match phase {
+                0..5 => psx_core::sio::button::START,
+                20..25 => psx_core::sio::button::CROSS,
+                _ => 0,
+            });
+        }
+        let n = CHUNK.min(cycles - done);
+        sys.run_cycles(n);
+        done += n;
+        if dump_wav.is_some() {
+            sys.bus.spu.drain_output(&mut wav_samples);
+        }
+    }
+    if let Some(path) = dump_wav {
+        write_wav(path, &wav_samples);
+        tracing::info!(
+            "wrote {} ({:.1}s of audio)",
+            path,
+            wav_samples.len() as f64 / 2.0 / 44_100.0
+        );
+    }
     tracing::info!(
         "done: pc={:#010x} cycles={} sr={:#010x} cause={:#010x} i_stat={:#06x} i_mask={:#06x}",
         sys.cpu.pc,
@@ -178,6 +228,14 @@ fn run_headless(mut sys: PsxSystem, cycles: u64, dump_vram: Option<&str>, peek: 
     sys.bus.spu.drain_output(&mut samples);
     let peak = samples.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
     tracing::info!("audio: {} samples buffered, peak {peak}", samples.len() / 2);
+    tracing::info!(
+        "xa: {} sectors decoded, {} frames pushed ({:.1}/sector), dropped {} (cd_in {})",
+        sys.bus.cdrom.xa_sectors,
+        sys.bus.cdrom.xa_frames,
+        sys.bus.cdrom.xa_frames as f64 / sys.bus.cdrom.xa_sectors.max(1) as f64,
+        sys.bus.cdrom.xa_dropped,
+        sys.bus.spu.cd_dropped,
+    );
     print!("--- TTY ---\n{}\n-----------\n", sys.tty_output());
     // Dump the instructions around PC to identify wait loops during bring-up
     let pc = (sys.cpu.pc & 0x001f_ffff) as usize;
@@ -213,6 +271,28 @@ fn run_headless(mut sys: PsxSystem, cycles: u64, dump_vram: Option<&str>, peek: 
         write_vram_bmp(path, &sys.bus.gpu.vram);
         tracing::info!("VRAM dumped to {path}");
     }
+}
+
+/// 44.1kHz stereo 16-bit WAV writer for offline listening tests.
+fn write_wav(path: &str, samples: &[i16]) {
+    let data_len = samples.len() * 2;
+    let mut out = Vec::with_capacity(44 + data_len);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36 + data_len as u32).to_le_bytes());
+    out.extend_from_slice(b"WAVEfmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    out.extend_from_slice(&2u16.to_le_bytes()); // stereo
+    out.extend_from_slice(&44_100u32.to_le_bytes());
+    out.extend_from_slice(&(44_100u32 * 4).to_le_bytes());
+    out.extend_from_slice(&4u16.to_le_bytes());
+    out.extend_from_slice(&16u16.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&(data_len as u32).to_le_bytes());
+    for s in samples {
+        out.extend_from_slice(&s.to_le_bytes());
+    }
+    std::fs::write(path, out).expect("failed to write WAV");
 }
 
 /// Dump the full 1024x512 VRAM as a 24-bit BMP for offline inspection.

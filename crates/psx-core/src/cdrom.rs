@@ -91,6 +91,14 @@ pub struct Cdrom {
     /// the SPU by the system.
     pub xa_out: VecDeque<i16>,
     xa_hist: [(i32, i32); 2],
+    /// Last-seen XA coding byte, for change logging.
+    xa_last_coding: u8,
+    /// Bring-up statistics: decoded sectors, pushed output frames, and
+    /// frames lost to the buffer cap (indicates production outpacing
+    /// consumption — heard as fast-forward garble).
+    pub xa_sectors: u64,
+    pub xa_frames: u64,
+    pub xa_dropped: u64,
     /// Resampler state: previous input frame and output phase in [0, 1)
     /// scaled by the source rate.
     xa_prev: (i16, i16),
@@ -121,6 +129,10 @@ impl Cdrom {
             data_pos: 0,
             xa_out: VecDeque::new(),
             xa_hist: [(0, 0); 2],
+            xa_last_coding: 0xff,
+            xa_sectors: 0,
+            xa_frames: 0,
+            xa_dropped: 0,
             xa_prev: (0, 0),
             xa_phase: 0,
         }
@@ -226,6 +238,8 @@ impl Cdrom {
                 self.reading = false;
             }
             Action::Xa(raw) => {
+                trace!(target: "psx_core::cdrom",
+                       "XA sector LBA {} file {} ch {}", self.read_lba, raw[0x10], raw[0x11]);
                 self.decode_xa_sector(&raw);
                 self.advance_sector(now);
             }
@@ -270,7 +284,16 @@ impl Cdrom {
         let stereo = coding & 3 == 1;
         let rate = if coding & 0x0c == 0x04 { 18_900 } else { 37_800 };
         let bits8 = coding & 0x30 == 0x10;
+        if coding != self.xa_last_coding {
+            self.xa_last_coding = coding;
+            debug!(target: "psx_core::cdrom",
+                   "XA coding {coding:#04x}: {} {rate}Hz {}bit (file={} ch={})",
+                   if stereo { "stereo" } else { "mono" },
+                   if bits8 { 8 } else { 4 },
+                   raw[0x10], raw[0x11]);
+        }
         let data = &raw[0x18..0x18 + 2304];
+        self.xa_sectors += 1;
 
         let mut unit_buf = [[0i32; 28]; 2];
         for group in data.chunks(128) {
@@ -310,6 +333,13 @@ impl Cdrom {
         // Bound the buffer (~2s) in case nothing drains it
         while self.xa_out.len() > 88_200 * 2 {
             self.xa_out.pop_front();
+            self.xa_out.pop_front();
+            self.xa_dropped += 1;
+            if self.xa_dropped == 1 || self.xa_dropped % 44_100 == 0 {
+                warn!(target: "psx_core::cdrom",
+                      "XA output overflowing ({} frames dropped) — production \
+                       outpacing 44.1kHz consumption", self.xa_dropped);
+            }
         }
     }
 
@@ -324,6 +354,7 @@ impl Cdrom {
             };
             self.xa_out.push_back(lerp(self.xa_prev.0, l));
             self.xa_out.push_back(lerp(self.xa_prev.1, r));
+            self.xa_frames += 1;
             self.xa_phase += src_rate;
         }
         self.xa_phase -= 44_100;
@@ -431,6 +462,12 @@ impl Cdrom {
                     self.seek_target = (mm * 60 + ss) * 75 + ff - 150;
                 }
                 self.push_int(now, ACK_DELAY, 3, vec![st]);
+            }
+            0x07 => {
+                // MotorOn
+                self.motor_on = true;
+                self.push_int(now, ACK_DELAY, 3, vec![st]);
+                self.push_int(now, COMPLETE_DELAY, 2, vec![self.stat_byte()]);
             }
             0x06 | 0x1b => {
                 // ReadN / ReadS: implicit seek to the Setloc target
