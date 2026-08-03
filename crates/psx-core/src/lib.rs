@@ -76,14 +76,22 @@ impl PsxSystem {
         // accesses accumulated (I-cache hits in cached segments are free)
         self.cycles += 1 + std::mem::take(&mut self.bus.penalty);
 
-        let bus::Bus { cdrom, sio, spu, irq, .. } = &mut self.bus;
+        let bus::Bus {
+            cdrom,
+            sio,
+            spu,
+            irq,
+            ..
+        } = &mut self.bus;
         cdrom.tick(self.cycles, irq);
         sio.tick(self.cycles, irq);
         // Route decoded XA audio into the SPU's CD input. Cap the SPU-side
         // level so backlog stays in the drive's buffer, where it throttles
         // further sector reads (see cdrom back-pressure).
         while spu.cd_in_level() < 9_408 {
-            let Some(l) = cdrom.xa_out.pop_front() else { break };
+            let Some(l) = cdrom.xa_out.pop_front() else {
+                break;
+            };
             let r = cdrom.xa_out.pop_front().unwrap_or(0);
             spu.push_cd_audio(l, r);
         }
@@ -106,16 +114,13 @@ impl PsxSystem {
     }
 
     fn handle_event(&mut self, event: EventKind) {
-        match event {
-            EventKind::VBlank => {
-                self.bus.irq.raise(0);
-                self.bus.gpu.vblank();
-                // Keep lazily-synced components from lagging more than a frame
-                self.bus.timers.sync_all(self.cycles, &mut self.bus.irq);
-                self.scheduler
-                    .schedule(self.cycles + CYCLES_PER_FRAME, EventKind::VBlank);
-            }
-            _ => {}
+        if event == EventKind::VBlank {
+            self.bus.irq.raise(0);
+            self.bus.gpu.vblank();
+            // Keep lazily-synced components from lagging more than a frame
+            self.bus.timers.sync_all(self.cycles, &mut self.bus.irq);
+            self.scheduler
+                .schedule(self.cycles + CYCLES_PER_FRAME, EventKind::VBlank);
         }
     }
 
@@ -143,10 +148,10 @@ impl PsxSystem {
         if is_putchar {
             let ch = self.cpu.regs[4] as u8 as char; // $a0
             self.tty.push(ch);
-            if ch == '\n' {
-                if let Some(line) = self.tty.lines().last() {
-                    info!(target: "psx_core::tty", "{line}");
-                }
+            if ch == '\n'
+                && let Some(line) = self.tty.lines().last()
+            {
+                info!(target: "psx_core::tty", "{line}");
             }
         }
     }

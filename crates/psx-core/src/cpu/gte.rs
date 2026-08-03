@@ -7,6 +7,10 @@
 //! results for polygon coordinates, so any deviation shows up as visibly
 //! broken geometry.
 
+// Index loops are kept where `i` mirrors the hardware register number
+// (MAC1..3 / IR1..3): iterator/zip forms would obscure that correspondence.
+#![allow(clippy::needless_range_loop)]
+
 /// `unr_table[i] = max(0, (0x40000 / (i + 0x100) + 1) / 2 - 0x101)`, per
 /// PSX-SPX "GTE Division Inaccuracy". Generated instead of hand-transcribed
 /// to avoid a 257-entry copy/paste error; verified against the published
@@ -17,7 +21,7 @@ const fn build_unr_table() -> [u8; 257] {
     let mut table = [0u8; 257];
     let mut i = 0;
     while i < 257 {
-        let v = (0x40000 / (i as u32 + 0x100) + 1) / 2;
+        let v = (0x40000 / (i as u32 + 0x100)).div_ceil(2);
         table[i] = if v >= 0x101 { (v - 0x101) as u8 } else { 0 };
         i += 1;
     }
@@ -338,7 +342,9 @@ impl Gte {
             // Bits 12..30 are documented as read/write-able by software; bit31
             // and bits 0..11 are always derived/zero and not stored.
             31 => self.flag = v & 0x7fff_f000,
-            _ => tracing::warn!(target: "psx_core::gte", r, v, "write_control: register out of range"),
+            _ => {
+                tracing::warn!(target: "psx_core::gte", r, v, "write_control: register out of range")
+            }
         }
     }
 
@@ -467,7 +473,8 @@ impl Gte {
         }
         self.rgb_fifo[0] = self.rgb_fifo[1];
         self.rgb_fifo[1] = self.rgb_fifo[2];
-        self.rgb_fifo[2] = (r as u32) | ((g as u32) << 8) | ((b as u32) << 16) | ((code as u32) << 24);
+        self.rgb_fifo[2] =
+            (r as u32) | ((g as u32) << 8) | ((b as u32) << 16) | ((code as u32) << 24);
     }
 
     fn push_color_from_mac(&mut self, code: u8) {
@@ -475,7 +482,11 @@ impl Gte {
     }
 
     fn vector(&self, i: usize) -> [i32; 3] {
-        [self.v[i][0] as i32, self.v[i][1] as i32, self.v[i][2] as i32]
+        [
+            self.v[i][0] as i32,
+            self.v[i][1] as i32,
+            self.v[i][2] as i32,
+        ]
     }
 
     fn ir_vector(&self) -> [i32; 3] {
@@ -484,7 +495,13 @@ impl Gte {
 
     /// `MAC1..3 = (t*1000h? + row . v) SAR (sf*12)`, `IR1..3 = MAC1..3`.
     /// Shared by the light/color matrix steps of the NC* and CC/CDP family.
-    fn mac_dot(&mut self, m: [[i16; 3]; 3], v: [i32; 3], t: Option<[i32; 3]>, sf: bool) -> [i32; 3] {
+    fn mac_dot(
+        &mut self,
+        m: [[i16; 3]; 3],
+        v: [i32; 3],
+        t: Option<[i32; 3]>,
+        sf: bool,
+    ) -> [i32; 3] {
         let shift = if sf { 12 } else { 0 };
         let mut out = [0i32; 3];
         for row in 0..3 {
@@ -666,7 +683,11 @@ impl Gte {
         let d2 = self.rt[1][1] as i64;
         let d3 = self.rt[2][2] as i64;
         let [ir1, ir2, ir3] = self.ir_vector().map(|x| x as i64);
-        let raws = [ir3 * d2 - ir2 * d3, ir1 * d3 - ir3 * d1, ir2 * d1 - ir1 * d2];
+        let raws = [
+            ir3 * d2 - ir2 * d3,
+            ir1 * d3 - ir3 * d1,
+            ir2 * d1 - ir1 * d2,
+        ];
         let mut mac = [0i32; 3];
         for i in 0..3 {
             mac[i] = self.store_mac(i + 1, raws[i], shift);

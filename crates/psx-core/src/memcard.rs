@@ -106,7 +106,7 @@ impl MemCard {
         let pre = self.last_tx;
         self.last_tx = tx;
 
-        let out = match step {
+        match step {
             0 => (0xff, true), // reply to the 0x81 select
             1 => {
                 self.cmd = match tx {
@@ -140,8 +140,7 @@ impl MemCard {
                 },
                 _ => (0xff, false),
             },
-        };
-        out
+        }
     }
 
     fn sector_valid(&self) -> bool {

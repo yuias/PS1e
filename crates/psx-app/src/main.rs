@@ -61,14 +61,14 @@ fn parse_args() -> Args {
                     .expect("--cycles needs a number")
             }
             "--dump-vram" => args.dump_vram = Some(it.next().expect("--dump-vram needs a path")),
-            "--dump-frame" => {
-                args.dump_frame = Some(it.next().expect("--dump-frame needs a path"))
-            }
+            "--dump-frame" => args.dump_frame = Some(it.next().expect("--dump-frame needs a path")),
             "--dump-wav" => args.dump_wav = Some(it.next().expect("--dump-wav needs a path")),
             "--peek" => {
                 args.peek = Some(
                     u32::from_str_radix(
-                        it.next().expect("--peek needs a hex address").trim_start_matches("0x"),
+                        it.next()
+                            .expect("--peek needs a hex address")
+                            .trim_start_matches("0x"),
                         16,
                     )
                     .expect("--peek needs a hex address"),
@@ -162,7 +162,15 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "PS1e",
         options,
-        Box::new(move |_cc| Ok(Box::new(ui::App::new(sys, bios, cfg, cfg_path, memcard_path)))),
+        Box::new(move |_cc| {
+            Ok(Box::new(ui::App::new(
+                sys,
+                bios,
+                cfg,
+                cfg_path,
+                memcard_path,
+            )))
+        }),
     )
 }
 
@@ -211,10 +219,21 @@ fn parse_input_script(path: &str) -> Vec<InputSpan> {
         if line.is_empty() {
             continue;
         }
-        let bad = || -> ! { panic!("{path}:{}: expected '<start-sec> <dur-sec> <BUTTONS>'", n + 1) };
+        let bad = || -> ! {
+            panic!(
+                "{path}:{}: expected '<start-sec> <dur-sec> <BUTTONS>'",
+                n + 1
+            )
+        };
         let mut parts = line.split_whitespace();
-        let start: f64 = parts.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| bad());
-        let dur: f64 = parts.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| bad());
+        let start: f64 = parts
+            .next()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| bad());
+        let dur: f64 = parts
+            .next()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| bad());
         let buttons = parts
             .next()
             .unwrap_or_else(|| bad())
@@ -321,12 +340,17 @@ fn run_headless(mut sys: PsxSystem, args: &Args, script: &[InputSpan]) {
     let pc = (sys.cpu.pc & 0x001f_ffff) as usize;
     for ofs in (pc.saturating_sub(16)..pc + 16).step_by(4) {
         let w = u32::from_le_bytes(sys.bus.ram[ofs..ofs + 4].try_into().unwrap());
-        println!("{:#010x}: {w:08x}{}", ofs, if ofs == pc { "  <- pc" } else { "" });
+        println!(
+            "{:#010x}: {w:08x}{}",
+            ofs,
+            if ofs == pc { "  <- pc" } else { "" }
+        );
     }
     // Dump the kernel event table (EvCB pointer at 0x120): one line per
     // entry as [index] class spec status — resolves TestEvent handles.
     let ram = &sys.bus.ram;
-    let word = |a: usize| u32::from_le_bytes(ram[a & 0x1f_fffc..(a & 0x1f_fffc) + 4].try_into().unwrap());
+    let word =
+        |a: usize| u32::from_le_bytes(ram[a & 0x1f_fffc..(a & 0x1f_fffc) + 4].try_into().unwrap());
     let evcb = word(0x120) as usize & 0x001f_ffff;
     let evcb_size = word(0x124) as usize / 0x1c;
     if evcb != 0 {
@@ -362,7 +386,11 @@ fn run_headless(mut sys: PsxSystem, args: &Args, script: &[InputSpan]) {
                 frame.width,
                 frame.height,
                 if frame.is_24bit { ", 24-bit" } else { "" },
-                if frame.enabled { "" } else { ", display disabled" },
+                if frame.enabled {
+                    ""
+                } else {
+                    ", display disabled"
+                },
             );
         }
     }

@@ -98,11 +98,11 @@ impl Cpu {
 
         self.execute(bus, instr, inflight);
 
-        if let Some((r, v)) = inflight {
-            if self.written_reg != Some(r) {
-                self.regs[r] = v;
-                self.regs[0] = 0;
-            }
+        if let Some((r, v)) = inflight
+            && self.written_reg != Some(r)
+        {
+            self.regs[r] = v;
+            self.regs[0] = 0;
         }
     }
 
@@ -152,7 +152,10 @@ impl Cpu {
                 0x06 => self.set_reg(rd, self.regs[rt] >> (self.regs[rs] & 0x1f)), // SRLV
                 0x07 => {
                     // SRAV
-                    self.set_reg(rd, ((self.regs[rt] as i32) >> (self.regs[rs] & 0x1f)) as u32)
+                    self.set_reg(
+                        rd,
+                        ((self.regs[rt] as i32) >> (self.regs[rs] & 0x1f)) as u32,
+                    )
                 }
                 0x08 => {
                     // JR

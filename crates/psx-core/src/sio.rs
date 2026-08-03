@@ -76,13 +76,13 @@ impl Sio {
 
     /// Fire a due /ACK interrupt. Called every instruction; cheap check.
     pub fn tick(&mut self, now: u64, irq: &mut Irq) {
-        if let Some(at) = self.ack_at {
-            if now >= at {
-                self.ack_at = None;
-                self.irq_flag = true;
-                if self.ctrl & (1 << 12) != 0 {
-                    irq.raise(7);
-                }
+        if let Some(at) = self.ack_at
+            && now >= at
+        {
+            self.ack_at = None;
+            self.irq_flag = true;
+            if self.ctrl & (1 << 12) != 0 {
+                irq.raise(7);
             }
         }
     }

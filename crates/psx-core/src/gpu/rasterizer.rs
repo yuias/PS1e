@@ -162,9 +162,8 @@ impl Gpu {
         };
 
         // Rectangles always use the current E1 texture page
-        let page = (self.tex_page_x as u32)
-            | (self.tex_page_y as u32) << 4
-            | (self.tex_depth as u32) << 7;
+        let page =
+            (self.tex_page_x as u32) | (self.tex_page_y as u32) << 4 | (self.tex_depth as u32) << 7;
         let tex = textured.then(|| tex_config(clut, page));
 
         let x0 = vx + self.draw_offset.0;
@@ -190,7 +189,7 @@ impl Gpu {
                             continue; // fully transparent texel
                         }
                         // Rectangles are never dithered
-                        self.shade_texel(texel, r, g, b, raw, x, y, false)
+                        self.shade_texel(texel, (r, g, b), raw, x, y, false)
                     }
                     None => rgb_to_555(r, g, b),
                 };
@@ -230,7 +229,10 @@ impl Gpu {
         for i in 0..=steps {
             let x = (fx >> 16) as i32;
             let y = (fy >> 16) as i32;
-            if x >= self.draw_min.0 && x <= self.draw_max.0 && y >= self.draw_min.1 && y <= self.draw_max.1
+            if x >= self.draw_min.0
+                && x <= self.draw_max.0
+                && y >= self.draw_min.1
+                && y <= self.draw_max.1
             {
                 let t = i as i64;
                 let lerp = |a: i32, b: i32| (a as i64 + (b - a) as i64 * t / steps as i64) as i32;
@@ -335,7 +337,7 @@ impl Gpu {
                                 w2 += a01;
                                 continue;
                             }
-                            self.shade_texel(texel, r, g, b_, raw, x, y, dither)
+                            self.shade_texel(texel, (r, g, b_), raw, x, y, dither)
                         }
                         None => rgb_to_555_dithered(r, g, b_, x, y, dither),
                     };
@@ -387,9 +389,7 @@ impl Gpu {
     fn shade_texel(
         &self,
         texel: u16,
-        r: i32,
-        g: i32,
-        b: i32,
+        (r, g, b): (i32, i32, i32),
         raw: bool,
         x: i32,
         y: i32,
@@ -399,9 +399,9 @@ impl Gpu {
             return texel;
         }
         let expand = |c: u16| (((c & 0x1f) << 3) | ((c & 0x1f) >> 2)) as i32;
-        let mr = (expand(texel) * r >> 7).min(255);
-        let mg = (expand(texel >> 5) * g >> 7).min(255);
-        let mb = (expand(texel >> 10) * b >> 7).min(255);
+        let mr = ((expand(texel) * r) >> 7).min(255);
+        let mg = ((expand(texel >> 5) * g) >> 7).min(255);
+        let mb = ((expand(texel >> 10) * b) >> 7).min(255);
         rgb_to_555_dithered(mr, mg, mb, x, y, dither) | (texel & 0x8000)
     }
 

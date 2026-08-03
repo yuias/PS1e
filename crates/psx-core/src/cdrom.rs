@@ -35,7 +35,7 @@ pub struct Disc {
 
 impl Disc {
     pub fn new(data: Vec<u8>) -> Result<Self, String> {
-        if data.is_empty() || data.len() % RAW_SECTOR != 0 {
+        if data.is_empty() || !data.len().is_multiple_of(RAW_SECTOR) {
             return Err(format!(
                 "disc image size {} is not a multiple of {RAW_SECTOR} bytes",
                 data.len()
@@ -202,14 +202,13 @@ impl Cdrom {
     /// Called every instruction; front-of-queue checks are cheap.
     pub fn tick(&mut self, now: u64, irq: &mut Irq) {
         // Queued command responses (need the previous INT acknowledged)
-        if self.int_flag & 7 == 0 {
-            if let Some((deadline, _, _)) = self.pending.front() {
-                if *deadline <= now {
-                    let (_, int, resp) = self.pending.pop_front().unwrap();
-                    self.deliver(int, &resp, irq);
-                    return;
-                }
-            }
+        if self.int_flag & 7 == 0
+            && let Some((deadline, _, _)) = self.pending.front()
+            && *deadline <= now
+        {
+            let (_, int, resp) = self.pending.pop_front().unwrap();
+            self.deliver(int, &resp, irq);
+            return;
         }
 
         // Sector streaming
@@ -332,7 +331,11 @@ impl Cdrom {
     fn decode_xa_sector(&mut self, raw: &[u8]) {
         let coding = raw[0x13];
         let stereo = coding & 3 == 1;
-        let rate = if coding & 0x0c == 0x04 { 18_900 } else { 37_800 };
+        let rate = if coding & 0x0c == 0x04 {
+            18_900
+        } else {
+            37_800
+        };
         let bits8 = coding & 0x30 == 0x10;
         if coding != self.xa_last_coding {
             self.xa_last_coding = coding;
@@ -372,9 +375,8 @@ impl Cdrom {
                 }
                 let complete_pair = !stereo || u & 1 == 1;
                 if complete_pair {
-                    for i in 0..28 {
-                        let l = unit_buf[0][i];
-                        let r = if stereo { unit_buf[1][i] } else { l };
+                    for (&l, &r) in unit_buf[0].iter().zip(&unit_buf[1]) {
+                        let r = if stereo { r } else { l };
                         self.push_xa_frame(l as i16, r as i16, rate);
                     }
                 }
@@ -385,7 +387,7 @@ impl Cdrom {
             self.xa_out.pop_front();
             self.xa_out.pop_front();
             self.xa_dropped += 1;
-            if self.xa_dropped == 1 || self.xa_dropped % 44_100 == 0 {
+            if self.xa_dropped == 1 || self.xa_dropped.is_multiple_of(44_100) {
                 warn!(target: "psx_core::cdrom",
                       "XA output overflowing ({} frames dropped) — production \
                        outpacing 44.1kHz consumption", self.xa_dropped);
@@ -399,9 +401,7 @@ impl Cdrom {
     fn push_xa_frame(&mut self, l: i16, r: i16, src_rate: u32) {
         while self.xa_phase < 44_100 {
             let t = self.xa_phase as i32;
-            let lerp = |a: i16, b: i16| {
-                (a as i32 + (b as i32 - a as i32) * t / 44_100) as i16
-            };
+            let lerp = |a: i16, b: i16| (a as i32 + (b as i32 - a as i32) * t / 44_100) as i16;
             self.xa_out.push_back(lerp(self.xa_prev.0, l));
             self.xa_out.push_back(lerp(self.xa_prev.1, r));
             self.xa_frames += 1;
@@ -886,6 +886,10 @@ mod tests {
         assert_eq!(int, 0, "XA sector must not raise INT1");
         // 18 groups * 8 units * 28 samples = 2016 stereo frames at 37800 Hz
         // -> ~2352 frames after resampling to 44100
-        assert!(cd.xa_out.len() / 2 > 2000, "got {} frames", cd.xa_out.len() / 2);
+        assert!(
+            cd.xa_out.len() / 2 > 2000,
+            "got {} frames",
+            cd.xa_out.len() / 2
+        );
     }
 }

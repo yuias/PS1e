@@ -115,13 +115,17 @@ impl Bus {
     pub fn mask_address(addr: u32) -> u32 {
         const REGION_MASK: [u32; 8] = [
             // KUSEG: 2 GiB mapped to the same physical space
-            0xffff_ffff, 0xffff_ffff, 0xffff_ffff, 0xffff_ffff,
+            0xffff_ffff,
+            0xffff_ffff,
+            0xffff_ffff,
+            0xffff_ffff,
             // KSEG0: 512 MiB, cached
             0x7fff_ffff,
             // KSEG1: 512 MiB, uncached
             0x1fff_ffff,
             // KSEG2: not translated
-            0xffff_ffff, 0xffff_ffff,
+            0xffff_ffff,
+            0xffff_ffff,
         ];
         addr & REGION_MASK[(addr >> 29) as usize]
     }
@@ -247,7 +251,9 @@ impl Bus {
             0x1f80_1050..0x1f80_1060 => self.sio1_regs[((p - 0x1f80_1050) / 4) as usize],
             0x1f80_1080..0x1f80_1100 => self.dma.read_reg(p),
             0x1f80_1100..0x1f80_1130 => {
-                let Bus { timers, irq, now, .. } = self;
+                let Bus {
+                    timers, irq, now, ..
+                } = self;
                 timers.read(p, *now, irq)
             }
             0x1f80_1810 => self.gpu.gpuread(),
@@ -344,7 +350,11 @@ impl Bus {
                     // For DICR, exclude the flag bits from the merge: they
                     // are write-1-to-acknowledge and must not be re-written.
                     let cur = self.dma.read_reg(aligned)
-                        & if aligned == 0x1f80_10f4 { 0x00ff_ffff } else { !0 };
+                        & if aligned == 0x1f80_10f4 {
+                            0x00ff_ffff
+                        } else {
+                            !0
+                        };
                     let shift = (p & 3) * 8;
                     let mask = (if width == 2 { 0xffffu32 } else { 0xff }) << shift;
                     (cur & !mask) | ((val << shift) & mask)
@@ -354,7 +364,9 @@ impl Bus {
                 }
             }
             0x1f80_1100..0x1f80_1130 => {
-                let Bus { timers, irq, now, .. } = self;
+                let Bus {
+                    timers, irq, now, ..
+                } = self;
                 timers.write(p, val, *now, irq);
             }
             0x1f80_1800..0x1f80_1804 => self.cdrom.write8(p, val as u8, self.now),

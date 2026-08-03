@@ -3,9 +3,9 @@
 use crate::audio::Audio;
 use crate::config::Config;
 use eframe::egui;
-use std::path::PathBuf;
 use psx_core::sio::button;
 use psx_core::{CPU_CLOCK_HZ, PsxSystem};
+use std::path::PathBuf;
 
 /// Keyboard -> digital pad mapping.
 const KEYMAP: [(egui::Key, u16); 14] = [
@@ -90,11 +90,11 @@ impl Drop for App {
     /// Persist settings changed from the UI and any unsaved card writes.
     fn drop(&mut self) {
         self.save_memcard_if_dirty();
-        if let Some(path) = &self.config_path {
-            if (self.config.volume - self.volume).abs() > f32::EPSILON {
-                self.config.volume = self.volume;
-                self.config.save(path);
-            }
+        if let Some(path) = &self.config_path
+            && (self.config.volume - self.volume).abs() > f32::EPSILON
+        {
+            self.config.volume = self.volume;
+            self.config.save(path);
         }
     }
 }
@@ -284,11 +284,9 @@ impl eframe::App for App {
                     t.clone()
                 }
                 None => {
-                    let t = ui.ctx().load_texture(
-                        "display",
-                        image,
-                        egui::TextureOptions::NEAREST,
-                    );
+                    let t = ui
+                        .ctx()
+                        .load_texture("display", image, egui::TextureOptions::NEAREST);
                     self.display_tex = Some(t.clone());
                     t
                 }
@@ -340,8 +338,7 @@ impl eframe::App for App {
                     t.clone()
                 }
                 None => {
-                    let t =
-                        ctx.load_texture("vram", image, egui::TextureOptions::NEAREST);
+                    let t = ctx.load_texture("vram", image, egui::TextureOptions::NEAREST);
                     self.vram_tex = Some(t.clone());
                     t
                 }

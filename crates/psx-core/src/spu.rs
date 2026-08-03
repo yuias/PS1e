@@ -128,7 +128,7 @@ impl Spu {
         if self.cd_in.len() >= 44_100 {
             self.cd_in.pop_front();
             self.cd_dropped += 1;
-            if self.cd_dropped == 1 || self.cd_dropped % 44_100 == 0 {
+            if self.cd_dropped == 1 || self.cd_dropped.is_multiple_of(44_100) {
                 tracing::warn!(target: "psx_core::spu",
                     "CD input overflowing ({} frames dropped)", self.cd_dropped);
             }
@@ -191,13 +191,9 @@ impl Spu {
         let ofs = (p - REG_BASE) as usize;
         match ofs {
             // Voice current ADSR volume
-            _ if ofs < 0x180 && ofs & 0xf == 0xc => {
-                self.voices[ofs >> 4].adsr_vol as u16
-            }
+            _ if ofs < 0x180 && ofs & 0xf == 0xc => self.voices[ofs >> 4].adsr_vol as u16,
             // Voice repeat address (live: updated by loop-start flags)
-            _ if ofs < 0x180 && ofs & 0xf == 0xe => {
-                (self.voices[ofs >> 4].repeat_addr / 8) as u16
-            }
+            _ if ofs < 0x180 && ofs & 0xf == 0xe => (self.voices[ofs >> 4].repeat_addr / 8) as u16,
             0x19c => self.endx as u16,
             0x19e => (self.endx >> 16) as u16,
             // SPUSTAT: low 6 bits mirror SPUCNT; bit 6 is the IRQ flag.
@@ -319,7 +315,7 @@ impl Spu {
             self.last_out[v] = sample;
             let vol_l = Self::volume(self.voice_reg(v, 0x0));
             let vol_r = Self::volume(self.voice_reg(v, 0x2));
-            let (sl, sr) = (sample * vol_l >> 15, sample * vol_r >> 15);
+            let (sl, sr) = ((sample * vol_l) >> 15, (sample * vol_r) >> 15);
             mix_l += sl;
             mix_r += sr;
             if eon & (1 << v) != 0 {
@@ -333,7 +329,7 @@ impl Spu {
         if cnt & 1 != 0 {
             let cvl = self.reg(0x1b0) as i16 as i32;
             let cvr = self.reg(0x1b2) as i16 as i32;
-            let (cl, cr) = (cd_l as i32 * cvl >> 15, cd_r as i32 * cvr >> 15);
+            let (cl, cr) = ((cd_l as i32 * cvl) >> 15, (cd_r as i32 * cvr) >> 15);
             mix_l += cl;
             mix_r += cr;
             if cnt & (1 << 2) != 0 {
@@ -345,18 +341,16 @@ impl Spu {
         // Reverb core runs at 22050 Hz; output held between steps
         self.rev_phase = !self.rev_phase;
         if self.rev_phase {
-            self.rev_out = self.reverb_step(
-                rev_l.clamp(-0x8000, 0x7fff),
-                rev_r.clamp(-0x8000, 0x7fff),
-            );
+            self.rev_out =
+                self.reverb_step(rev_l.clamp(-0x8000, 0x7fff), rev_r.clamp(-0x8000, 0x7fff));
         }
 
         let main_l = Self::volume(self.reg(0x180));
         let main_r = Self::volume(self.reg(0x182));
         let (mut l, mut r) = if enabled && !muted {
             (
-                (mix_l * main_l >> 15) + self.rev_out.0,
-                (mix_r * main_r >> 15) + self.rev_out.1,
+                ((mix_l * main_l) >> 15) + self.rev_out.0,
+                ((mix_r * main_r) >> 15) + self.rev_out.1,
             )
         } else {
             (0, 0)
@@ -448,7 +442,10 @@ impl Spu {
         out_r = o;
 
         if write_enable {
-            for (m, v) in wr_list.iter().chain([(m_lapf2, w2l), (m_rapf2, w2r)].iter()) {
+            for (m, v) in wr_list
+                .iter()
+                .chain([(m_lapf2, w2l), (m_rapf2, w2r)].iter())
+            {
                 let p = ptr(*m);
                 self.ram[p..p + 2].copy_from_slice(&(*v as i16).to_le_bytes());
             }
@@ -509,7 +506,7 @@ impl Spu {
         };
 
         self.tick_envelope(v);
-        raw * self.voices[v].adsr_vol >> 15
+        (raw * self.voices[v].adsr_vol) >> 15
     }
 
     /// Decode the ADPCM block at the voice's current address, then apply
@@ -631,8 +628,8 @@ fn catmull_rom(p0: i32, p1: i32, p2: i32, p3: i32, t: i32) -> i32 {
     let a = 3 * (p1 - p2) + p3 - p0;
     let b = 2 * p0 - 5 * p1 + 4 * p2 - p3;
     let c = p2 - p0;
-    let v = ((a * t >> 12) + b) * t >> 12;
-    let v = (v + c) * t >> 12;
+    let v = ((((a * t) >> 12) + b) * t) >> 12;
+    let v = ((v + c) * t) >> 12;
     (((v + 2 * p1) / 2) as i32).clamp(-0x8000, 0x7fff)
 }
 
@@ -672,7 +669,7 @@ mod tests {
         spu.write16(REG_BASE + 0x1aa, 0xc000, &mut irq); // enable + unmute
         spu.write16(REG_BASE + 0x180, 0x3fff, &mut irq); // main vol L
         spu.write16(REG_BASE + 0x182, 0x3fff, &mut irq);
-        spu.write16(REG_BASE + 0x0, 0x3fff, &mut irq); // voice 0 vol L
+        spu.write16(REG_BASE, 0x3fff, &mut irq); // voice 0 vol L
         spu.write16(REG_BASE + 0x2, 0x3fff, &mut irq);
         spu.write16(REG_BASE + 0x4, 0x1000, &mut irq); // pitch = 44100
         spu.write16(REG_BASE + 0x6, (base / 8) as u16, &mut irq); // start

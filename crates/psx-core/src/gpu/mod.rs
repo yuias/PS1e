@@ -17,7 +17,13 @@ pub const VRAM_HEIGHT: usize = 512;
 enum Gp0Mode {
     Command,
     /// CPU->VRAM image transfer: destination rect and write cursor.
-    ImageLoad { x: u16, y: u16, w: u16, h: u16, cur: u32 },
+    ImageLoad {
+        x: u16,
+        y: u16,
+        w: u16,
+        h: u16,
+        cur: u32,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -42,9 +48,9 @@ pub struct Gpu {
     poly_last_vertex: u32,
 
     // Drawing state (GP0 E1..E6)
-    pub tex_page_x: u16,       // in 64-halfword units
-    pub tex_page_y: u16,       // in 256-line units
-    pub semi_mode: u8,         // global semi-transparency mode
+    pub tex_page_x: u16, // in 64-halfword units
+    pub tex_page_y: u16, // in 256-line units
+    pub semi_mode: u8,   // global semi-transparency mode
     pub tex_depth: TexDepth,
     dither: bool,
     draw_to_display: bool,
@@ -190,16 +196,18 @@ impl Gpu {
     fn capture_frame(&mut self) {
         let (w, h) = self.display_resolution();
         let (sx, sy) = self.display_vram_start();
-        let stride = if self.color_24bit { (w * 3).div_ceil(2) } else { w };
+        let stride = if self.color_24bit {
+            (w * 3).div_ceil(2)
+        } else {
+            w
+        };
         self.frame.width = w;
         self.frame.height = h;
         self.frame.stride = stride;
         self.frame.is_24bit = self.color_24bit;
         self.frame.enabled = !self.display_disabled;
         self.frame.pixels.clear();
-        self.frame
-            .pixels
-            .reserve((stride * h) as usize);
+        self.frame.pixels.reserve((stride * h) as usize);
         for y in 0..h {
             let row = (((sy + y) & 0x1ff) as usize) * VRAM_WIDTH;
             for x in 0..stride {
@@ -283,7 +291,13 @@ impl Gpu {
                 self.mode = if cur + 2 >= total {
                     Gp0Mode::Command
                 } else {
-                    Gp0Mode::ImageLoad { x, y, w, h, cur: cur + 2 }
+                    Gp0Mode::ImageLoad {
+                        x,
+                        y,
+                        w,
+                        h,
+                        cur: cur + 2,
+                    }
                 };
                 return;
             }
@@ -351,13 +365,25 @@ impl Gpu {
                 if op & 0x04 != 0 { 7 } else { 4 } // textured tri : flat tri
             }
             0x28..=0x2f => {
-                if op & 0x04 != 0 { 9 } else { 5 }
+                if op & 0x04 != 0 {
+                    9
+                } else {
+                    5
+                }
             }
             0x30..=0x37 => {
-                if op & 0x04 != 0 { 9 } else { 6 }
+                if op & 0x04 != 0 {
+                    9
+                } else {
+                    6
+                }
             }
             0x38..=0x3f => {
-                if op & 0x04 != 0 { 12 } else { 8 }
+                if op & 0x04 != 0 {
+                    12
+                } else {
+                    8
+                }
             }
             0x40..=0x5f => {
                 let gouraud = op & 0x10 != 0;
@@ -380,8 +406,8 @@ impl Gpu {
             self.log_command(op, cmd);
         }
         match op {
-            0x00 => {}                     // nop
-            0x01 => {}                     // clear texture cache (no cache yet)
+            0x00 => {} // nop
+            0x01 => {} // clear texture cache (no cache yet)
             0x02 => self.fill_rect(cmd),
             0x1f => self.irq_pending = true,
             0x20..=0x3f => self.draw_polygon_command(op, cmd),
@@ -392,8 +418,7 @@ impl Gpu {
                     self.in_polyline = true;
                     self.poly_cmd = cmd[0];
                     let gouraud = op & 0x10 != 0;
-                    self.poly_last_color =
-                        if gouraud { cmd[2] } else { cmd[0] } & 0x00ff_ffff;
+                    self.poly_last_color = if gouraud { cmd[2] } else { cmd[0] } & 0x00ff_ffff;
                     self.poly_last_vertex = *cmd.last().unwrap();
                 }
             }
@@ -454,7 +479,10 @@ impl Gpu {
             0x02 => {
                 let (x, y) = unpack_coord(cmd[1]);
                 let (w, h) = ((cmd[2] & 0x3ff) as u16, ((cmd[2] >> 16) & 0x1ff) as u16);
-                format!("fill rect {w}x{h} at ({x},{y}) color={:06x}", cmd[0] & 0xff_ffff)
+                format!(
+                    "fill rect {w}x{h} at ({x},{y}) color={:06x}",
+                    cmd[0] & 0xff_ffff
+                )
             }
             0x1f => "irq request".to_string(),
             0x20..=0x3f => {
@@ -473,7 +501,11 @@ impl Gpu {
                     if gouraud { "gouraud " } else { "flat " },
                     if textured { "textured " } else { "" },
                     if op & 0x02 != 0 { "semi " } else { "" },
-                    if textured && op & 0x01 != 0 { "raw " } else { "" },
+                    if textured && op & 0x01 != 0 {
+                        "raw "
+                    } else {
+                        ""
+                    },
                     cmd[0] & 0xff_ffff,
                 )
             }
@@ -483,7 +515,11 @@ impl Gpu {
                 format!(
                     "line{}{} {:?}->{:?} color={:06x}",
                     if gouraud { " gouraud" } else { "" },
-                    if op & 0x08 != 0 { " (polyline start)" } else { "" },
+                    if op & 0x08 != 0 {
+                        " (polyline start)"
+                    } else {
+                        ""
+                    },
                     vertex(cmd[1]),
                     vertex(v1),
                     cmd[0] & 0xff_ffff,
@@ -525,8 +561,16 @@ impl Gpu {
             }
             0xe1 => format!("texpage {:06x}", cmd[0] & 0xff_ffff),
             0xe2 => format!("tex window {:06x}", cmd[0] & 0xff_ffff),
-            0xe3 => format!("draw area min ({},{})", cmd[0] & 0x3ff, (cmd[0] >> 10) & 0x1ff),
-            0xe4 => format!("draw area max ({},{})", cmd[0] & 0x3ff, (cmd[0] >> 10) & 0x1ff),
+            0xe3 => format!(
+                "draw area min ({},{})",
+                cmd[0] & 0x3ff,
+                (cmd[0] >> 10) & 0x1ff
+            ),
+            0xe4 => format!(
+                "draw area max ({},{})",
+                cmd[0] & 0x3ff,
+                (cmd[0] >> 10) & 0x1ff
+            ),
             0xe5 => {
                 let x = ((cmd[0] & 0x7ff) << 21) as i32 >> 21;
                 let y = (((cmd[0] >> 11) & 0x7ff) << 21) as i32 >> 21;
@@ -598,7 +642,11 @@ impl Gpu {
                     }
                 };
                 self.interlaced = word & (1 << 5) != 0;
-                self.vres = if word & 4 != 0 && self.interlaced { 480 } else { 240 };
+                self.vres = if word & 4 != 0 && self.interlaced {
+                    480
+                } else {
+                    240
+                };
                 self.pal_mode = word & 8 != 0;
                 self.color_24bit = word & 0x10 != 0;
                 debug!(target: "psx_core::gpu",
@@ -693,7 +741,11 @@ impl Gpu {
         if self.check_mask && self.vram[i] & 0x8000 != 0 {
             return;
         }
-        let force = if self.force_mask && !semi_handled_mask { 0x8000 } else { 0 };
+        let force = if self.force_mask && !semi_handled_mask {
+            0x8000
+        } else {
+            0
+        };
         self.vram[i] = px | force;
     }
 }

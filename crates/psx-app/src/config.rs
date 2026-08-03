@@ -65,10 +65,10 @@ impl Config {
                         // Relative paths resolve against the config dir
                         if let Some(dir) = path.parent() {
                             for p in [&mut cfg.bios, &mut cfg.memcard] {
-                                if let Some(v) = p {
-                                    if v.is_relative() {
-                                        *v = dir.join(&v);
-                                    }
+                                if let Some(v) = p
+                                    && v.is_relative()
+                                {
+                                    *v = dir.join(&v);
                                 }
                             }
                         }
