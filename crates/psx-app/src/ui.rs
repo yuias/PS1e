@@ -269,6 +269,13 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ctx, |ui| {
             let enabled = self.sys.bus.gpu.frame.enabled;
             let image = self.display_image();
+            // No frame captured yet (before the first vblank): zero-sized
+            // textures are a wgpu validation error, so skip texture work.
+            let has_frame = image.size[0] > 0 && image.size[1] > 0;
+            if !(enabled && has_frame) {
+                ui.centered_and_justified(|ui| ui.label("display disabled"));
+                return;
+            }
             let tex = match &mut self.display_tex {
                 Some(t) => {
                     t.set(image, egui::TextureOptions::NEAREST);
@@ -284,17 +291,13 @@ impl eframe::App for App {
                     t
                 }
             };
-            if enabled {
-                // Fit the panel while keeping a 4:3 presentation aspect
-                let avail = ui.available_size();
-                let scale = (avail.x / 4.0).min(avail.y / 3.0);
-                let size = egui::Vec2::new(scale * 4.0, scale * 3.0);
-                ui.centered_and_justified(|ui| {
-                    ui.add(egui::Image::new(&tex).fit_to_exact_size(size));
-                });
-            } else {
-                ui.centered_and_justified(|ui| ui.label("display disabled"));
-            }
+            // Fit the panel while keeping a 4:3 presentation aspect
+            let avail = ui.available_size();
+            let scale = (avail.x / 4.0).min(avail.y / 3.0);
+            let size = egui::Vec2::new(scale * 4.0, scale * 3.0);
+            ui.centered_and_justified(|ui| {
+                ui.add(egui::Image::new(&tex).fit_to_exact_size(size));
+            });
         });
 
         if self.show_vram {
