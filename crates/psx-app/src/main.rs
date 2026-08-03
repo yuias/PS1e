@@ -2,6 +2,11 @@
 //!
 //! `--headless` runs the core without a window for CI and BIOS bring-up:
 //!   psx-app --headless --cycles 30000000 [--bios assets/SCPH-1000.bin]
+//!
+//! Headless game progression: `--mash-start` taps START/CROSS periodically;
+//! `--input <file>` replays a script of timed button holds (see
+//! [`parse_input_script`]). Inspect results with `--dump-frame`/`--dump-vram`
+//! and `--log-gpu` (decoded GP0/GP1 command log).
 
 mod audio;
 mod config;
@@ -16,9 +21,14 @@ struct Args {
     cycles: u64,
     dump_vram: Option<String>,
     dump_wav: Option<String>,
+    dump_frame: Option<String>,
     peek: Option<u32>,
     /// Headless: tap START every 2 seconds to get past title screens.
     mash_start: bool,
+    /// Headless: input script replayed during the run (overrides mash-start).
+    input: Option<String>,
+    /// Decode every GP0/GP1 command to the log.
+    log_gpu: bool,
 }
 
 fn parse_args() -> Args {
@@ -29,14 +39,19 @@ fn parse_args() -> Args {
         cycles: 30_000_000,
         dump_vram: None,
         dump_wav: None,
+        dump_frame: None,
         peek: None,
         mash_start: false,
+        input: None,
+        log_gpu: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
             "--headless" => args.headless = true,
             "--mash-start" => args.mash_start = true,
+            "--log-gpu" => args.log_gpu = true,
+            "--input" => args.input = Some(it.next().expect("--input needs a path")),
             "--bios" => args.bios = Some(it.next().expect("--bios needs a path")),
             "--disc" => args.disc = Some(it.next().expect("--disc needs a path")),
             "--cycles" => {
@@ -46,6 +61,9 @@ fn parse_args() -> Args {
                     .expect("--cycles needs a number")
             }
             "--dump-vram" => args.dump_vram = Some(it.next().expect("--dump-vram needs a path")),
+            "--dump-frame" => {
+                args.dump_frame = Some(it.next().expect("--dump-frame needs a path"))
+            }
             "--dump-wav" => args.dump_wav = Some(it.next().expect("--dump-wav needs a path")),
             "--peek" => {
                 args.peek = Some(
@@ -66,14 +84,13 @@ fn parse_args() -> Args {
 }
 
 fn main() -> eframe::Result {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
-        )
-        .init();
-
     let args = parse_args();
+    // The GPU command log emits at debug level under its own target so it can
+    // be toggled at runtime (UI checkbox / --log-gpu) without drowning `info`.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "info".into())
+        .add_directive("psx_core::gpu::cmd=debug".parse().unwrap());
+    tracing_subscriber::fmt().with_env_filter(filter).init();
     let (cfg, cfg_path) = config::Config::load();
 
     // CLI takes precedence over the config file
@@ -93,6 +110,7 @@ fn main() -> eframe::Result {
     let bios = std::fs::read(&bios_path)
         .unwrap_or_else(|e| panic!("failed to read BIOS '{}': {e}", bios_path.display()));
     let mut sys = PsxSystem::new(bios.clone()).expect("failed to create system");
+    sys.bus.gpu.log_commands = args.log_gpu;
     if let Some(path) = &args.disc {
         sys.insert_disc(load_disc(path));
     }
@@ -125,14 +143,12 @@ fn main() -> eframe::Result {
     }
 
     if args.headless {
-        run_headless(
-            sys,
-            args.cycles,
-            args.dump_vram.as_deref(),
-            args.dump_wav.as_deref(),
-            args.peek,
-            args.mash_start,
-        );
+        let script = args
+            .input
+            .as_deref()
+            .map(parse_input_script)
+            .unwrap_or_default();
+        run_headless(sys, &args, &script);
         return Ok(());
     }
 
@@ -176,21 +192,85 @@ fn load_disc(path: &str) -> psx_core::cdrom::Disc {
     psx_core::cdrom::Disc::new(data).expect("invalid disc image")
 }
 
-fn run_headless(
-    mut sys: PsxSystem,
-    cycles: u64,
-    dump_vram: Option<&str>,
-    dump_wav: Option<&str>,
-    peek: Option<u32>,
-    mash_start: bool,
-) {
+/// One scripted input span: hold `buttons` for cycles `start..end`.
+struct InputSpan {
+    start: u64,
+    end: u64,
+    buttons: u16,
+}
+
+/// Parse an input script: one span per line, `<start-sec> <dur-sec> <BUTTONS>`
+/// where BUTTONS is `+`-separated names (START, CROSS, UP, ...). `#` starts a
+/// comment. Overlapping spans are OR-ed together.
+fn parse_input_script(path: &str) -> Vec<InputSpan> {
+    let text = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("failed to read input script '{path}': {e}"));
+    let mut spans = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        let line = line.split('#').next().unwrap().trim();
+        if line.is_empty() {
+            continue;
+        }
+        let bad = || -> ! { panic!("{path}:{}: expected '<start-sec> <dur-sec> <BUTTONS>'", n + 1) };
+        let mut parts = line.split_whitespace();
+        let start: f64 = parts.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| bad());
+        let dur: f64 = parts.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| bad());
+        let buttons = parts
+            .next()
+            .unwrap_or_else(|| bad())
+            .split('+')
+            .map(|name| {
+                button_by_name(name)
+                    .unwrap_or_else(|| panic!("{path}:{}: unknown button '{name}'", n + 1))
+            })
+            .fold(0u16, |acc, b| acc | b);
+        let hz = psx_core::CPU_CLOCK_HZ as f64;
+        spans.push(InputSpan {
+            start: (start * hz) as u64,
+            end: ((start + dur) * hz) as u64,
+            buttons,
+        });
+    }
+    spans
+}
+
+fn button_by_name(name: &str) -> Option<u16> {
+    use psx_core::sio::button::*;
+    Some(match name.to_ascii_uppercase().as_str() {
+        "SELECT" => SELECT,
+        "START" => START,
+        "UP" => UP,
+        "DOWN" => DOWN,
+        "LEFT" => LEFT,
+        "RIGHT" => RIGHT,
+        "L1" => L1,
+        "R1" => R1,
+        "L2" => L2,
+        "R2" => R2,
+        "TRIANGLE" => TRIANGLE,
+        "CIRCLE" => CIRCLE,
+        "CROSS" => CROSS,
+        "SQUARE" => SQUARE,
+        _ => return None,
+    })
+}
+
+fn run_headless(mut sys: PsxSystem, args: &Args, script: &[InputSpan]) {
+    let cycles = args.cycles;
+    let (dump_vram, dump_wav) = (args.dump_vram.as_deref(), args.dump_wav.as_deref());
     tracing::info!("running headless for {cycles} cycles");
     // Chunked run so we can inject input and collect audio along the way
     const CHUNK: u64 = psx_core::CPU_CLOCK_HZ / 10;
     let mut wav_samples: Vec<i16> = Vec::new();
     let mut done = 0u64;
     while done < cycles {
-        if mash_start {
+        if !script.is_empty() {
+            let buttons = script
+                .iter()
+                .filter(|s| s.start <= done && done < s.end)
+                .fold(0u16, |acc, s| acc | s.buttons);
+            sys.set_buttons(buttons);
+        } else if args.mash_start {
             // Alternate START and CROSS taps (0.5s each out of every 2s)
             // so both title screens and menus advance
             let phase = done / CHUNK % 40;
@@ -259,7 +339,7 @@ fn run_headless(
             }
         }
     }
-    if let Some(addr) = peek {
+    if let Some(addr) = args.peek {
         println!("--- peek {addr:#010x} ---");
         let base = (addr & 0x001f_fffc) as usize;
         for ofs in (base..base + 96).step_by(4) {
@@ -270,6 +350,21 @@ fn run_headless(
     if let Some(path) = dump_vram {
         write_vram_bmp(path, &sys.bus.gpu.vram);
         tracing::info!("VRAM dumped to {path}");
+    }
+    if let Some(path) = args.dump_frame.as_deref() {
+        let frame = &sys.bus.gpu.frame;
+        if frame.width == 0 || frame.height == 0 {
+            tracing::warn!("no frame captured yet; skipping --dump-frame");
+        } else {
+            write_frame_bmp(path, frame);
+            tracing::info!(
+                "frame dumped to {path} ({}x{}{}{})",
+                frame.width,
+                frame.height,
+                if frame.is_24bit { ", 24-bit" } else { "" },
+                if frame.enabled { "" } else { ", display disabled" },
+            );
+        }
     }
 }
 
@@ -293,6 +388,46 @@ fn write_wav(path: &str, samples: &[i16]) {
         out.extend_from_slice(&s.to_le_bytes());
     }
     std::fs::write(path, out).expect("failed to write WAV");
+}
+
+/// Dump the last vblank-latched display frame (what the TV shows) as a
+/// 24-bit BMP, decoding 15-bit or packed 24-bit rows as appropriate.
+fn write_frame_bmp(path: &str, frame: &psx_core::gpu::Frame) {
+    let (w, h, stride) = (
+        frame.width as usize,
+        frame.height as usize,
+        frame.stride as usize,
+    );
+    let pad = (4 - (w * 3) % 4) % 4;
+    let data_size = (w * 3 + pad) * h;
+    let mut out = Vec::with_capacity(54 + data_size);
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&(54u32 + data_size as u32).to_le_bytes());
+    out.extend_from_slice(&[0; 4]);
+    out.extend_from_slice(&54u32.to_le_bytes());
+    out.extend_from_slice(&40u32.to_le_bytes()); // BITMAPINFOHEADER
+    out.extend_from_slice(&(w as u32).to_le_bytes());
+    out.extend_from_slice(&(h as u32).to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&24u16.to_le_bytes());
+    out.extend_from_slice(&[0; 24]); // no compression, default resolution
+    for y in (0..h).rev() {
+        let row = &frame.pixels[y * stride..(y + 1) * stride];
+        for x in 0..w {
+            let (r, g, b) = if frame.is_24bit {
+                let byte = x * 3;
+                let read = |b: usize| (row[(byte + b) / 2] >> (((byte + b) & 1) * 8)) as u8;
+                (read(0), read(1), read(2))
+            } else {
+                let px = row[x];
+                let e = |c: u16| ((c << 3) | (c >> 2)) as u8;
+                (e(px & 0x1f), e((px >> 5) & 0x1f), e((px >> 10) & 0x1f))
+            };
+            out.extend_from_slice(&[b, g, r]);
+        }
+        out.extend_from_slice(&[0, 0, 0][..pad]);
+    }
+    std::fs::write(path, out).expect("failed to write BMP");
 }
 
 /// Dump the full 1024x512 VRAM as a 24-bit BMP for offline inspection.
