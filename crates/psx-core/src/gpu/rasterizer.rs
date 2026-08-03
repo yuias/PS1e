@@ -1,7 +1,9 @@
 //! Software rasterizer: triangles, rectangles, lines.
 //!
 //! Integer edge-function rasterization with a top-left fill rule (PS1 omits
-//! right/bottom edge pixels). Dithering is not yet implemented (TODO).
+//! right/bottom edge pixels). Dithering follows the hardware rule: applied
+//! to gouraud shading and texture modulation on polygons and lines, never
+//! to rectangles, fills or raw textures.
 
 use super::{Gpu, TexDepth, VRAM_WIDTH};
 
@@ -53,6 +55,15 @@ fn tex_config(clut: u32, page: u32) -> TexConfig {
         clut_y: ((clut >> 6) & 0x1ff) as i32,
     }
 }
+
+/// The hardware's 4x4 ordered-dither offsets, added to 8-bit channels
+/// before truncation to 5 bits.
+const DITHER: [[i32; 4]; 4] = [
+    [-4, 0, -3, 1],
+    [2, -2, 3, -1],
+    [-3, 1, -4, 0],
+    [3, -1, 2, -2],
+];
 
 fn orient2d(a: (i32, i32), b: (i32, i32), c: (i32, i32)) -> i64 {
     (b.0 - a.0) as i64 * (c.1 - a.1) as i64 - (b.1 - a.1) as i64 * (c.0 - a.0) as i64
@@ -168,14 +179,18 @@ impl Gpu {
                 if x < self.draw_min.0 || x > self.draw_max.0 {
                     continue;
                 }
-                // TODO: rect_tex_flip (x/y mirroring) is ignored for now
                 let px = match tex {
                     Some(tc) => {
-                        let texel = self.sample((u0 + dx) & 0xff, (v0 + dy) & 0xff, &tc);
+                        // E1 bits 12/13 mirror rectangle texture fetches
+                        let (fx, fy) = self.rect_tex_flip;
+                        let tu = if fx { u0 - dx } else { u0 + dx } & 0xff;
+                        let tv = if fy { v0 - dy } else { v0 + dy } & 0xff;
+                        let texel = self.sample(tu, tv, &tc);
                         if texel == 0 {
                             continue; // fully transparent texel
                         }
-                        self.shade_texel(texel, r, g, b, raw)
+                        // Rectangles are never dithered
+                        self.shade_texel(texel, r, g, b, raw, x, y, false)
                     }
                     None => rgb_to_555(r, g, b),
                 };
@@ -219,7 +234,14 @@ impl Gpu {
             {
                 let t = i as i64;
                 let lerp = |a: i32, b: i32| (a as i64 + (b - a) as i64 * t / steps as i64) as i32;
-                let px = rgb_to_555(lerp(r0, r1), lerp(g0, g1), lerp(b0, b1));
+                let px = rgb_to_555_dithered(
+                    lerp(r0, r1),
+                    lerp(g0, g1),
+                    lerp(b0, b1),
+                    x,
+                    y,
+                    self.dither && gouraud,
+                );
                 self.put_pixel(x, y, px, semi, self.semi_mode);
             }
             fx += sx;
@@ -264,6 +286,9 @@ impl Gpu {
         if x0 > x1 || y0 > y1 {
             return;
         }
+
+        // Dither gouraud shading and texture modulation (never raw texture)
+        let dither = self.dither && (gouraud || (tex.is_some() && !raw));
 
         let a = (v0.x, v0.y);
         let b = (v1.x, v1.y);
@@ -310,9 +335,9 @@ impl Gpu {
                                 w2 += a01;
                                 continue;
                             }
-                            self.shade_texel(texel, r, g, b_, raw)
+                            self.shade_texel(texel, r, g, b_, raw, x, y, dither)
                         }
-                        None => rgb_to_555(r, g, b_),
+                        None => rgb_to_555_dithered(r, g, b_, x, y, dither),
                     };
                     let apply_semi = semi && (tex.is_none() || px & 0x8000 != 0);
                     self.put_pixel(x, y, px, apply_semi, semi_mode);
@@ -357,18 +382,27 @@ impl Gpu {
     }
 
     /// Modulate a texel with the vertex color ((tex * color) / 128 per
-    /// channel), preserving the STP bit. `raw` skips modulation.
-    fn shade_texel(&self, texel: u16, r: i32, g: i32, b: i32, raw: bool) -> u16 {
+    /// channel), preserving the STP bit. `raw` skips modulation; modulated
+    /// results are dithered in the 8-bit domain like hardware.
+    fn shade_texel(
+        &self,
+        texel: u16,
+        r: i32,
+        g: i32,
+        b: i32,
+        raw: bool,
+        x: i32,
+        y: i32,
+        dither: bool,
+    ) -> u16 {
         if raw {
             return texel;
         }
-        let tr = (texel & 0x1f) as i32;
-        let tg = ((texel >> 5) & 0x1f) as i32;
-        let tb = ((texel >> 10) & 0x1f) as i32;
-        let mr = ((tr * r) >> 7).min(31);
-        let mg = ((tg * g) >> 7).min(31);
-        let mb = ((tb * b) >> 7).min(31);
-        (mr | mg << 5 | mb << 10) as u16 | (texel & 0x8000)
+        let expand = |c: u16| (((c & 0x1f) << 3) | ((c & 0x1f) >> 2)) as i32;
+        let mr = (expand(texel) * r >> 7).min(255);
+        let mg = (expand(texel >> 5) * g >> 7).min(255);
+        let mb = (expand(texel >> 10) * b >> 7).min(255);
+        rgb_to_555_dithered(mr, mg, mb, x, y, dither) | (texel & 0x8000)
     }
 
     /// Final pixel write: clip is already done; handles semi-transparency
@@ -392,8 +426,20 @@ impl Gpu {
 }
 
 fn rgb_to_555(r: i32, g: i32, b: i32) -> u16 {
-    // TODO: dithering (GPUSTAT bit 9) before the 8->5 bit truncation
     (((r >> 3) & 0x1f) | ((g >> 3) & 0x1f) << 5 | ((b >> 3) & 0x1f) << 10) as u16
+}
+
+/// 8-bit channels to 15-bit, with the ordered dither applied first.
+fn rgb_to_555_dithered(r: i32, g: i32, b: i32, x: i32, y: i32, dither: bool) -> u16 {
+    if !dither {
+        return rgb_to_555(r.clamp(0, 255), g.clamp(0, 255), b.clamp(0, 255));
+    }
+    let d = DITHER[(y & 3) as usize][(x & 3) as usize];
+    rgb_to_555(
+        (r + d).clamp(0, 255),
+        (g + d).clamp(0, 255),
+        (b + d).clamp(0, 255),
+    )
 }
 
 /// Semi-transparency: per-channel blend of back(B) and front(F) 5-bit values.

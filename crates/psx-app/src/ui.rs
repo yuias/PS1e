@@ -38,6 +38,7 @@ pub struct App {
     bios: Vec<u8>,
     running: bool,
     show_vram: bool,
+    vram_as_24bit: bool,
     display_tex: Option<egui::TextureHandle>,
     vram_tex: Option<egui::TextureHandle>,
     audio: Option<Audio>,
@@ -62,6 +63,7 @@ impl App {
             bios,
             running: false,
             show_vram: false,
+            vram_as_24bit: false,
             display_tex: None,
             vram_tex: None,
             audio: Audio::new(),
@@ -291,7 +293,30 @@ impl eframe::App for App {
         });
 
         if self.show_vram {
-            let image = self.vram_image(0, 0, 1024, 512);
+            let image = if self.vram_as_24bit {
+                // Whole VRAM reinterpreted as packed RGB888 (682 px/row)
+                let vram = &self.sys.bus.gpu.vram;
+                let (w, h) = (682usize, 512usize);
+                let mut pixels = Vec::with_capacity(w * h);
+                for y in 0..h {
+                    let row = y * 1024;
+                    for x in 0..w {
+                        let byte = x * 3;
+                        let read = |b: usize| {
+                            let half = vram[row + (byte + b) / 2];
+                            (half >> (((byte + b) & 1) * 8)) as u8
+                        };
+                        pixels.push(egui::Color32::from_rgb(read(0), read(1), read(2)));
+                    }
+                }
+                egui::ColorImage {
+                    size: [w, h],
+                    source_size: egui::Vec2::new(w as f32, h as f32),
+                    pixels,
+                }
+            } else {
+                self.vram_image(0, 0, 1024, 512)
+            };
             let tex = match &mut self.vram_tex {
                 Some(t) => {
                     t.set(image, egui::TextureOptions::NEAREST);
@@ -307,6 +332,7 @@ impl eframe::App for App {
             egui::Window::new("VRAM (1024x512)")
                 .default_width(1024.0)
                 .show(ctx, |ui| {
+                    ui.checkbox(&mut self.vram_as_24bit, "interpret as 24-bit RGB");
                     ui.add(egui::Image::new(&tex));
                 });
         }
