@@ -72,8 +72,9 @@ impl PsxSystem {
         self.observe_tty();
         self.bus.now = self.cycles;
         self.cpu.step(&mut self.bus);
-        // TODO: refine with memory wait states and I-cache timing
-        self.cycles += 1;
+        // 1 pipeline cycle per instruction plus the wait states its bus
+        // accesses accumulated (I-cache hits in cached segments are free)
+        self.cycles += 1 + std::mem::take(&mut self.bus.penalty);
 
         let bus::Bus { cdrom, sio, spu, irq, .. } = &mut self.bus;
         cdrom.tick(self.cycles, irq);

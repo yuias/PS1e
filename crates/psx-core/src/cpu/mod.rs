@@ -87,7 +87,7 @@ impl Cpu {
             return;
         }
 
-        let instr = bus.read32(self.pc);
+        let instr = bus.fetch32(self.pc);
         self.pc = self.next_pc;
         self.next_pc = self.next_pc.wrapping_add(4);
 

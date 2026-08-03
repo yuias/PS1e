@@ -68,6 +68,9 @@ pub struct Bus {
     /// Current CPU cycle, updated by the system before each step; used by
     /// components that catch up lazily (timers).
     pub now: u64,
+    /// Wait-state cycles accumulated by accesses since the last step;
+    /// drained by the system into the cycle counter.
+    pub penalty: u64,
     /// Expansion base / delay registers at 0x1f801000..0x1f801024, plus
     /// RAM_SIZE at 0x1f801060. Stored raw so BIOS read-back matches.
     mem_ctrl: [u32; 9],
@@ -99,6 +102,7 @@ impl Bus {
             spu: Spu::new(),
             mdec: Mdec::new(),
             now: 0,
+            penalty: 0,
             mem_ctrl: [0; 9],
             ram_size: 0,
             cache_control: 0,
@@ -122,6 +126,29 @@ impl Bus {
         addr & REGION_MASK[(addr >> 29) as usize]
     }
 
+    /// Read wait states by region. Approximations: RAM pays its access
+    /// latency, the 8-bit BIOS ROM is painfully slow (4 byte reads per
+    /// word), scratchpad is on the CPU and free. Stores go through the
+    /// write queue and are modeled as free.
+    fn read_penalty(p: u32) -> u64 {
+        match p {
+            0x0000_0000..0x0080_0000 => 3,
+            0x1f80_0000..0x1f80_0400 => 0,
+            0x1fc0_0000..0x1fc8_0000 => 18,
+            _ => 3, // MMIO / expansion
+        }
+    }
+
+    /// Instruction fetch: cached segments (KUSEG/KSEG0) are treated as
+    /// I-cache hits; uncached fetches pay the full bus latency per word.
+    pub fn fetch32(&mut self, addr: u32) -> u32 {
+        let p = Self::mask_address(addr);
+        if addr >= 0xa000_0000 {
+            self.penalty += Self::read_penalty(p);
+        }
+        self.read32_at(p)
+    }
+
     fn read_ram32(&self, addr: u32) -> u32 {
         let i = (addr as usize) & (RAM_SIZE - 1) & !3;
         u32::from_le_bytes(self.ram[i..i + 4].try_into().unwrap())
@@ -136,6 +163,7 @@ impl Bus {
 
     pub fn read8(&mut self, addr: u32) -> u8 {
         let p = Self::mask_address(addr);
+        self.penalty += Self::read_penalty(p);
         match p {
             0x0000_0000..0x0080_0000 => self.ram[(p as usize) & (RAM_SIZE - 1)],
             0x1f80_0000..0x1f80_0400 => self.scratchpad[(p - 0x1f80_0000) as usize],
@@ -154,6 +182,7 @@ impl Bus {
 
     pub fn read16(&mut self, addr: u32) -> u16 {
         let p = Self::mask_address(addr);
+        self.penalty += Self::read_penalty(p);
         match p {
             0x0000_0000..0x0080_0000 => {
                 let i = (p as usize) & (RAM_SIZE - 1);
@@ -177,6 +206,11 @@ impl Bus {
 
     pub fn read32(&mut self, addr: u32) -> u32 {
         let p = Self::mask_address(addr);
+        self.penalty += Self::read_penalty(p);
+        self.read32_at(p)
+    }
+
+    fn read32_at(&mut self, p: u32) -> u32 {
         match p {
             0x0000_0000..0x0080_0000 => {
                 let i = (p as usize) & (RAM_SIZE - 1);
