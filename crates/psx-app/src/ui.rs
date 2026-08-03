@@ -46,10 +46,17 @@ pub struct App {
     volume: f32,
     config: Config,
     config_path: Option<PathBuf>,
+    memcard_path: PathBuf,
 }
 
 impl App {
-    pub fn new(sys: PsxSystem, bios: Vec<u8>, config: Config, config_path: Option<PathBuf>) -> Self {
+    pub fn new(
+        sys: PsxSystem,
+        bios: Vec<u8>,
+        config: Config,
+        config_path: Option<PathBuf>,
+        memcard_path: PathBuf,
+    ) -> Self {
         Self {
             sys,
             bios,
@@ -62,13 +69,25 @@ impl App {
             volume: config.volume.clamp(0.0, 1.0),
             config,
             config_path,
+            memcard_path,
+        }
+    }
+
+    fn save_memcard_if_dirty(&mut self) {
+        if self.sys.bus.sio.memcard.take_dirty() {
+            if let Err(e) = std::fs::write(&self.memcard_path, &self.sys.bus.sio.memcard.data) {
+                tracing::error!("failed to save memory card: {e}");
+            } else {
+                tracing::info!("memory card saved");
+            }
         }
     }
 }
 
 impl Drop for App {
-    /// Persist settings changed from the UI (currently just the volume).
+    /// Persist settings changed from the UI and any unsaved card writes.
     fn drop(&mut self) {
+        self.save_memcard_if_dirty();
         if let Some(path) = &self.config_path {
             if (self.config.volume - self.volume).abs() > f32::EPSILON {
                 self.config.volume = self.volume;
@@ -167,6 +186,7 @@ impl eframe::App for App {
             if let Some(audio) = &self.audio {
                 audio.push_samples(&self.sample_scratch);
             }
+            self.save_memcard_if_dirty();
             ctx.request_repaint();
         }
 

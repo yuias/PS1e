@@ -18,6 +18,10 @@ const DEFAULT_TEMPLATE: &str = r#"# PS1e configuration
 
 # Master volume, 0.0 .. 1.0
 volume = 0.5
+
+# Memory card image (created and formatted automatically).
+# Defaults to memcard0.mcr next to this file.
+#memcard = "memcard0.mcr"
 "#;
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -25,6 +29,7 @@ volume = 0.5
 pub struct Config {
     pub bios: Option<PathBuf>,
     pub volume: f32,
+    pub memcard: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -32,6 +37,7 @@ impl Default for Config {
         Self {
             bios: None,
             volume: 0.5,
+            memcard: None,
         }
     }
 }
@@ -56,10 +62,14 @@ impl Config {
             match std::fs::read_to_string(&path) {
                 Ok(text) => match toml::from_str::<Config>(&text) {
                     Ok(mut cfg) => {
-                        // Relative BIOS paths resolve against the config dir
-                        if let (Some(bios), Some(dir)) = (&cfg.bios, path.parent()) {
-                            if bios.is_relative() {
-                                cfg.bios = Some(dir.join(bios));
+                        // Relative paths resolve against the config dir
+                        if let Some(dir) = path.parent() {
+                            for p in [&mut cfg.bios, &mut cfg.memcard] {
+                                if let Some(v) = p {
+                                    if v.is_relative() {
+                                        *v = dir.join(&v);
+                                    }
+                                }
                             }
                         }
                         tracing::info!("loaded config from {}", path.display());
@@ -86,6 +96,17 @@ impl Config {
             }
         }
         (Config::default(), path)
+    }
+
+    /// Memory card image location: configured path, or memcard0.mcr next
+    /// to the config file.
+    pub fn memcard_path(&self, cfg_path: Option<&PathBuf>) -> PathBuf {
+        self.memcard.clone().unwrap_or_else(|| {
+            cfg_path
+                .and_then(|p| p.parent())
+                .map(|d| d.join("memcard0.mcr"))
+                .unwrap_or_else(|| PathBuf::from("memcard0.mcr"))
+        })
     }
 
     /// Persist current settings (e.g. volume changed in the UI), keeping it

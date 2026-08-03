@@ -9,6 +9,7 @@ pub mod cpu;
 pub mod dma;
 pub mod gpu;
 pub mod mdec;
+pub mod memcard;
 pub mod scheduler;
 pub mod sio;
 pub mod spu;

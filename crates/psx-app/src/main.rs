@@ -90,6 +90,33 @@ fn main() -> eframe::Result {
         sys.insert_disc(load_disc(path));
     }
 
+    // Memory card: load the image, or create a freshly formatted one
+    let memcard_path = cfg.memcard_path(cfg_path.as_ref());
+    match std::fs::read(&memcard_path) {
+        Ok(data) if data.len() == psx_core::memcard::CARD_SIZE => {
+            sys.bus.sio.memcard = psx_core::memcard::MemCard::with_data(data.into_boxed_slice());
+            tracing::info!("memory card: {}", memcard_path.display());
+        }
+        Ok(_) => {
+            tracing::error!(
+                "memory card {} has wrong size; using a fresh card (not saved over it)",
+                memcard_path.display()
+            );
+        }
+        Err(_) => {
+            if let Some(dir) = memcard_path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let card = psx_core::memcard::MemCard::new();
+            if let Err(e) = std::fs::write(&memcard_path, &card.data) {
+                tracing::warn!("could not create memory card image: {e}");
+            } else {
+                tracing::info!("created memory card: {}", memcard_path.display());
+            }
+            sys.bus.sio.memcard = card;
+        }
+    }
+
     if args.headless {
         run_headless(sys, args.cycles, args.dump_vram.as_deref(), args.peek);
         return Ok(());
@@ -105,7 +132,7 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "PS1e",
         options,
-        Box::new(move |_cc| Ok(Box::new(ui::App::new(sys, bios, cfg, cfg_path)))),
+        Box::new(move |_cc| Ok(Box::new(ui::App::new(sys, bios, cfg, cfg_path, memcard_path)))),
     )
 }
 

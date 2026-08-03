@@ -5,6 +5,7 @@
 //! the /ACK interrupt is latched immediately after each non-final byte.
 
 use crate::bus::Irq;
+use crate::memcard::MemCard;
 use tracing::trace;
 
 /// /ACK arrives roughly 100us after the byte transfer on real hardware.
@@ -36,7 +37,8 @@ pub mod button {
 enum Device {
     None,
     Pad,
-    Absent, // memory card or anything else we don't emulate
+    MemCard,
+    Absent,
 }
 
 pub struct Sio {
@@ -52,6 +54,8 @@ pub struct Sio {
     ack_at: Option<u64>,
     /// Currently pressed buttons (host convention: set = pressed).
     pub buttons: u16,
+    /// Memory card in slot 1.
+    pub memcard: MemCard,
 }
 
 impl Sio {
@@ -66,6 +70,7 @@ impl Sio {
             irq_flag: false,
             ack_at: None,
             buttons: 0,
+            memcard: MemCard::new(),
         }
     }
 
@@ -128,6 +133,7 @@ impl Sio {
                 if val & (1 << 1) == 0 {
                     self.seq = 0;
                     self.device = Device::None;
+                    self.memcard.deselect();
                 }
             }
             0xe => self.baud = val,
@@ -151,11 +157,13 @@ impl Sio {
         if self.seq == 0 {
             self.device = match tx {
                 0x01 => Device::Pad,
+                0x81 => Device::MemCard,
                 _ => Device::Absent,
             };
         }
         let (response, ack) = match self.device {
             Device::Pad => self.pad_exchange(tx),
+            Device::MemCard => self.memcard.exchange(tx),
             _ => (0xff, false),
         };
         trace!(target: "psx_core::sio", "tx {tx:#04x} -> rx {response:#04x} ack={ack}");
