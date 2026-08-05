@@ -78,6 +78,15 @@ as a texture each frame. Debug panels: CPU registers, disassembly (future),
 VRAM viewer, TTY console, MMIO/log filter. A `--headless` mode runs the core
 without a window for CI and quick BIOS bring-up tests.
 
+`--headless --control-port <port>` switches to *lockstep control mode*,
+designed for scripted or LLM-driven game analysis: the emulator only advances
+on command, so every observation is deterministic. The bundled `psxctl` client
+sends one command per invocation (`run`, `press`, `input set`, `frame`,
+`peek`/`poke`, `tty`, …), letting a shell or tool-using agent drive an
+interact→observe→decide loop statelessly. Coexists with the debug stub; while
+a debugger is attached, execution commands are refused (observation still
+works).
+
 ## Original BIOS (separate project)
 
 An original BIOS binary (LLE, real MIPS code) is developed in a separate

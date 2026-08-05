@@ -12,9 +12,14 @@
 //! headless); `--wait-debugger` additionally holds execution at the reset
 //! vector until a debugger attaches:
 //!   (lldb) gdb-remote localhost:9001
+//!
+//! `--control-port <port>` (headless only) runs the emulator in lockstep,
+//! driven interactively through the `psxctl` client — designed for scripted
+//! or LLM-driven game analysis (see [`control`]).
 
 mod audio;
 mod config;
+mod control;
 mod ui;
 
 use psx_core::PsxSystem;
@@ -38,6 +43,8 @@ struct Args {
     debug_port: Option<u16>,
     /// Hold execution at the reset vector until a debugger attaches.
     wait_debugger: bool,
+    /// Lockstep control port for interactive automation (headless only).
+    control_port: Option<u16>,
 }
 
 fn parse_args() -> Args {
@@ -55,6 +62,7 @@ fn parse_args() -> Args {
         log_gpu: false,
         debug_port: None,
         wait_debugger: false,
+        control_port: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -68,6 +76,13 @@ fn parse_args() -> Args {
                     it.next()
                         .and_then(|v| v.parse().ok())
                         .expect("--debug-port needs a port number"),
+                )
+            }
+            "--control-port" => {
+                args.control_port = Some(
+                    it.next()
+                        .and_then(|v| v.parse().ok())
+                        .expect("--control-port needs a port number"),
                 )
             }
             "--input" => args.input = Some(it.next().expect("--input needs a path")),
@@ -164,6 +179,10 @@ fn main() -> eframe::Result {
     let debugger = args
         .debug_port
         .map(|port| psx_debug::DebugServer::bind(port).expect("failed to bind debug port"));
+    if args.control_port.is_some() && !args.headless {
+        eprintln!("--control-port requires --headless (lockstep control needs no window)");
+        std::process::exit(2);
+    }
 
     if args.headless {
         let script = args
@@ -264,7 +283,7 @@ fn parse_input_script(path: &str) -> Vec<InputSpan> {
             .unwrap_or_else(|| bad())
             .split('+')
             .map(|name| {
-                button_by_name(name)
+                control::button_by_name(name)
                     .unwrap_or_else(|| panic!("{path}:{}: unknown button '{name}'", n + 1))
             })
             .fold(0u16, |acc, b| acc | b);
@@ -278,27 +297,6 @@ fn parse_input_script(path: &str) -> Vec<InputSpan> {
     spans
 }
 
-fn button_by_name(name: &str) -> Option<u16> {
-    use psx_core::sio::button::*;
-    Some(match name.to_ascii_uppercase().as_str() {
-        "SELECT" => SELECT,
-        "START" => START,
-        "UP" => UP,
-        "DOWN" => DOWN,
-        "LEFT" => LEFT,
-        "RIGHT" => RIGHT,
-        "L1" => L1,
-        "R1" => R1,
-        "L2" => L2,
-        "R2" => R2,
-        "TRIANGLE" => TRIANGLE,
-        "CIRCLE" => CIRCLE,
-        "CROSS" => CROSS,
-        "SQUARE" => SQUARE,
-        _ => return None,
-    })
-}
-
 fn run_headless(
     mut sys: PsxSystem,
     args: &Args,
@@ -306,11 +304,34 @@ fn run_headless(
     mut debugger: Option<psx_debug::DebugServer>,
 ) {
     let cycles = args.cycles;
-    let (dump_vram, dump_wav) = (args.dump_vram.as_deref(), args.dump_wav.as_deref());
-    tracing::info!("running headless for {cycles} cycles");
+    let dump_wav = args.dump_wav.as_deref();
     // Chunked run so we can inject input and collect audio along the way
     const CHUNK: u64 = psx_core::CPU_CLOCK_HZ / 10;
     let mut wav_samples: Vec<i16> = Vec::new();
+
+    if let Some(port) = args.control_port {
+        // Lockstep control mode: the emulator advances only on `run`/`press`
+        // commands, so --cycles and input scripts do not apply.
+        let mut ctl = control::ControlServer::bind(port).expect("failed to bind control port");
+        tracing::info!("lockstep control mode; drive with: psxctl --port {port} help");
+        loop {
+            let debugger_owns = debugger.as_ref().is_some_and(|d| d.attached());
+            if let Some(dbg) = &mut debugger {
+                dbg.pump(&mut sys, CHUNK);
+            }
+            if !ctl.pump(&mut sys, debugger_owns) {
+                break;
+            }
+            if dump_wav.is_some() {
+                sys.bus.spu.drain_output(&mut wav_samples);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        finish_headless(&mut sys, args, wav_samples);
+        return;
+    }
+
+    tracing::info!("running headless for {cycles} cycles");
     let mut debugger_seen = false;
     let mut done = 0u64;
     while done < cycles {
@@ -354,6 +375,12 @@ fn run_headless(
             sys.bus.spu.drain_output(&mut wav_samples);
         }
     }
+    finish_headless(&mut sys, args, wav_samples);
+}
+
+/// End-of-run summary and dumps, shared by budgeted and control-mode runs.
+fn finish_headless(sys: &mut PsxSystem, args: &Args, wav_samples: Vec<i16>) {
+    let (dump_vram, dump_wav) = (args.dump_vram.as_deref(), args.dump_wav.as_deref());
     if let Some(path) = dump_wav {
         write_wav(path, &wav_samples);
         tracing::info!(
