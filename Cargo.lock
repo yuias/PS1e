@@ -2043,6 +2043,7 @@ dependencies = [
  "cpal",
  "eframe",
  "psx-core",
+ "psx-debug",
  "serde",
  "toml",
  "tracing",
@@ -2054,6 +2055,14 @@ dependencies = [
 name = "psx-core"
 version = "0.1.0"
 dependencies = [
+ "tracing",
+]
+
+[[package]]
+name = "psx-debug"
+version = "0.1.0"
+dependencies = [
+ "psx-core",
  "tracing",
 ]
 

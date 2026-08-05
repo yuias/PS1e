@@ -1,0 +1,10 @@
+[package]
+name = "psx-debug"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "LLDB-first gdb-remote debug stub for the PS1e core"
+
+[dependencies]
+psx-core = { path = "../psx-core" }
+tracing.workspace = true

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/psx-core", "crates/psx-app"]
+members = ["crates/psx-core", "crates/psx-app", "crates/psx-debug"]
 
 [workspace.package]
 version = "0.1.0"
