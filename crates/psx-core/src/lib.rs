@@ -25,6 +25,7 @@ pub const CPU_CLOCK_HZ: u64 = 33_868_800;
 /// NTSC field: 263 scanlines.
 pub const CYCLES_PER_FRAME: u64 = timers::CYCLES_PER_LINE * 263;
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct PsxSystem {
     pub cpu: Cpu,
     pub bus: Bus,
@@ -32,6 +33,18 @@ pub struct PsxSystem {
     cycles: u64,
     next_sample: u64,
     tty: String,
+}
+
+/// Save-state file magic + format version. Bump the version on any change
+/// to a serialized struct.
+const STATE_MAGIC: &[u8; 4] = b"PS1E";
+const STATE_VERSION: u16 = 1;
+
+/// Cheap content fingerprint (FNV-1a) to flag cross-BIOS state loads.
+fn bios_fingerprint(bios: &[u8]) -> u32 {
+    bios.iter().fold(0x811c_9dc5u32, |h, b| {
+        (h ^ *b as u32).wrapping_mul(0x0100_0193)
+    })
 }
 
 impl PsxSystem {
@@ -51,6 +64,46 @@ impl PsxSystem {
     /// Total elapsed CPU cycles since reset.
     pub fn cycles(&self) -> u64 {
         self.cycles
+    }
+
+    /// Serialize the complete machine state. The BIOS image, disc image and
+    /// memory card are *not* included: they are ambient assets the frontend
+    /// owns (and rolling back the memory card would corrupt real saves).
+    pub fn save_state(&self) -> Result<Vec<u8>, String> {
+        let mut out = Vec::with_capacity(8 * 1024 * 1024);
+        out.extend_from_slice(STATE_MAGIC);
+        out.extend_from_slice(&STATE_VERSION.to_le_bytes());
+        out.extend_from_slice(&bios_fingerprint(&self.bus.bios).to_le_bytes());
+        postcard::to_extend(self, out).map_err(|e| format!("serialize failed: {e}"))
+    }
+
+    /// Restore a state produced by [`PsxSystem::save_state`], carrying over
+    /// the current BIOS, disc and memory card.
+    pub fn load_state(&mut self, data: &[u8]) -> Result<(), String> {
+        let (header, body) = data
+            .split_at_checked(10)
+            .ok_or("state file too short".to_string())?;
+        if &header[..4] != STATE_MAGIC {
+            return Err("not a PS1e save state".into());
+        }
+        let version = u16::from_le_bytes(header[4..6].try_into().unwrap());
+        if version != STATE_VERSION {
+            return Err(format!(
+                "state version {version} not supported (expected {STATE_VERSION})"
+            ));
+        }
+        let fingerprint = u32::from_le_bytes(header[6..10].try_into().unwrap());
+        if fingerprint != bios_fingerprint(&self.bus.bios) {
+            tracing::warn!("state was saved with a different BIOS image; expect instability");
+        }
+        let mut new: PsxSystem =
+            postcard::from_bytes(body).map_err(|e| format!("deserialize failed: {e}"))?;
+        new.bus.bios = std::mem::take(&mut self.bus.bios);
+        new.bus.cdrom.set_disc(self.bus.cdrom.take_disc());
+        new.bus.sio.memcard = std::mem::take(&mut self.bus.sio.memcard);
+        new.bus.gpu.log_commands = self.bus.gpu.log_commands;
+        *self = new;
+        Ok(())
     }
 
     /// TTY output captured so far (kernel `putchar`).

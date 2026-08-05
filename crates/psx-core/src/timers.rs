@@ -14,7 +14,7 @@ pub const CYCLES_PER_LINE: u64 = 2153;
 /// Dotclock divider approximation for the common 320-pixel mode.
 const DOTCLOCK_DIV: u64 = 5;
 
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, serde::Serialize, serde::Deserialize)]
 struct Timer {
     counter: u32,
     mode: u32,
@@ -25,6 +25,7 @@ struct Timer {
     frac: u64,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Timers {
     t: [Timer; 3],
 }

@@ -18,7 +18,7 @@ pub enum Exception {
     Overflow = 0xc,
 }
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct Cop0 {
     /// r12: Status register
     pub sr: u32,

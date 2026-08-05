@@ -8,20 +8,25 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub enum EventKind {
     VBlank,
     TimerTarget(u8),
     DmaComplete(u8),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 struct Entry {
     deadline: u64,
     seq: u64, // tie-breaker keeping FIFO order for same-cycle events
     kind: EventKind,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Scheduler {
     heap: BinaryHeap<Reverse<Entry>>,
     seq: u64,

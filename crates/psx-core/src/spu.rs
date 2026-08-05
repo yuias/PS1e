@@ -26,7 +26,7 @@ const OUTPUT_CAP: usize = 65536 * 2;
 const ADPCM_POS: [i32; 5] = [0, 60, 115, 98, 122];
 const ADPCM_NEG: [i32; 5] = [0, 0, -52, -55, -60];
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 enum Phase {
     Off,
     Attack,
@@ -35,7 +35,7 @@ enum Phase {
     Release,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Voice {
     /// Current ADPCM block address (byte address in SPU RAM).
     cur_addr: u32,
@@ -70,8 +70,10 @@ impl Default for Voice {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Spu {
     /// Raw 16-bit register file for 0x1f801c00..0x1f801e00.
+    #[serde(with = "serde_big_array::BigArray")]
     regs: [u16; 0x100],
     pub ram: Box<[u8]>,
     voices: Vec<Voice>,

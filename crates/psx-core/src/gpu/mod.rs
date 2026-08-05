@@ -13,7 +13,7 @@ pub const VRAM_WIDTH: usize = 1024;
 pub const VRAM_HEIGHT: usize = 512;
 
 /// What GP0 is currently receiving.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 enum Gp0Mode {
     Command,
     /// CPU->VRAM image transfer: destination rect and write cursor.
@@ -26,13 +26,14 @@ enum Gp0Mode {
     },
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum TexDepth {
     T4Bit = 0,
     T8Bit = 1,
     T15Bit = 2,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Gpu {
     pub vram: Box<[u16]>,
 
@@ -96,7 +97,7 @@ pub struct Gpu {
 
 /// A vblank snapshot of the display area, as raw VRAM halfwords per row
 /// (`stride` halfwords each; 24-bit rows pack 2 pixels into 3 halfwords).
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct Frame {
     pub pixels: Vec<u16>,
     pub width: u32,

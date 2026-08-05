@@ -19,6 +19,7 @@ pub use gte::Gte;
 use crate::bus::Bus;
 use tracing::{trace, warn};
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Cpu {
     pub regs: [u32; 32],
     pub hi: u32,

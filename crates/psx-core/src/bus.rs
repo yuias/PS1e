@@ -36,7 +36,7 @@ fn dma_block_words(bcr: u32) -> u32 {
 }
 
 /// Interrupt controller (I_STAT / I_MASK).
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct Irq {
     pub stat: u32,
     pub mask: u32,
@@ -53,9 +53,12 @@ impl Irq {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Bus {
     pub ram: Box<[u8]>,
     pub scratchpad: Box<[u8]>,
+    /// Not part of save states; the frontend re-injects it on load.
+    #[serde(skip)]
     pub bios: Box<[u8]>,
     pub irq: Irq,
     pub gpu: Gpu,

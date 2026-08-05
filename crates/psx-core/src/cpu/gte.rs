@@ -32,7 +32,7 @@ const fn build_unr_table() -> [u8; 257] {
 const MAC123_MAX: i64 = (1i64 << 43) - 1;
 const MAC123_MIN: i64 = -(1i64 << 43);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Gte {
     // --- Data registers ---
     /// V0..V2, each [x, y, z].

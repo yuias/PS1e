@@ -17,7 +17,30 @@ const ZIGZAG: [usize; 64] = [
     58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
 ];
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// serde for `Vec<[i16; 64]>` (serde's array support stops at 32): the
+/// blocks are flattened into one `Vec<i16>` and re-chunked on load.
+mod flat_blocks {
+    use serde::de::Error;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &[[i16; 64]], s: S) -> Result<S::Ok, S::Error> {
+        let flat: Vec<i16> = v.iter().flatten().copied().collect();
+        flat.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<[i16; 64]>, D::Error> {
+        let flat: Vec<i16> = Vec::deserialize(d)?;
+        if !flat.len().is_multiple_of(64) {
+            return Err(D::Error::custom("block data not a multiple of 64"));
+        }
+        Ok(flat
+            .chunks_exact(64)
+            .map(|c| c.try_into().unwrap())
+            .collect())
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Command {
     Idle,
     Decode,
@@ -25,9 +48,13 @@ enum Command {
     SetScale,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Mdec {
+    #[serde(with = "serde_big_array::BigArray")]
     luma_quant: [u8; 64],
+    #[serde(with = "serde_big_array::BigArray")]
     chroma_quant: [u8; 64],
+    #[serde(with = "serde_big_array::BigArray")]
     scale: [i16; 64],
 
     command: Command,
@@ -41,11 +68,13 @@ pub struct Mdec {
     signed: bool,
     bit15: bool,
     /// Coefficient accumulator for the block being parsed.
+    #[serde(with = "serde_big_array::BigArray")]
     coefs: [i16; 64],
     coef_idx: usize,
     in_block: bool,
     qscale: i32,
     /// Decoded 8x8 blocks pending macroblock assembly (Cr, Cb, Y1..Y4).
+    #[serde(with = "flat_blocks")]
     blocks: Vec<[i16; 64]>,
 
     out: VecDeque<u32>,

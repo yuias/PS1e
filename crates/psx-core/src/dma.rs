@@ -8,7 +8,7 @@ use tracing::{debug, warn};
 
 pub const DPCR_RESET: u32 = 0x0765_4321;
 
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct Channel {
     pub madr: u32,
     pub bcr: u32,
@@ -37,6 +37,7 @@ impl Channel {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Dma {
     pub ch: [Channel; 7],
     pub dpcr: u32,

@@ -33,7 +33,7 @@ pub mod button {
 }
 
 /// Transaction target decided by the first byte on the wire.
-#[derive(PartialEq, Eq, Clone, Copy)]
+#[derive(PartialEq, Eq, Clone, Copy, serde::Serialize, serde::Deserialize)]
 enum Device {
     None,
     Pad,
@@ -41,6 +41,7 @@ enum Device {
     Absent,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Sio {
     ctrl: u16,
     mode: u16,
@@ -54,7 +55,9 @@ pub struct Sio {
     ack_at: Option<u64>,
     /// Currently pressed buttons (host convention: set = pressed).
     pub buttons: u16,
-    /// Memory card in slot 1.
+    /// Memory card in slot 1. Not part of save states: rolling the card
+    /// back with a state load would corrupt real saves.
+    #[serde(skip)]
     pub memcard: MemCard,
 }
 

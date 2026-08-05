@@ -7,3 +7,8 @@ description = "Platform-independent PlayStation 1 emulator core"
 
 [dependencies]
 tracing.workspace = true
+# Save states: serde across all component structs, postcard as the compact
+# wire format. All wasm-safe.
+serde = { version = "1", features = ["derive"] }
+serde-big-array = "0.5"
+postcard = { version = "1", default-features = false, features = ["use-std"] }

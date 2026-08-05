@@ -60,7 +60,10 @@ mod stat {
     pub const READING: u8 = 1 << 5;
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Cdrom {
+    /// Not part of save states; the frontend re-injects it on load.
+    #[serde(skip)]
     disc: Option<Disc>,
     index: u8,
     params: VecDeque<u8>,
@@ -152,6 +155,17 @@ impl Cdrom {
             xa_prev: (0, 0),
             xa_phase: 0,
         }
+    }
+
+    /// Remove the disc (save-state plumbing: the image is carried over
+    /// outside the serialized state).
+    pub fn take_disc(&mut self) -> Option<Disc> {
+        self.disc.take()
+    }
+
+    /// Counterpart of [`Cdrom::take_disc`]; `None` leaves the drive empty.
+    pub fn set_disc(&mut self, disc: Option<Disc>) {
+        self.disc = disc;
     }
 
     pub fn insert_disc(&mut self, disc: Disc) {
