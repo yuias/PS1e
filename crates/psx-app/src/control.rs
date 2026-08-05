@@ -150,8 +150,9 @@ impl Controller {
         let mut words = line.split_whitespace();
         let cmd = words.next().unwrap_or("");
         let args: Vec<&str> = words.collect();
-        // The debugger and the control port must not both drive execution.
-        if debugger_owns && matches!(cmd, "run" | "press" | "reset") {
+        // The debugger and the control port must not both drive execution
+        // (loadstate mutates it just as much as running does).
+        if debugger_owns && matches!(cmd, "run" | "press" | "reset" | "loadstate") {
             return Reply::err("debugger attached; execution is owned by the debugger");
         }
         match (cmd, args.as_slice()) {
@@ -268,6 +269,20 @@ impl Controller {
                 crate::write_vram_bmp(path, &sys.bus.gpu.vram);
                 Reply::ok(format!("1024x512 -> {path}"))
             }
+            ("savestate", [path]) => match sys.save_state() {
+                Ok(data) => match std::fs::write(path, &data) {
+                    Ok(()) => Reply::ok(format!("saved {} bytes -> {path}", data.len())),
+                    Err(e) => Reply::err(format!("write {path}: {e}")),
+                },
+                Err(e) => Reply::err(e),
+            },
+            ("loadstate", [path]) => match std::fs::read(path) {
+                Ok(data) => match sys.load_state(&data) {
+                    Ok(()) => Reply::ok(format!("loaded, pc={:#010x}", sys.cpu.pc)),
+                    Err(e) => Reply::err(e),
+                },
+                Err(e) => Reply::err(format!("read {path}: {e}")),
+            },
             ("quit", _) => Reply {
                 ok: true,
                 payload: "bye".into(),
@@ -289,6 +304,8 @@ vram <path>           dump full 1024x512 VRAM as BMP
 peek <hexaddr> <len>  hex dump memory (side-effect-free, MMIO shows --)
 poke <hexaddr> <hex>  write bytes to RAM/scratchpad
 tty                   TTY output accumulated since the last `tty`
+savestate <path>      snapshot the full machine state to a file
+loadstate <path>      restore a snapshot (BIOS/disc/memcard carry over)
 quit                  shut the emulator down
 ";
 
@@ -445,6 +462,30 @@ mod tests {
         assert!(!c.execute(&mut sys, "run -5", false).ok);
         assert!(!c.execute(&mut sys, "press NOPE 1", false).ok);
         assert!(!c.execute(&mut sys, "peek xyz 4", false).ok);
+    }
+
+    #[test]
+    fn savestate_loadstate_round_trip() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        let path = std::env::temp_dir().join(format!("ps1e-ctl-test-{}.sst", std::process::id()));
+        let p = path.to_str().unwrap();
+
+        assert!(c.execute(&mut sys, "run 1", false).ok);
+        let r = c.execute(&mut sys, &format!("savestate {p}"), false);
+        assert!(r.ok, "{}", r.payload);
+        let cycles_at_save = sys.cycles();
+
+        assert!(c.execute(&mut sys, "run 1", false).ok);
+        assert_ne!(sys.cycles(), cycles_at_save);
+
+        let r = c.execute(&mut sys, &format!("loadstate {p}"), false);
+        assert!(r.ok, "{}", r.payload);
+        assert_eq!(sys.cycles(), cycles_at_save);
+
+        // While a debugger owns execution, loading is refused (saving is ok).
+        assert!(c.execute(&mut sys, &format!("savestate {p}"), true).ok);
+        assert!(!c.execute(&mut sys, &format!("loadstate {p}"), true).ok);
+        std::fs::remove_file(path).ok();
     }
 
     #[test]

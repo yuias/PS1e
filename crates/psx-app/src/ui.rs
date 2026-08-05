@@ -48,6 +48,8 @@ pub struct App {
     config: Config,
     config_path: Option<PathBuf>,
     memcard_path: PathBuf,
+    /// Save-state slot file (sibling of the memory card image).
+    state_path: PathBuf,
     /// gdb-remote stub; while a client is attached it owns execution.
     debugger: Option<psx_debug::DebugServer>,
     /// Hold at the reset vector until the first debugger attach.
@@ -79,10 +81,31 @@ impl App {
             volume: config.volume.clamp(0.0, 1.0),
             config,
             config_path,
+            state_path: memcard_path.with_file_name("state0.sst"),
             memcard_path,
             debugger,
             wait_debugger,
             debugger_seen: false,
+        }
+    }
+
+    fn save_state(&self) {
+        match self.sys.save_state() {
+            Ok(data) => match std::fs::write(&self.state_path, &data) {
+                Ok(()) => tracing::info!("state saved to {}", self.state_path.display()),
+                Err(e) => tracing::error!("state save failed: {e}"),
+            },
+            Err(e) => tracing::error!("state save failed: {e}"),
+        }
+    }
+
+    fn load_state(&mut self) {
+        match std::fs::read(&self.state_path) {
+            Ok(data) => match self.sys.load_state(&data) {
+                Ok(()) => tracing::info!("state loaded from {}", self.state_path.display()),
+                Err(e) => tracing::error!("state load failed: {e}"),
+            },
+            Err(e) => tracing::error!("state load failed: {e} ({})", self.state_path.display()),
         }
     }
 
@@ -181,6 +204,10 @@ impl eframe::App for App {
         });
         self.sys.set_buttons(buttons);
 
+        // Save-state hotkeys, gated like the run controls while a debugger
+        // owns execution (checked again below once the flag is computed).
+        let (f5, f9) = ctx.input(|i| (i.key_pressed(egui::Key::F5), i.key_pressed(egui::Key::F9)));
+
         // Pace by wall clock, not repaint rate (high-refresh monitors
         // would otherwise fast-forward the game).
         let dt = ctx.input(|i| i.stable_dt).clamp(0.001, 0.05) as f64;
@@ -193,6 +220,15 @@ impl eframe::App for App {
             dbg.pump(&mut self.sys, dt_cycles);
             self.debugger_seen |= dbg.attached();
             debugger_active = dbg.attached() || (self.wait_debugger && !self.debugger_seen);
+        }
+
+        if f5 {
+            self.save_state();
+        }
+        // Loading mutates execution state, so it stays with the debugger
+        // while one is attached (same rule as the control port).
+        if f9 && !debugger_active {
+            self.load_state();
         }
 
         if debugger_active {
@@ -245,6 +281,13 @@ impl eframe::App for App {
                     if ui.button("Reset").clicked() {
                         self.running = false;
                         self.sys = PsxSystem::new(self.bios.clone()).expect("reset failed");
+                    }
+                    ui.separator();
+                    if ui.button("💾 Save (F5)").clicked() {
+                        self.save_state();
+                    }
+                    if ui.button("📂 Load (F9)").clicked() {
+                        self.load_state();
                     }
                 });
                 if let Some(dbg) = &self.debugger {
