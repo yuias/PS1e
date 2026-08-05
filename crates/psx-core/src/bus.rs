@@ -153,6 +153,31 @@ impl Bus {
         self.read32_at(p)
     }
 
+    /// Side-effect-free byte read for debuggers: plain memories only.
+    /// MMIO is refused (`None`) — a debugger draining the CD-ROM FIFO or
+    /// acknowledging IRQs by *looking* at them would corrupt emulation.
+    pub fn peek8(&self, addr: u32) -> Option<u8> {
+        let p = Self::mask_address(addr);
+        match p {
+            0x0000_0000..0x0080_0000 => Some(self.ram[(p as usize) & (RAM_SIZE - 1)]),
+            0x1f80_0000..0x1f80_0400 => Some(self.scratchpad[(p - 0x1f80_0000) as usize]),
+            0x1fc0_0000..0x1fc8_0000 => Some(self.bios[(p - 0x1fc0_0000) as usize]),
+            _ => None,
+        }
+    }
+
+    /// Side-effect-free byte write for debuggers: RAM and scratchpad only.
+    /// Returns false for ROM and MMIO.
+    pub fn poke8(&mut self, addr: u32, val: u8) -> bool {
+        let p = Self::mask_address(addr);
+        match p {
+            0x0000_0000..0x0080_0000 => self.ram[(p as usize) & (RAM_SIZE - 1)] = val,
+            0x1f80_0000..0x1f80_0400 => self.scratchpad[(p - 0x1f80_0000) as usize] = val,
+            _ => return false,
+        }
+        true
+    }
+
     fn read_ram32(&self, addr: u32) -> u32 {
         let i = (addr as usize) & (RAM_SIZE - 1) & !3;
         u32::from_le_bytes(self.ram[i..i + 4].try_into().unwrap())
