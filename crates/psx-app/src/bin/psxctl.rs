@@ -1,6 +1,6 @@
-//! psxctl: one-shot client for the psx-app control port.
+//! psxctl: one-shot client for the PS1e control port.
 //!
-//! Sends a single command to a `psx-app --headless --control-port <port>`
+//! Sends a single command to a `ps1e --headless --control-port <port>`
 //! session and prints the reply, so shells and tool-using LLM agents can
 //! drive the emulator statelessly:
 //!
@@ -35,7 +35,7 @@ fn main() {
 
     let stream = TcpStream::connect(("127.0.0.1", port)).unwrap_or_else(|e| {
         eprintln!("psxctl: cannot connect to 127.0.0.1:{port}: {e}");
-        eprintln!("is `psx-app --headless --control-port {port}` running?");
+        eprintln!("is `ps1e --headless --control-port {port}` running?");
         std::process::exit(2);
     });
     let mut writer = stream.try_clone().expect("clone stream");

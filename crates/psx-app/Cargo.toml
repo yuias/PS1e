@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 description = "Native PS1e frontend: egui debug shell on wgpu"
 
+# The executable is `ps1e`; the crate keeps its workspace name.
+# `psxctl` in src/bin/ is still auto-discovered alongside this.
+[[bin]]
+name = "ps1e"
+path = "src/main.rs"
+
 [dependencies]
 psx-core = { path = "../psx-core" }
 psx-debug = { path = "../psx-debug" }

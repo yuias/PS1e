@@ -1,7 +1,7 @@
 //! Native frontend: egui debug shell (registers, TTY console, run control).
 //!
 //! `--headless` runs the core without a window for CI and BIOS bring-up:
-//!   psx-app --headless --cycles 30000000 [--bios assets/SCPH-1000.bin]
+//!   ps1e --headless --cycles 30000000 [--bios assets/SCPH-1000.bin]
 //!
 //! Headless game progression: `--mash-start` taps START/CROSS periodically;
 //! `--input <file>` replays a script of timed button holds (see

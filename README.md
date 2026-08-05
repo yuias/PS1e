@@ -15,13 +15,13 @@ Requires a recent stable Rust toolchain.
 cargo build --release
 ```
 
-Produces `psx-app` (emulator) and `psxctl` (automation client) in
+Produces `ps1e` (emulator) and `psxctl` (automation client) in
 `target/release/`.
 
 ## Run
 
 ```
-psx-app [--bios <path>] [--disc <image.bin|image.cue>]
+ps1e [--bios <path>] [--disc <image.bin|image.cue>]
 ```
 
 Without `--disc`, the BIOS shell runs. The GUI shows the display, CPU
@@ -54,7 +54,7 @@ memcard = "memcard0.mcr"    # created and formatted automatically
 ## Headless mode
 
 ```
-psx-app --headless [--cycles N] [--disc <image>] ...
+ps1e --headless [--cycles N] [--disc <image>] ...
 ```
 
 Runs without a window and prints a run summary (TTY output, pc, audio and
@@ -72,7 +72,7 @@ CD statistics). Useful flags:
 ## Debugger (LLDB / GDB)
 
 ```
-psx-app --headless --debug-port 9001 --wait-debugger
+ps1e --headless --debug-port 9001 --wait-debugger
 ```
 
 The stub speaks the gdb-remote serial protocol with LLDB as the primary
@@ -94,7 +94,7 @@ target.
 ## Automation (LLM / scripting)
 
 ```
-psx-app --headless --control-port 9002 [--disc <image>]
+ps1e --headless --control-port 9002 [--disc <image>]
 ```
 
 The emulator runs in lockstep: it advances only when commanded, so every
