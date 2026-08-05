@@ -7,6 +7,11 @@
 //! `--input <file>` replays a script of timed button holds (see
 //! [`parse_input_script`]). Inspect results with `--dump-frame`/`--dump-vram`
 //! and `--log-gpu` (decoded GP0/GP1 command log).
+//!
+//! `--debug-port <port>` opens an LLDB/GDB gdb-remote stub (both GUI and
+//! headless); `--wait-debugger` additionally holds execution at the reset
+//! vector until a debugger attaches:
+//!   (lldb) gdb-remote localhost:9001
 
 mod audio;
 mod config;
@@ -29,6 +34,10 @@ struct Args {
     input: Option<String>,
     /// Decode every GP0/GP1 command to the log.
     log_gpu: bool,
+    /// gdb-remote stub port (LLDB-first; see psx-debug).
+    debug_port: Option<u16>,
+    /// Hold execution at the reset vector until a debugger attaches.
+    wait_debugger: bool,
 }
 
 fn parse_args() -> Args {
@@ -44,6 +53,8 @@ fn parse_args() -> Args {
         mash_start: false,
         input: None,
         log_gpu: false,
+        debug_port: None,
+        wait_debugger: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -51,6 +62,14 @@ fn parse_args() -> Args {
             "--headless" => args.headless = true,
             "--mash-start" => args.mash_start = true,
             "--log-gpu" => args.log_gpu = true,
+            "--wait-debugger" => args.wait_debugger = true,
+            "--debug-port" => {
+                args.debug_port = Some(
+                    it.next()
+                        .and_then(|v| v.parse().ok())
+                        .expect("--debug-port needs a port number"),
+                )
+            }
             "--input" => args.input = Some(it.next().expect("--input needs a path")),
             "--bios" => args.bios = Some(it.next().expect("--bios needs a path")),
             "--disc" => args.disc = Some(it.next().expect("--disc needs a path")),
@@ -142,13 +161,17 @@ fn main() -> eframe::Result {
         }
     }
 
+    let debugger = args
+        .debug_port
+        .map(|port| psx_debug::DebugServer::bind(port).expect("failed to bind debug port"));
+
     if args.headless {
         let script = args
             .input
             .as_deref()
             .map(parse_input_script)
             .unwrap_or_default();
-        run_headless(sys, &args, &script);
+        run_headless(sys, &args, &script, debugger);
         return Ok(());
     }
 
@@ -169,6 +192,8 @@ fn main() -> eframe::Result {
                 cfg,
                 cfg_path,
                 memcard_path,
+                debugger,
+                args.wait_debugger,
             )))
         }),
     )
@@ -274,15 +299,38 @@ fn button_by_name(name: &str) -> Option<u16> {
     })
 }
 
-fn run_headless(mut sys: PsxSystem, args: &Args, script: &[InputSpan]) {
+fn run_headless(
+    mut sys: PsxSystem,
+    args: &Args,
+    script: &[InputSpan],
+    mut debugger: Option<psx_debug::DebugServer>,
+) {
     let cycles = args.cycles;
     let (dump_vram, dump_wav) = (args.dump_vram.as_deref(), args.dump_wav.as_deref());
     tracing::info!("running headless for {cycles} cycles");
     // Chunked run so we can inject input and collect audio along the way
     const CHUNK: u64 = psx_core::CPU_CLOCK_HZ / 10;
     let mut wav_samples: Vec<i16> = Vec::new();
+    let mut debugger_seen = false;
     let mut done = 0u64;
     while done < cycles {
+        // While a debugger is attached (or awaited), it owns execution; only
+        // the cycles it actually ran count against the --cycles budget.
+        if let Some(dbg) = &mut debugger {
+            let before = sys.cycles();
+            dbg.pump(&mut sys, CHUNK.min(cycles - done));
+            debugger_seen |= dbg.attached();
+            done += sys.cycles() - before;
+            if dbg.attached() || (args.wait_debugger && !debugger_seen) {
+                if dbg.halted() || !dbg.attached() {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                if dump_wav.is_some() {
+                    sys.bus.spu.drain_output(&mut wav_samples);
+                }
+                continue;
+            }
+        }
         if !script.is_empty() {
             let buttons = script
                 .iter()

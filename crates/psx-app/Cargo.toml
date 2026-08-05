@@ -7,6 +7,7 @@ description = "Native PS1e frontend: egui debug shell on wgpu"
 
 [dependencies]
 psx-core = { path = "../psx-core" }
+psx-debug = { path = "../psx-debug" }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # default features off: drops the glow (OpenGL) renderer and accesskit,

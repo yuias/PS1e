@@ -48,15 +48,23 @@ pub struct App {
     config: Config,
     config_path: Option<PathBuf>,
     memcard_path: PathBuf,
+    /// gdb-remote stub; while a client is attached it owns execution.
+    debugger: Option<psx_debug::DebugServer>,
+    /// Hold at the reset vector until the first debugger attach.
+    wait_debugger: bool,
+    debugger_seen: bool,
 }
 
 impl App {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         sys: PsxSystem,
         bios: Vec<u8>,
         config: Config,
         config_path: Option<PathBuf>,
         memcard_path: PathBuf,
+        debugger: Option<psx_debug::DebugServer>,
+        wait_debugger: bool,
     ) -> Self {
         Self {
             sys,
@@ -72,6 +80,9 @@ impl App {
             config,
             config_path,
             memcard_path,
+            debugger,
+            wait_debugger,
+            debugger_seen: false,
         }
     }
 
@@ -170,12 +181,34 @@ impl eframe::App for App {
         });
         self.sys.set_buttons(buttons);
 
-        if self.running {
-            // Pace by wall clock, not repaint rate (high-refresh monitors
-            // would otherwise fast-forward the game). Nudge by the audio
-            // buffer level to counteract clock drift.
-            let dt = ctx.input(|i| i.stable_dt).clamp(0.001, 0.05) as f64;
-            let mut cycles = (dt * CPU_CLOCK_HZ as f64) as u64;
+        // Pace by wall clock, not repaint rate (high-refresh monitors
+        // would otherwise fast-forward the game).
+        let dt = ctx.input(|i| i.stable_dt).clamp(0.001, 0.05) as f64;
+        let dt_cycles = (dt * CPU_CLOCK_HZ as f64) as u64;
+
+        // While a debugger is attached (or awaited), it owns execution:
+        // the Run/Pause state is ignored and `pump` decides what runs.
+        let mut debugger_active = false;
+        if let Some(dbg) = &mut self.debugger {
+            dbg.pump(&mut self.sys, dt_cycles);
+            self.debugger_seen |= dbg.attached();
+            debugger_active = dbg.attached() || (self.wait_debugger && !self.debugger_seen);
+        }
+
+        if debugger_active {
+            self.sample_scratch.clear();
+            self.sys.bus.spu.drain_output(&mut self.sample_scratch);
+            for s in &mut self.sample_scratch {
+                *s = (*s as f32 * self.volume) as i16;
+            }
+            if let Some(audio) = &self.audio {
+                audio.push_samples(&self.sample_scratch);
+            }
+            self.save_memcard_if_dirty();
+            ctx.request_repaint();
+        } else if self.running {
+            // Nudge by the audio buffer level to counteract clock drift.
+            let mut cycles = dt_cycles;
             if let Some(audio) = &self.audio {
                 let buffered = audio.buffered_frames();
                 if buffered < 2205 {
@@ -199,17 +232,34 @@ impl eframe::App for App {
 
         egui::TopBottomPanel::top("controls").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                let label = if self.running { "⏸ Pause" } else { "▶ Run" };
-                if ui.button(label).clicked() {
-                    self.running = !self.running;
-                }
-                if ui.button("Step").clicked() {
-                    self.running = false;
-                    self.sys.step();
-                }
-                if ui.button("Reset").clicked() {
-                    self.running = false;
-                    self.sys = PsxSystem::new(self.bios.clone()).expect("reset failed");
+                // The debugger owns run control while attached
+                ui.add_enabled_ui(!debugger_active, |ui| {
+                    let label = if self.running { "⏸ Pause" } else { "▶ Run" };
+                    if ui.button(label).clicked() {
+                        self.running = !self.running;
+                    }
+                    if ui.button("Step").clicked() {
+                        self.running = false;
+                        self.sys.step();
+                    }
+                    if ui.button("Reset").clicked() {
+                        self.running = false;
+                        self.sys = PsxSystem::new(self.bios.clone()).expect("reset failed");
+                    }
+                });
+                if let Some(dbg) = &self.debugger {
+                    ui.separator();
+                    ui.label(if dbg.attached() {
+                        if dbg.halted() {
+                            "🔌 debugger: halted"
+                        } else {
+                            "🔌 debugger: running"
+                        }
+                    } else if debugger_active {
+                        "🔌 waiting for debugger"
+                    } else {
+                        "🔌 debugger: listening"
+                    });
                 }
                 ui.separator();
                 ui.checkbox(&mut self.show_vram, "VRAM viewer");

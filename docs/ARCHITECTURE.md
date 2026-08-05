@@ -12,7 +12,7 @@ fast while modeling the real hardware as independent components.
 | BIOS | Boot retail BIOS images from `assets/` (LLE). An original BIOS binary is developed in a **separate project**; this emulator treats it as just another 512 KiB ROM image and serves as its primary bring-up/verification tool (rich logging). No HLE hooks in the execution path. |
 | Debug UI | egui embedded in the native frontend (registers, VRAM viewer, TTY console, log filtering). |
 | Timing accuracy | Cycle-accuracy oriented: model memory wait states, DMA bus contention, load/branch delay slots, and per-instruction timing as faithfully as practical. Speed optimizations must not change observable timing. |
-| Debugger (future) | Remote debug stub speaking the gdb-remote serial protocol (the wire protocol LLDB uses), with **LLDB as the primary client**: implement the LLDB-specific extensions (`qHostInfo`, `qProcessInfo`, `qRegisterInfo`, `target.xml`) and validate against LLDB on Windows/macOS. Plain GDB works as a byproduct. |
+| Debugger | `psx-debug`: remote debug stub speaking the gdb-remote serial protocol (the wire protocol LLDB uses), with **LLDB as the primary client**: the LLDB-specific extensions (`qHostInfo`, `qProcessInfo`, `qRegisterInfo`, `target.xml`) are implemented. Plain GDB works as a byproduct. Enabled with `--debug-port <port>` (GUI and headless); `--wait-debugger` holds execution at the reset vector until attach. Validation against a real LLDB on Windows/macOS is still pending (covered by protocol-level tests so far). |
 | Web (future) | `psx-core` is platform-independent and compiles to `wasm32`; a thin HTML5/JS frontend drives it. |
 
 ## Workspace layout
@@ -21,12 +21,13 @@ fast while modeling the real hardware as independent components.
 PS1e/
 ├── crates/
 │   ├── psx-core/     # Emulator core. No windowing, no GPU API, no I/O — wasm-safe.
+│   ├── psx-debug/    # LLDB-first gdb-remote debug stub (TCP).
 │   └── psx-app/      # Native frontend: eframe (egui + wgpu), audio, input.
 ├── assets/           # BIOS images (gitignored).
 └── docs/
 ```
 
-Planned crates: `psx-wasm` (wasm bindings), `psx-debug` (LLDB-first gdb-remote stub).
+Planned crates: `psx-wasm` (wasm bindings).
 
 ## Core design (`psx-core`)
 
