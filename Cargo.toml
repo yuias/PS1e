@@ -18,5 +18,12 @@ opt-level = 1
 opt-level = 2
 
 [profile.release]
-lto = "thin"
+lto = true # "thin"
 codegen-units = 1
+strip = true
+panic = "abort"
+
+# Size-optimize dependencies only; workspace members keep opt-level 3
+# so emulator hot loops are unaffected.
+[profile.release.package."*"]
+opt-level = "s"

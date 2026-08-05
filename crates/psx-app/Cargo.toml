@@ -9,7 +9,25 @@ description = "Native PS1e frontend: egui debug shell on wgpu"
 psx-core = { path = "../psx-core" }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-eframe = { version = "0.32", features = ["wgpu"] }
+# default features off: drops the glow (OpenGL) renderer and accesskit,
+# and lets us pick wgpu backends explicitly below.
+eframe = { version = "0.32", default-features = false, features = [
+    "wgpu",
+    "default_fonts",
+    "wayland", # Linux targets only; no cost on Windows
+    "x11",     # Linux targets only; no cost on Windows
+] }
 cpal = "0.16"
 serde = { version = "1", features = ["derive"] }
 toml = "0.9"
+
+# One native wgpu backend per OS keeps naga's shader translators to a single
+# target language. Excludes gles/webgpu everywhere.
+[target.'cfg(windows)'.dependencies]
+wgpu = { version = "25", default-features = false, features = ["dx12", "wgsl"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+wgpu = { version = "25", default-features = false, features = ["vulkan", "wgsl"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { version = "25", default-features = false, features = ["metal", "wgsl"] }
