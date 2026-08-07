@@ -194,6 +194,11 @@ impl Gpu {
     }
 
     /// Latch the display area into [`Frame`].
+    ///
+    /// In 480i the hardware scans out one field per vblank; mirroring that,
+    /// only the rows of the current field are refreshed and the other
+    /// field's rows are kept from the previous capture (weave). This keeps
+    /// games that render per-field from flickering at half brightness.
     fn capture_frame(&mut self) {
         let (w, h) = self.display_resolution();
         let (sx, sy) = self.display_vram_start();
@@ -202,19 +207,28 @@ impl Gpu {
         } else {
             w
         };
+        let total = (stride * h) as usize;
+        let full = self.frame.pixels.len() != total
+            || self.frame.width != w
+            || self.frame.stride != stride
+            || self.frame.is_24bit != self.color_24bit
+            || !(self.interlaced && self.vres == 480);
         self.frame.width = w;
         self.frame.height = h;
         self.frame.stride = stride;
         self.frame.is_24bit = self.color_24bit;
         self.frame.enabled = !self.display_disabled;
-        self.frame.pixels.clear();
-        self.frame.pixels.reserve((stride * h) as usize);
+        self.frame.pixels.resize(total, 0);
+        let field = self.odd_frame as u32;
         for y in 0..h {
+            if !full && y & 1 != field {
+                continue;
+            }
             let row = (((sy + y) & 0x1ff) as usize) * VRAM_WIDTH;
+            let dst = (y * stride) as usize;
             for x in 0..stride {
-                self.frame
-                    .pixels
-                    .push(self.vram[row + (((sx + x) & 0x3ff) as usize)]);
+                self.frame.pixels[dst + x as usize] =
+                    self.vram[row + (((sx + x) & 0x3ff) as usize)];
             }
         }
     }
@@ -782,4 +796,66 @@ fn color_to_5551(c: u32) -> u16 {
     let g = ((c >> 8) & 0xff) >> 3;
     let b = ((c >> 16) & 0xff) >> 3;
     (r | g << 5 | b << 10) as u16
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Paint every VRAM row with a marker value.
+    fn paint(gpu: &mut Gpu, base: u16) {
+        for y in 0..VRAM_HEIGHT {
+            for x in 0..VRAM_WIDTH {
+                gpu.vram[y * VRAM_WIDTH + x] = base + y as u16;
+            }
+        }
+    }
+
+    #[test]
+    fn interlaced_frame_weaves_fields_across_vblanks() {
+        let mut gpu = Gpu::new();
+        gpu.gp1(0x0300_0000); // display on
+        gpu.gp1(0x0800_0025); // 320 wide, 480i
+        assert_eq!(gpu.display_resolution(), (320, 480));
+
+        paint(&mut gpu, 0);
+        gpu.vblank(); // first capture after a mode change is full
+        assert!(
+            gpu.frame
+                .pixels
+                .iter()
+                .enumerate()
+                .all(|(i, &p)| { p == (i / gpu.frame.stride as usize) as u16 })
+        );
+
+        // Repaint; the next vblank must refresh only one field
+        paint(&mut gpu, 1000);
+        gpu.vblank();
+        let stride = gpu.frame.stride as usize;
+        let updated: Vec<bool> = (0..gpu.frame.height as usize)
+            .map(|y| gpu.frame.pixels[y * stride] >= 1000)
+            .collect();
+        assert!(updated.iter().any(|&u| u) && updated.iter().any(|&u| !u));
+        assert!(
+            updated.windows(2).all(|w| w[0] != w[1]),
+            "fields must alternate"
+        );
+
+        // The following vblank fills in the other field
+        gpu.vblank();
+        assert!((0..gpu.frame.height as usize).all(|y| gpu.frame.pixels[y * stride] >= 1000));
+    }
+
+    #[test]
+    fn progressive_frame_is_fully_recaptured_each_vblank() {
+        let mut gpu = Gpu::new();
+        gpu.gp1(0x0300_0000);
+        gpu.gp1(0x0800_0001); // 320x240 progressive
+        paint(&mut gpu, 0);
+        gpu.vblank();
+        paint(&mut gpu, 1000);
+        gpu.vblank();
+        let stride = gpu.frame.stride as usize;
+        assert!((0..gpu.frame.height as usize).all(|y| gpu.frame.pixels[y * stride] >= 1000));
+    }
 }
