@@ -231,9 +231,15 @@ impl Worker {
                 }
                 Command::Reset if !debugger_active => {
                     self.running = false;
+                    // Ambient assets survive a reset: disc, memory card
+                    // (mid-write contents included) and the log switch
                     let log = self.sys.bus.gpu.log_commands;
+                    let disc = self.sys.bus.cdrom.take_disc();
+                    let memcard = std::mem::take(&mut self.sys.bus.sio.memcard);
                     self.sys = PsxSystem::new(self.cfg.bios.clone()).expect("reset failed");
                     self.sys.bus.gpu.log_commands = log;
+                    self.sys.bus.cdrom.set_disc(disc);
+                    self.sys.bus.sio.memcard = memcard;
                 }
                 Command::SetRunning(_) | Command::Step | Command::Reset => {}
                 Command::SaveState => match self.sys.save_state() {
