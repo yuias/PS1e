@@ -20,6 +20,7 @@
 mod audio;
 mod config;
 mod control;
+mod emu;
 mod ui;
 
 use psx_core::PsxSystem;
@@ -204,16 +205,18 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "PS1e",
         options,
-        Box::new(move |_cc| {
-            Ok(Box::new(ui::App::new(
-                sys,
+        Box::new(move |cc| {
+            let worker_cfg = emu::WorkerConfig {
                 bios,
-                cfg,
-                cfg_path,
+                state_path: memcard_path.with_file_name("state0.sst"),
                 memcard_path,
                 debugger,
-                args.wait_debugger,
-            )))
+                wait_debugger: args.wait_debugger,
+                volume: cfg.volume,
+                log_gpu: args.log_gpu,
+            };
+            let emu = emu::spawn(sys, worker_cfg, cc.egui_ctx.clone());
+            Ok(Box::new(ui::App::new(emu, cfg, cfg_path, args.log_gpu)))
         }),
     )
 }

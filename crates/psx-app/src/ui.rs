@@ -1,11 +1,15 @@
-//! egui debug shell: run control, CPU registers, TTY console.
+//! egui debug shell: a thin client over the emulator worker thread.
+//!
+//! All emulation (and audio) lives in [`crate::emu`]; this module only sends
+//! commands, reads published snapshots and draws. Keeping it presentation-only
+//! is deliberate — a wasm frontend can reuse the same snapshot types.
 
-use crate::audio::Audio;
 use crate::config::Config;
+use crate::emu::{Command, DebuggerState, Emu, FrameSnapshot};
 use eframe::egui;
 use psx_core::sio::button;
-use psx_core::{CPU_CLOCK_HZ, PsxSystem};
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 
 /// Keyboard -> digital pad mapping.
 const KEYMAP: [(egui::Key, u16); 14] = [
@@ -33,97 +37,42 @@ const REG_NAMES: [&str; 32] = [
 ];
 
 pub struct App {
-    sys: PsxSystem,
-    /// Kept for Reset.
-    bios: Vec<u8>,
-    running: bool,
+    emu: Emu,
     show_vram: bool,
     vram_as_24bit: bool,
     display_tex: Option<egui::TextureHandle>,
     vram_tex: Option<egui::TextureHandle>,
-    audio: Option<Audio>,
-    sample_scratch: Vec<i16>,
+    /// Vblank count of the frame currently uploaded to `display_tex`.
+    shown_frame: u64,
+    gpu_log: bool,
     /// Master volume applied on top of the SPU output (0..=1).
     volume: f32,
     config: Config,
     config_path: Option<PathBuf>,
-    memcard_path: PathBuf,
-    /// Save-state slot file (sibling of the memory card image).
-    state_path: PathBuf,
-    /// gdb-remote stub; while a client is attached it owns execution.
-    debugger: Option<psx_debug::DebugServer>,
-    /// Hold at the reset vector until the first debugger attach.
-    wait_debugger: bool,
-    debugger_seen: bool,
 }
 
 impl App {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        sys: PsxSystem,
-        bios: Vec<u8>,
-        config: Config,
-        config_path: Option<PathBuf>,
-        memcard_path: PathBuf,
-        debugger: Option<psx_debug::DebugServer>,
-        wait_debugger: bool,
-    ) -> Self {
+    pub fn new(emu: Emu, config: Config, config_path: Option<PathBuf>, log_gpu: bool) -> Self {
+        let volume = config.volume.clamp(0.0, 1.0);
         Self {
-            sys,
-            bios,
-            running: false,
+            emu,
             show_vram: false,
             vram_as_24bit: false,
             display_tex: None,
             vram_tex: None,
-            audio: Audio::new(),
-            sample_scratch: Vec::new(),
-            volume: config.volume.clamp(0.0, 1.0),
+            shown_frame: 0,
+            gpu_log: log_gpu,
+            volume,
             config,
             config_path,
-            state_path: memcard_path.with_file_name("state0.sst"),
-            memcard_path,
-            debugger,
-            wait_debugger,
-            debugger_seen: false,
-        }
-    }
-
-    fn save_state(&self) {
-        match self.sys.save_state() {
-            Ok(data) => match std::fs::write(&self.state_path, &data) {
-                Ok(()) => tracing::info!("state saved to {}", self.state_path.display()),
-                Err(e) => tracing::error!("state save failed: {e}"),
-            },
-            Err(e) => tracing::error!("state save failed: {e}"),
-        }
-    }
-
-    fn load_state(&mut self) {
-        match std::fs::read(&self.state_path) {
-            Ok(data) => match self.sys.load_state(&data) {
-                Ok(()) => tracing::info!("state loaded from {}", self.state_path.display()),
-                Err(e) => tracing::error!("state load failed: {e}"),
-            },
-            Err(e) => tracing::error!("state load failed: {e} ({})", self.state_path.display()),
-        }
-    }
-
-    fn save_memcard_if_dirty(&mut self) {
-        if self.sys.bus.sio.memcard.take_dirty() {
-            if let Err(e) = std::fs::write(&self.memcard_path, &self.sys.bus.sio.memcard.data) {
-                tracing::error!("failed to save memory card: {e}");
-            } else {
-                tracing::info!("memory card saved");
-            }
         }
     }
 }
 
 impl Drop for App {
-    /// Persist settings changed from the UI and any unsaved card writes.
+    /// Persist settings changed from the UI. (The worker flushes the memory
+    /// card itself when it stops.)
     fn drop(&mut self) {
-        self.save_memcard_if_dirty();
         if let Some(path) = &self.config_path
             && (self.config.volume - self.volume).abs() > f32::EPSILON
         {
@@ -133,64 +82,66 @@ impl Drop for App {
     }
 }
 
-impl App {
-    /// The last vblank frame as an egui image (15-bit or packed RGB888).
-    /// Rendering the vblank snapshot instead of live VRAM avoids catching
-    /// half-drawn frames (visible as irregular flicker).
-    fn display_image(&self) -> egui::ColorImage {
-        let frame = &self.sys.bus.gpu.frame;
-        let (w, h, stride) = (
-            frame.width as usize,
-            frame.height as usize,
-            frame.stride as usize,
-        );
-        let mut pixels = Vec::with_capacity(w * h);
-        if frame.pixels.len() < stride * h {
-            return egui::ColorImage::default(); // no frame captured yet
-        }
-        for y in 0..h {
-            let row = &frame.pixels[y * stride..(y + 1) * stride];
-            for x in 0..w {
-                pixels.push(if frame.is_24bit {
-                    let byte = x * 3;
-                    let read = |b: usize| (row[(byte + b) / 2] >> (((byte + b) & 1) * 8)) as u8;
-                    egui::Color32::from_rgb(read(0), read(1), read(2))
-                } else {
-                    let px = row[x];
-                    let e = |c: u16| ((c << 3) | (c >> 2)) as u8;
-                    egui::Color32::from_rgb(e(px & 0x1f), e((px >> 5) & 0x1f), e((px >> 10) & 0x1f))
-                });
-            }
-        }
-        egui::ColorImage {
-            size: [w, h],
-            source_size: egui::Vec2::new(w as f32, h as f32),
-            pixels,
+/// Convert a frame snapshot (15-bit or packed RGB888 rows) to an egui image.
+fn frame_image(frame: &FrameSnapshot) -> egui::ColorImage {
+    let (w, h, stride) = (
+        frame.width as usize,
+        frame.height as usize,
+        frame.stride as usize,
+    );
+    if frame.pixels.len() < stride * h {
+        return egui::ColorImage::default(); // no frame captured yet
+    }
+    let mut pixels = Vec::with_capacity(w * h);
+    for y in 0..h {
+        let row = &frame.pixels[y * stride..(y + 1) * stride];
+        for x in 0..w {
+            pixels.push(if frame.is_24bit {
+                let byte = x * 3;
+                let read = |b: usize| (row[(byte + b) / 2] >> (((byte + b) & 1) * 8)) as u8;
+                egui::Color32::from_rgb(read(0), read(1), read(2))
+            } else {
+                let px = row[x];
+                let e = |c: u16| ((c << 3) | (c >> 2)) as u8;
+                egui::Color32::from_rgb(e(px & 0x1f), e((px >> 5) & 0x1f), e((px >> 10) & 0x1f))
+            });
         }
     }
+    egui::ColorImage {
+        size: [w, h],
+        source_size: egui::Vec2::new(w as f32, h as f32),
+        pixels,
+    }
+}
 
-    /// Convert a VRAM rectangle (15-bit pixels) into an egui image.
-    fn vram_image(&self, x0: u32, y0: u32, w: u32, h: u32) -> egui::ColorImage {
-        let vram = &self.sys.bus.gpu.vram;
-        let mut pixels = Vec::with_capacity((w * h) as usize);
-        for y in 0..h {
-            let row = (((y0 + y) & 0x1ff) as usize) * 1024;
-            for x in 0..w {
-                let px = vram[row + (((x0 + x) & 0x3ff) as usize)];
+/// Convert a VRAM snapshot to an egui image, either as 15-bit pixels or
+/// reinterpreted as packed 24-bit RGB (682 px/row).
+fn vram_image(vram: &[u16], as_24bit: bool) -> egui::ColorImage {
+    let (w, h) = if as_24bit {
+        (682usize, 512usize)
+    } else {
+        (1024, 512)
+    };
+    let mut pixels = Vec::with_capacity(w * h);
+    for y in 0..h {
+        let row = y * 1024;
+        for x in 0..w {
+            pixels.push(if as_24bit {
+                let byte = x * 3;
+                let read = |b: usize| (vram[row + (byte + b) / 2] >> (((byte + b) & 1) * 8)) as u8;
+                egui::Color32::from_rgb(read(0), read(1), read(2))
+            } else {
+                let px = vram[row + x];
                 // Expand 5-bit channels, replicating the top bits
                 let e = |c: u16| ((c << 3) | (c >> 2)) as u8;
-                pixels.push(egui::Color32::from_rgb(
-                    e(px & 0x1f),
-                    e((px >> 5) & 0x1f),
-                    e((px >> 10) & 0x1f),
-                ));
-            }
+                egui::Color32::from_rgb(e(px & 0x1f), e((px >> 5) & 0x1f), e((px >> 10) & 0x1f))
+            });
         }
-        egui::ColorImage {
-            size: [w as usize, h as usize],
-            source_size: egui::Vec2::new(w as f32, h as f32),
-            pixels,
-        }
+    }
+    egui::ColorImage {
+        size: [w, h],
+        source_size: egui::Vec2::new(w as f32, h as f32),
+        pixels,
     }
 }
 
@@ -202,112 +153,71 @@ impl eframe::App for App {
                 .filter(|(k, _)| i.key_down(*k))
                 .fold(0u16, |acc, (_, b)| acc | b)
         });
-        self.sys.set_buttons(buttons);
+        self.emu.shared.buttons.store(buttons, Ordering::Relaxed);
+        self.emu
+            .shared
+            .volume
+            .store(self.volume.to_bits(), Ordering::Relaxed);
 
-        // Save-state hotkeys, gated like the run controls while a debugger
-        // owns execution (checked again below once the flag is computed).
+        let status = self.emu.shared.status.lock().unwrap().clone();
+        let debugger_active = matches!(
+            status.debugger,
+            DebuggerState::Running | DebuggerState::Halted
+        ) || status.debugger == DebuggerState::Waiting;
+
+        // Save-state hotkeys; gating (debugger owns loads) is in the worker
         let (f5, f9) = ctx.input(|i| (i.key_pressed(egui::Key::F5), i.key_pressed(egui::Key::F9)));
-
-        // Pace by wall clock, not repaint rate (high-refresh monitors
-        // would otherwise fast-forward the game).
-        let dt = ctx.input(|i| i.stable_dt).clamp(0.001, 0.05) as f64;
-        let dt_cycles = (dt * CPU_CLOCK_HZ as f64) as u64;
-
-        // While a debugger is attached (or awaited), it owns execution:
-        // the Run/Pause state is ignored and `pump` decides what runs.
-        let mut debugger_active = false;
-        if let Some(dbg) = &mut self.debugger {
-            dbg.pump(&mut self.sys, dt_cycles);
-            self.debugger_seen |= dbg.attached();
-            debugger_active = dbg.attached() || (self.wait_debugger && !self.debugger_seen);
-        }
-
         if f5 {
-            self.save_state();
+            self.emu.send(Command::SaveState);
         }
-        // Loading mutates execution state, so it stays with the debugger
-        // while one is attached (same rule as the control port).
-        if f9 && !debugger_active {
-            self.load_state();
-        }
-
-        if debugger_active {
-            self.sample_scratch.clear();
-            self.sys.bus.spu.drain_output(&mut self.sample_scratch);
-            for s in &mut self.sample_scratch {
-                *s = (*s as f32 * self.volume) as i16;
-            }
-            if let Some(audio) = &self.audio {
-                audio.push_samples(&self.sample_scratch);
-            }
-            self.save_memcard_if_dirty();
-            ctx.request_repaint();
-        } else if self.running {
-            // Nudge by the audio buffer level to counteract clock drift.
-            let mut cycles = dt_cycles;
-            if let Some(audio) = &self.audio {
-                let buffered = audio.buffered_frames();
-                if buffered < 2205 {
-                    cycles += cycles / 10; // <50ms buffered: catch up
-                } else if buffered > 8820 {
-                    cycles -= cycles / 10; // >200ms: back off
-                }
-            }
-            self.sys.run_cycles(cycles);
-            self.sample_scratch.clear();
-            self.sys.bus.spu.drain_output(&mut self.sample_scratch);
-            for s in &mut self.sample_scratch {
-                *s = (*s as f32 * self.volume) as i16;
-            }
-            if let Some(audio) = &self.audio {
-                audio.push_samples(&self.sample_scratch);
-            }
-            self.save_memcard_if_dirty();
-            ctx.request_repaint();
+        if f9 {
+            self.emu.send(Command::LoadState);
         }
 
         egui::TopBottomPanel::top("controls").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 // The debugger owns run control while attached
                 ui.add_enabled_ui(!debugger_active, |ui| {
-                    let label = if self.running { "⏸ Pause" } else { "▶ Run" };
+                    let label = if status.running {
+                        "⏸ Pause"
+                    } else {
+                        "▶ Run"
+                    };
                     if ui.button(label).clicked() {
-                        self.running = !self.running;
+                        self.emu.send(Command::SetRunning(!status.running));
                     }
                     if ui.button("Step").clicked() {
-                        self.running = false;
-                        self.sys.step();
+                        self.emu.send(Command::Step);
                     }
                     if ui.button("Reset").clicked() {
-                        self.running = false;
-                        self.sys = PsxSystem::new(self.bios.clone()).expect("reset failed");
+                        self.emu.send(Command::Reset);
                     }
                     ui.separator();
                     if ui.button("💾 Save (F5)").clicked() {
-                        self.save_state();
+                        self.emu.send(Command::SaveState);
                     }
                     if ui.button("📂 Load (F9)").clicked() {
-                        self.load_state();
+                        self.emu.send(Command::LoadState);
                     }
                 });
-                if let Some(dbg) = &self.debugger {
+                if status.debugger != DebuggerState::None {
                     ui.separator();
-                    ui.label(if dbg.attached() {
-                        if dbg.halted() {
-                            "🔌 debugger: halted"
-                        } else {
-                            "🔌 debugger: running"
-                        }
-                    } else if debugger_active {
-                        "🔌 waiting for debugger"
-                    } else {
-                        "🔌 debugger: listening"
+                    ui.label(match status.debugger {
+                        DebuggerState::Halted => "🔌 debugger: halted",
+                        DebuggerState::Running => "🔌 debugger: running",
+                        DebuggerState::Waiting => "🔌 waiting for debugger",
+                        _ => "🔌 debugger: listening",
                     });
                 }
                 ui.separator();
                 ui.checkbox(&mut self.show_vram, "VRAM viewer");
-                ui.checkbox(&mut self.sys.bus.gpu.log_commands, "GPU cmd log")
-                    .on_hover_text("decode every GP0/GP1 command to the log (debug level)");
+                if ui
+                    .checkbox(&mut self.gpu_log, "GPU cmd log")
+                    .on_hover_text("decode every GP0/GP1 command to the log (debug level)")
+                    .changed()
+                {
+                    self.emu.send(Command::SetGpuLog(self.gpu_log));
+                }
                 ui.separator();
                 ui.label("🔊");
                 ui.add(
@@ -317,9 +227,15 @@ impl eframe::App for App {
                 );
                 ui.separator();
                 ui.monospace(format!(
-                    "pc {:#010x}   cycles {}",
-                    self.sys.cpu.pc,
-                    self.sys.cycles()
+                    "pc {:#010x}   cycles {}   🔉{:3}ms{}",
+                    status.pc,
+                    status.cycles,
+                    status.audio_buffered * 1000 / 44_100,
+                    if status.audio_underruns > 0 {
+                        format!("   underruns {}", status.audio_underruns)
+                    } else {
+                        String::new()
+                    }
                 ));
             });
         });
@@ -331,15 +247,15 @@ impl eframe::App for App {
                 egui::Grid::new("regs").striped(true).show(ui, |ui| {
                     for (i, name) in REG_NAMES.iter().enumerate() {
                         ui.monospace(format!("{name:>4}"));
-                        ui.monospace(format!("{:08x}", self.sys.cpu.regs[i]));
+                        ui.monospace(format!("{:08x}", status.regs[i]));
                         if i % 2 == 1 {
                             ui.end_row();
                         }
                     }
                     ui.monospace("  hi");
-                    ui.monospace(format!("{:08x}", self.sys.cpu.hi));
+                    ui.monospace(format!("{:08x}", status.hi));
                     ui.monospace("  lo");
-                    ui.monospace(format!("{:08x}", self.sys.cpu.lo));
+                    ui.monospace(format!("{:08x}", status.lo));
                     ui.end_row();
                 });
             });
@@ -352,8 +268,9 @@ impl eframe::App for App {
                 egui::ScrollArea::vertical()
                     .stick_to_bottom(true)
                     .show(ui, |ui| {
+                        let tty = self.emu.shared.tty.lock().unwrap().clone();
                         ui.add(
-                            egui::TextEdit::multiline(&mut self.sys.tty_output().to_string())
+                            egui::TextEdit::multiline(&mut tty.as_str())
                                 .font(egui::TextStyle::Monospace)
                                 .desired_width(f32::INFINITY)
                                 .interactive(false),
@@ -362,27 +279,41 @@ impl eframe::App for App {
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            let enabled = self.sys.bus.gpu.frame.enabled;
-            let image = self.display_image();
-            // No frame captured yet (before the first vblank): zero-sized
-            // textures are a wgpu validation error, so skip texture work.
-            let has_frame = image.size[0] > 0 && image.size[1] > 0;
+            let (enabled, image) = {
+                let frame = self.emu.shared.frame.lock().unwrap();
+                // Convert only when the worker published a new frame
+                let image = if frame.count != self.shown_frame || self.display_tex.is_none() {
+                    self.shown_frame = frame.count;
+                    Some(frame_image(&frame))
+                } else {
+                    None
+                };
+                (frame.enabled, image)
+            };
+            let has_frame = image
+                .as_ref()
+                .map(|i| i.size[0] > 0 && i.size[1] > 0)
+                .unwrap_or(self.display_tex.is_some());
             if !(enabled && has_frame) {
                 ui.centered_and_justified(|ui| ui.label("display disabled"));
                 return;
             }
-            let tex = match &mut self.display_tex {
-                Some(t) => {
+            let tex = match (&mut self.display_tex, image) {
+                (Some(t), Some(image)) => {
                     t.set(image, egui::TextureOptions::NEAREST);
                     t.clone()
                 }
-                None => {
+                (Some(t), None) => t.clone(),
+                (None, Some(image)) => {
+                    // Zero-sized textures are a wgpu validation error; the
+                    // has_frame check above already excluded them
                     let t = ui
                         .ctx()
                         .load_texture("display", image, egui::TextureOptions::NEAREST);
                     self.display_tex = Some(t.clone());
                     t
                 }
+                (None, None) => unreachable!(),
             };
             // Fit the panel while keeping a 4:3 presentation aspect
             let avail = ui.available_size();
@@ -400,48 +331,33 @@ impl eframe::App for App {
             });
         });
 
+        self.emu
+            .shared
+            .vram_requested
+            .store(self.show_vram, Ordering::Relaxed);
         if self.show_vram {
-            let image = if self.vram_as_24bit {
-                // Whole VRAM reinterpreted as packed RGB888 (682 px/row)
-                let vram = &self.sys.bus.gpu.vram;
-                let (w, h) = (682usize, 512usize);
-                let mut pixels = Vec::with_capacity(w * h);
-                for y in 0..h {
-                    let row = y * 1024;
-                    for x in 0..w {
-                        let byte = x * 3;
-                        let read = |b: usize| {
-                            let half = vram[row + (byte + b) / 2];
-                            (half >> (((byte + b) & 1) * 8)) as u8
-                        };
-                        pixels.push(egui::Color32::from_rgb(read(0), read(1), read(2)));
+            let vram = self.emu.shared.vram.lock().unwrap();
+            if vram.len() == 1024 * 512 {
+                let image = vram_image(&vram, self.vram_as_24bit);
+                drop(vram);
+                let tex = match &mut self.vram_tex {
+                    Some(t) => {
+                        t.set(image, egui::TextureOptions::NEAREST);
+                        t.clone()
                     }
-                }
-                egui::ColorImage {
-                    size: [w, h],
-                    source_size: egui::Vec2::new(w as f32, h as f32),
-                    pixels,
-                }
-            } else {
-                self.vram_image(0, 0, 1024, 512)
-            };
-            let tex = match &mut self.vram_tex {
-                Some(t) => {
-                    t.set(image, egui::TextureOptions::NEAREST);
-                    t.clone()
-                }
-                None => {
-                    let t = ctx.load_texture("vram", image, egui::TextureOptions::NEAREST);
-                    self.vram_tex = Some(t.clone());
-                    t
-                }
-            };
-            egui::Window::new("VRAM (1024x512)")
-                .default_width(1024.0)
-                .show(ctx, |ui| {
-                    ui.checkbox(&mut self.vram_as_24bit, "interpret as 24-bit RGB");
-                    ui.add(egui::Image::new(&tex));
-                });
+                    None => {
+                        let t = ctx.load_texture("vram", image, egui::TextureOptions::NEAREST);
+                        self.vram_tex = Some(t.clone());
+                        t
+                    }
+                };
+                egui::Window::new("VRAM (1024x512)")
+                    .default_width(1024.0)
+                    .show(ctx, |ui| {
+                        ui.checkbox(&mut self.vram_as_24bit, "interpret as 24-bit RGB");
+                        ui.add(egui::Image::new(&tex));
+                    });
+            }
         }
     }
 }

@@ -2,6 +2,7 @@
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub type SampleQueue = Arc<Mutex<VecDeque<i16>>>;
@@ -10,6 +11,7 @@ pub struct Audio {
     // Held so the stream keeps playing; dropped with the app.
     _stream: cpal::Stream,
     pub queue: SampleQueue,
+    underruns: Arc<AtomicU64>,
 }
 
 impl Audio {
@@ -23,6 +25,8 @@ impl Audio {
         let channels = config.channels() as usize;
         let queue: SampleQueue = Arc::new(Mutex::new(VecDeque::new()));
         let q = queue.clone();
+        let underruns = Arc::new(AtomicU64::new(0));
+        let ur = underruns.clone();
 
         // The SPU produces 44100 Hz stereo; resample by simple duplication
         // ratio if the device rate differs (good enough until a proper
@@ -36,12 +40,19 @@ impl Audio {
                 &config.into(),
                 move |data: &mut [f32], _| {
                     let mut q = q.lock().unwrap();
+                    let mut starved = false;
                     for frame in data.chunks_mut(channels) {
                         pos += step;
                         while pos >= 1.0 {
                             pos -= 1.0;
                             if q.len() >= 2 {
                                 last = (q.pop_front().unwrap(), q.pop_front().unwrap());
+                            } else {
+                                // Underrun: decay toward silence instead of
+                                // holding the level, so the eventual
+                                // resumption step is small (softer click)
+                                starved = true;
+                                last = (last.0 - last.0 / 16, last.1 - last.1 / 16);
                             }
                         }
                         let l = last.0 as f32 / 32768.0;
@@ -49,6 +60,9 @@ impl Audio {
                         for (i, s) in frame.iter_mut().enumerate() {
                             *s = if i % 2 == 0 { l } else { r };
                         }
+                    }
+                    if starved {
+                        ur.fetch_add(1, Ordering::Relaxed);
                     }
                 },
                 |e| tracing::warn!("audio stream error: {e}"),
@@ -60,12 +74,18 @@ impl Audio {
         Some(Self {
             _stream: stream,
             queue,
+            underruns,
         })
     }
 
     /// Queued stereo frames waiting to be played.
     pub fn buffered_frames(&self) -> usize {
         self.queue.lock().unwrap().len() / 2
+    }
+
+    /// Device callbacks that ran out of samples so far.
+    pub fn underruns(&self) -> u64 {
+        self.underruns.load(Ordering::Relaxed)
     }
 
     pub fn push_samples(&self, samples: &[i16]) {
