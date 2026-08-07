@@ -28,20 +28,57 @@ const COMPLETE_DELAY: u64 = 120_000;
 const ADPCM_POS: [i32; 5] = [0, 60, 115, 98, 122];
 const ADPCM_NEG: [i32; 5] = [0, 0, -52, -55, -60];
 
+/// One TOC entry.
+#[derive(Clone, Copy, Debug)]
+pub struct Track {
+    pub number: u8,
+    pub audio: bool,
+    /// Absolute LBA of the track's INDEX 01.
+    pub start: u32,
+}
+
 pub struct Disc {
     /// Raw image, 2352-byte sectors, starting at LBA 0 (= MSF 00:02:00).
     data: Vec<u8>,
+    /// TOC, ascending by start LBA. Never empty.
+    tracks: Vec<Track>,
 }
 
 impl Disc {
+    /// Single data track covering the whole image (plain .bin).
     pub fn new(data: Vec<u8>) -> Result<Self, String> {
+        let track = Track {
+            number: 1,
+            audio: false,
+            start: 0,
+        };
+        Self::with_tracks(data, vec![track])
+    }
+
+    /// Image with an explicit TOC (from a cue sheet).
+    pub fn with_tracks(data: Vec<u8>, tracks: Vec<Track>) -> Result<Self, String> {
         if data.is_empty() || !data.len().is_multiple_of(RAW_SECTOR) {
             return Err(format!(
                 "disc image size {} is not a multiple of {RAW_SECTOR} bytes",
                 data.len()
             ));
         }
-        Ok(Self { data })
+        let count = (data.len() / RAW_SECTOR) as u32;
+        if tracks.is_empty() {
+            return Err("disc has no tracks".into());
+        }
+        if !tracks.windows(2).all(|w| w[0].start <= w[1].start) {
+            return Err("track starts are not ascending".into());
+        }
+        if tracks.iter().any(|t| t.start >= count) {
+            return Err("track start beyond end of image".into());
+        }
+        Ok(Self { data, tracks })
+    }
+
+    /// The TOC, ascending by start LBA.
+    pub fn tracks(&self) -> &[Track] {
+        &self.tracks
     }
 
     fn sector(&self, lba: u32) -> Option<&[u8]> {
@@ -52,12 +89,34 @@ impl Disc {
     fn sector_count(&self) -> u32 {
         (self.data.len() / RAW_SECTOR) as u32
     }
+
+    /// The track containing `lba` (the last one starting at or before it).
+    fn track_at(&self, lba: u32) -> Track {
+        *self
+            .tracks
+            .iter()
+            .rev()
+            .find(|t| t.start <= lba)
+            .unwrap_or(&self.tracks[0])
+    }
+
+    fn track_start(&self, number: u8) -> Option<u32> {
+        self.tracks
+            .iter()
+            .find(|t| t.number == number)
+            .map(|t| t.start)
+    }
+
+    fn last_track(&self) -> u8 {
+        self.tracks.last().map_or(1, |t| t.number)
+    }
 }
 
 /// Drive status byte bits.
 mod stat {
     pub const MOTOR_ON: u8 = 1 << 1;
     pub const READING: u8 = 1 << 5;
+    pub const PLAYING: u8 = 1 << 7;
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -83,6 +142,12 @@ pub struct Cdrom {
     xa_latch: Option<(u8, u8)>,
     motor_on: bool,
     reading: bool,
+    /// CD-DA playback (Play command) is active.
+    playing: bool,
+    /// Track being played, for auto-pause at track boundaries.
+    play_track: u8,
+    /// Sectors until the next Report interrupt (mode bit 2).
+    report_in: u32,
     /// CD audio mute (Mute/Demute commands). Muted XA decodes are
     /// discarded — games mute right before Pause to cut the tail.
     muted: bool,
@@ -137,6 +202,9 @@ impl Cdrom {
             xa_latch: None,
             motor_on: true,
             reading: false,
+            playing: false,
+            play_track: 0,
+            report_in: 0,
             muted: false,
             seek_target: 0,
             read_lba: 0,
@@ -169,7 +237,8 @@ impl Cdrom {
     }
 
     pub fn insert_disc(&mut self, disc: Disc) {
-        debug!(target: "psx_core::cdrom", "disc inserted: {} sectors", disc.sector_count());
+        debug!(target: "psx_core::cdrom", "disc inserted: {} sectors, {} tracks",
+               disc.sector_count(), disc.tracks().len());
         self.disc = Some(disc);
     }
 
@@ -180,6 +249,9 @@ impl Cdrom {
         }
         if self.reading {
             s |= stat::READING;
+        }
+        if self.playing {
+            s |= stat::PLAYING;
         }
         s
     }
@@ -228,7 +300,80 @@ impl Cdrom {
         // Sector streaming
         if self.reading && now >= self.next_sector_at {
             self.process_sector(now, irq);
+        } else if self.playing && now >= self.next_sector_at {
+            self.process_cdda_sector(now, irq);
         }
+    }
+
+    /// Handle one CD-DA sector: 2352 bytes of raw 44.1kHz stereo PCM,
+    /// streamed into the SPU's CD input like decoded XA. Auto-pause (mode
+    /// bit 1) stops with INT4 at track boundaries; Report (mode bit 2)
+    /// emits INT1 position reports along the way.
+    fn process_cdda_sector(&mut self, now: u64, irq: &mut Irq) {
+        let ended = match self.disc.as_ref().map(|d| d.sector_count()) {
+            None => true,
+            Some(count) => self.read_lba >= count,
+        };
+        let crossed = !ended
+            && self
+                .disc
+                .as_ref()
+                .is_some_and(|d| d.track_at(self.read_lba).number != self.play_track);
+        if ended || (crossed && self.mode & 0x02 != 0) {
+            // End of disc always pauses; a track boundary only with the
+            // auto-pause mode bit set. INT4 needs the previous INT acked.
+            if self.int_flag & 7 != 0 || !self.pending.is_empty() {
+                return;
+            }
+            self.playing = false;
+            let st = self.stat_byte();
+            self.deliver(4, &[st], irq);
+            debug!(target: "psx_core::cdrom",
+                   "CD-DA auto-pause at LBA {} ({})", self.read_lba,
+                   if ended { "end of disc" } else { "track boundary" });
+            return;
+        }
+        if crossed {
+            self.play_track = self.disc.as_ref().unwrap().track_at(self.read_lba).number;
+        }
+
+        if self.mode & 0x04 != 0 && self.report_in == 0 {
+            // Position report; skipped (not stalled) while an INT is pending
+            if self.int_flag & 7 == 0 && self.pending.is_empty() {
+                let track = self
+                    .disc
+                    .as_ref()
+                    .map_or(1, |d| d.track_at(self.read_lba).number);
+                let (amm, ass, aff) = lba_to_bcd_msf(self.read_lba);
+                let st = self.stat_byte();
+                self.deliver(
+                    1,
+                    &[st, to_bcd(track as u32), 0x01, amm, ass, aff, 0, 0],
+                    irq,
+                );
+                self.report_in = 75;
+            }
+        } else if self.report_in > 0 {
+            self.report_in -= 1;
+        }
+
+        if self.muted {
+            self.advance_sector(now);
+            return;
+        }
+        // Back-pressure, as for XA: hold the sector until the SPU-side
+        // backlog drains below ~2 sectors' worth of frames
+        if self.xa_out.len() / 2 > 9_408 {
+            return;
+        }
+        let raw = self.disc.as_ref().and_then(|d| d.sector(self.read_lba));
+        for frame in raw.unwrap().chunks_exact(4) {
+            self.xa_out
+                .push_back(i16::from_le_bytes([frame[0], frame[1]]));
+            self.xa_out
+                .push_back(i16::from_le_bytes([frame[2], frame[3]]));
+        }
+        self.advance_sector(now);
     }
 
     /// Handle the sector currently under the head: route realtime XA audio
@@ -520,12 +665,41 @@ impl Cdrom {
             0x01 => self.push_int(now, ACK_DELAY, 3, vec![st]), // Getstat
             0x02 => {
                 // Setloc(mm, ss, ff) in BCD
-                let bcd = |v: u8| ((v >> 4) * 10 + (v & 0xf)) as u32;
                 if params.len() >= 3 {
-                    let (mm, ss, ff) = (bcd(params[0]), bcd(params[1]), bcd(params[2]));
+                    let (mm, ss, ff) = (
+                        from_bcd(params[0]),
+                        from_bcd(params[1]),
+                        from_bcd(params[2]),
+                    );
                     self.seek_target = (mm * 60 + ss) * 75 + ff - 150;
                 }
                 self.push_int(now, ACK_DELAY, 3, vec![st]);
+            }
+            0x03 => {
+                // Play(track?): CD-DA from the given track's start, or from
+                // the Setloc target (games always Setloc before a bare Play)
+                let track = params.first().copied().map(from_bcd).unwrap_or(0) as u8;
+                let target = if track > 0 {
+                    self.disc
+                        .as_ref()
+                        .and_then(|d| d.track_start(track))
+                        .unwrap_or(self.seek_target)
+                } else {
+                    self.seek_target
+                };
+                let seek = self.seek_cycles(target);
+                self.read_lba = target;
+                self.head_lba = target;
+                self.reading = false;
+                self.playing = true;
+                self.motor_on = true;
+                self.play_track = self.disc.as_ref().map_or(1, |d| d.track_at(target).number);
+                self.report_in = 0;
+                self.xa_out.clear();
+                self.next_sector_at = now + ACK_DELAY + seek + self.sector_period();
+                debug!(target: "psx_core::cdrom",
+                       "Play track {} from LBA {target}", self.play_track);
+                self.push_int(now, ACK_DELAY, 3, vec![self.stat_byte()]);
             }
             0x07 => {
                 // MotorOn
@@ -540,6 +714,7 @@ impl Cdrom {
                 let seek = self.seek_cycles(self.seek_target);
                 self.read_lba = self.seek_target;
                 self.reading = true;
+                self.playing = false;
                 self.motor_on = true;
                 self.xa_out.clear();
                 self.xa_hist = [(0, 0); 2];
@@ -553,6 +728,7 @@ impl Cdrom {
             0x08 => {
                 // Stop
                 self.reading = false;
+                self.playing = false;
                 self.push_int(now, ACK_DELAY, 3, vec![self.stat_byte()]);
                 self.motor_on = false;
                 self.push_int(now, CPU_HZ / 2, 2, vec![self.stat_byte()]);
@@ -561,6 +737,7 @@ impl Cdrom {
                 // Pause: ~70ms at single speed, half at double
                 self.push_int(now, ACK_DELAY, 3, vec![self.stat_byte()]);
                 self.reading = false;
+                self.playing = false;
                 let pause = if self.mode & 0x80 != 0 {
                     CPU_HZ / 1000 * 35
                 } else {
@@ -572,6 +749,7 @@ impl Cdrom {
                 // Init: reset mode, stop reading
                 self.mode = 0;
                 self.reading = false;
+                self.playing = false;
                 self.motor_on = true;
                 let st = self.stat_byte();
                 self.push_int(now, ACK_DELAY, 3, vec![st]);
@@ -611,19 +789,38 @@ impl Cdrom {
                 self.push_int(now, ACK_DELAY, 3, self.last_header.to_vec());
             }
             0x11 => {
-                // GetlocP: track position (single data track assumed)
-                let (mm, ss, ff) = lba_to_bcd_msf(self.read_lba);
-                self.push_int(now, ACK_DELAY, 3, vec![1, 1, mm, ss, ff, mm, ss, ff]);
+                // GetlocP: track, index, track-relative and absolute MSF
+                let (track, rel) = match self.disc.as_ref() {
+                    Some(d) => {
+                        let t = d.track_at(self.read_lba);
+                        (t.number, self.read_lba.saturating_sub(t.start))
+                    }
+                    None => (1, self.read_lba),
+                };
+                let (mm, ss, ff) = frames_to_bcd_msf(rel);
+                let (amm, ass, aff) = lba_to_bcd_msf(self.read_lba);
+                self.push_int(
+                    now,
+                    ACK_DELAY,
+                    3,
+                    vec![to_bcd(track as u32), 0x01, mm, ss, ff, amm, ass, aff],
+                );
             }
             0x13 => {
-                // GetTN: single data track
-                self.push_int(now, ACK_DELAY, 3, vec![st, 0x01, 0x01]);
+                // GetTN: first and last track number
+                let last = self.disc.as_ref().map_or(1, Disc::last_track);
+                self.push_int(now, ACK_DELAY, 3, vec![st, 0x01, to_bcd(last as u32)]);
             }
             0x14 => {
-                // GetTD: track start (track 1 = 00:02, end-of-disc for 0)
-                let lba = match params.first() {
+                // GetTD: track start (0 = end-of-disc)
+                let lba = match params.first().copied().map(from_bcd) {
                     Some(0) => self.disc.as_ref().map_or(0, Disc::sector_count),
-                    _ => 0,
+                    Some(n) => self
+                        .disc
+                        .as_ref()
+                        .and_then(|d| d.track_start(n as u8))
+                        .unwrap_or(0),
+                    None => 0,
                 };
                 let (mm, ss, _) = lba_to_bcd_msf(lba);
                 self.push_int(now, ACK_DELAY, 3, vec![st, mm, ss]);
@@ -682,15 +879,26 @@ impl Default for Cdrom {
     }
 }
 
+fn to_bcd(v: u32) -> u8 {
+    (((v / 10) << 4) | (v % 10)) as u8
+}
+
+fn from_bcd(v: u8) -> u32 {
+    ((v >> 4) * 10 + (v & 0xf)) as u32
+}
+
+/// Frame count -> BCD (mm, ss, ff), with no lead-in offset (track-relative).
+fn frames_to_bcd_msf(frames: u32) -> (u8, u8, u8) {
+    (
+        to_bcd(frames / (60 * 75)),
+        to_bcd(frames / 75 % 60),
+        to_bcd(frames % 75),
+    )
+}
+
 /// LBA -> BCD (mm, ss, ff), including the 2-second lead-in offset.
 fn lba_to_bcd_msf(lba: u32) -> (u8, u8, u8) {
-    let abs = lba + 150;
-    let to_bcd = |v: u32| (((v / 10) << 4) | (v % 10)) as u8;
-    (
-        to_bcd(abs / (60 * 75)),
-        to_bcd(abs / 75 % 60),
-        to_bcd(abs % 75),
-    )
+    frames_to_bcd_msf(lba + 150)
 }
 
 #[cfg(test)]
@@ -871,6 +1079,112 @@ mod tests {
         assert_eq!(cd.xa_sectors, 20);
         // All frames delivered at the consumption rate
         assert_eq!(consumed, cd.xa_frames);
+    }
+
+    /// 3-track disc: 75 data sectors, then two 75-sector audio tracks.
+    /// Audio sector bytes are filled with the sector's LBA (low byte).
+    fn multitrack_disc() -> Disc {
+        let mut img = vec![0u8; RAW_SECTOR * 225];
+        for lba in 75..225 {
+            img[lba * RAW_SECTOR..(lba + 1) * RAW_SECTOR].fill(lba as u8);
+        }
+        let track = |number, audio, start| Track {
+            number,
+            audio,
+            start,
+        };
+        Disc::with_tracks(
+            img,
+            vec![track(1, false, 0), track(2, true, 75), track(3, true, 150)],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn play_streams_cdda_pcm_from_the_requested_track() {
+        let mut cd = Cdrom::new();
+        let mut irq = Irq::default();
+        cd.int_enable = 0x1f;
+        cd.insert_disc(multitrack_disc());
+        cd.write8(2, 0x02, 0); // Play(track 2, BCD)
+        cd.write8(1, 0x03, 0);
+        cd.write8(0, 1, 0);
+        let (int, _) = acked(&mut cd, &mut irq, ACK_DELAY + 1);
+        assert_eq!(int, 3);
+        assert!(cd.stat_byte() & stat::PLAYING != 0);
+
+        let mut now = ACK_DELAY + 2;
+        let mut first = None;
+        for _ in 0..10_000_000u64 / 768 {
+            now += 768;
+            cd.tick(now, &mut irq);
+            if first.is_none() && !cd.xa_out.is_empty() {
+                first = cd.xa_out.front().copied();
+                break;
+            }
+        }
+        // Track 2 starts at LBA 75; its PCM bytes are all 75 (0x4b)
+        assert_eq!(first, Some(i16::from_le_bytes([75, 75])));
+    }
+
+    #[test]
+    fn cdda_autopauses_with_int4_at_the_track_boundary() {
+        let mut cd = Cdrom::new();
+        let mut irq = Irq::default();
+        cd.int_enable = 0x1f;
+        cd.insert_disc(multitrack_disc());
+        cd.write8(2, 0x02, 0); // Setmode: auto-pause
+        cd.write8(1, 0x0e, 0);
+        cd.write8(0, 1, 0);
+        acked(&mut cd, &mut irq, ACK_DELAY + 1);
+        cd.write8(0, 0, 0);
+        cd.write8(2, 0x02, 0);
+        cd.write8(1, 0x03, 0); // Play(track 2)
+        cd.write8(0, 1, 0);
+        acked(&mut cd, &mut irq, 2 * ACK_DELAY + 2);
+
+        let mut now = 2 * ACK_DELAY + 3;
+        let mut frames = 0u64;
+        let mut int4 = false;
+        for _ in 0..200_000_000u64 / 768 {
+            now += 768;
+            cd.tick(now, &mut irq);
+            frames += cd.xa_out.len() as u64 / 2;
+            cd.xa_out.clear();
+            if cd.int_flag & 7 == 4 {
+                int4 = true;
+                break;
+            }
+        }
+        assert!(int4, "expected INT4 at the boundary to track 3");
+        assert!(cd.stat_byte() & stat::PLAYING == 0);
+        // Exactly track 2's 75 sectors were played (588 frames each)
+        assert_eq!(frames, 75 * 588);
+    }
+
+    #[test]
+    fn toc_commands_reflect_the_cue_tracks() {
+        let mut cd = Cdrom::new();
+        let mut irq = Irq::default();
+        cd.int_enable = 0x1f;
+        cd.insert_disc(multitrack_disc());
+        cd.write8(1, 0x13, 0); // GetTN
+        cd.write8(0, 1, 0);
+        let (int, resp) = acked(&mut cd, &mut irq, ACK_DELAY + 1);
+        assert_eq!(int, 3);
+        assert_eq!(&resp[1..], &[0x01, 0x03]);
+        cd.write8(0, 0, 0);
+        cd.write8(2, 0x02, 0); // GetTD(2): LBA 75 -> absolute 00:03
+        cd.write8(1, 0x14, 0);
+        cd.write8(0, 1, 0);
+        let (_, resp) = acked(&mut cd, &mut irq, 2 * ACK_DELAY + 2);
+        assert_eq!(&resp[1..], &[0x00, 0x03]);
+        cd.write8(0, 0, 0);
+        cd.write8(2, 0x00, 0); // GetTD(0): end of disc, 225 -> 00:05
+        cd.write8(1, 0x14, 0);
+        cd.write8(0, 1, 0);
+        let (_, resp) = acked(&mut cd, &mut irq, 3 * ACK_DELAY + 3);
+        assert_eq!(&resp[1..], &[0x00, 0x05]);
     }
 
     #[test]
