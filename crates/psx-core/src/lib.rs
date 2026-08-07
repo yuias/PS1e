@@ -38,7 +38,7 @@ pub struct PsxSystem {
 /// Save-state file magic + format version. Bump the version on any change
 /// to a serialized struct.
 const STATE_MAGIC: &[u8; 4] = b"PS1E";
-const STATE_VERSION: u16 = 1;
+const STATE_VERSION: u16 = 2;
 
 /// Cheap content fingerprint (FNV-1a) to flag cross-BIOS state loads.
 fn bios_fingerprint(bios: &[u8]) -> u32 {

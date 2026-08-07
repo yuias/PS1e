@@ -50,6 +50,10 @@ struct Voice {
     adsr_vol: i32,
     /// Samples until the next envelope step.
     env_wait: u32,
+    /// Current L/R volume level for sweep mode (fixed writes snap it).
+    vol_cur: [i32; 2],
+    /// Samples until the next sweep step, per channel.
+    vol_wait: [u32; 2],
 }
 
 impl Default for Voice {
@@ -64,6 +68,8 @@ impl Default for Voice {
             phase: Phase::Off,
             adsr_vol: 0,
             env_wait: 0,
+            vol_cur: [0; 2],
+            vol_wait: [0; 2],
         }
     }
 }
@@ -94,6 +100,9 @@ pub struct Spu {
     noise_timer: i32,
     /// Per-voice output of the current sample, for pitch modulation.
     last_out: [i32; 24],
+    /// Main-volume sweep state (level and step countdown, L/R).
+    main_cur: [i32; 2],
+    main_wait: [u32; 2],
 }
 
 impl Spu {
@@ -114,6 +123,8 @@ impl Spu {
             noise_lfsr: 1,
             noise_timer: 0,
             last_out: [0; 24],
+            main_cur: [0; 2],
+            main_wait: [0; 2],
         }
     }
 
@@ -176,13 +187,26 @@ impl Spu {
         irq.raise(9);
     }
 
-    /// Volume register: sweep mode (bit 15) is approximated as full volume.
-    fn volume(reg: u16) -> i32 {
-        if reg & 0x8000 != 0 {
-            0x7fff
-        } else {
-            ((reg as i16) << 1) as i32
+    /// Advance one volume channel by one sample and return the applied
+    /// volume. Fixed mode (bit 15 clear) snaps the level; sweep mode runs
+    /// the shared envelope toward 0x7fff (increase) or 0 (decrease), with
+    /// bit 12 inverting the applied phase.
+    fn tick_volume(cur: &mut i32, wait: &mut u32, reg: u16) -> i32 {
+        if reg & 0x8000 == 0 {
+            *cur = ((reg as i16) << 1) as i32;
+            return *cur;
         }
+        let exp = reg & (1 << 14) != 0;
+        let dec = reg & (1 << 13) != 0;
+        let neg = reg & (1 << 12) != 0;
+        if *wait > 0 {
+            *wait -= 1;
+        } else {
+            let (w, step) = envelope_step((reg & 0x7f) as u32, dec, exp, *cur);
+            *wait = w;
+            *cur = (*cur + step).clamp(0, 0x7fff);
+        }
+        if neg { -*cur } else { *cur }
     }
 
     // --- MMIO ----------------------------------------------------------
@@ -313,8 +337,10 @@ impl Spu {
             }
             let sample = self.step_voice(v, irq, noise_on, pmon);
             self.last_out[v] = sample;
-            let vol_l = Self::volume(self.voice_reg(v, 0x0));
-            let vol_r = Self::volume(self.voice_reg(v, 0x2));
+            let (rl, rr) = (self.voice_reg(v, 0x0), self.voice_reg(v, 0x2));
+            let voice = &mut self.voices[v];
+            let vol_l = Self::tick_volume(&mut voice.vol_cur[0], &mut voice.vol_wait[0], rl);
+            let vol_r = Self::tick_volume(&mut voice.vol_cur[1], &mut voice.vol_wait[1], rr);
             let (sl, sr) = ((sample * vol_l) >> 15, (sample * vol_r) >> 15);
             mix_l += sl;
             mix_r += sr;
@@ -345,8 +371,9 @@ impl Spu {
                 self.reverb_step(rev_l.clamp(-0x8000, 0x7fff), rev_r.clamp(-0x8000, 0x7fff));
         }
 
-        let main_l = Self::volume(self.reg(0x180));
-        let main_r = Self::volume(self.reg(0x182));
+        let (ml, mr) = (self.reg(0x180), self.reg(0x182));
+        let main_l = Self::tick_volume(&mut self.main_cur[0], &mut self.main_wait[0], ml);
+        let main_r = Self::tick_volume(&mut self.main_cur[1], &mut self.main_wait[1], mr);
         let (mut l, mut r) = if enabled && !muted {
             (
                 ((mix_l * main_l) >> 15) + self.rev_out.0,
@@ -506,7 +533,7 @@ impl Spu {
             ((g(0x0ff - i) * at(idx - 3)) >> 15)
                 + ((g(0x1ff - i) * at(idx - 2)) >> 15)
                 + ((g(0x100 + i) * at(idx - 1)) >> 15)
-                + ((g(0x000 + i) * at(idx)) >> 15)
+                + ((g(i) * at(idx)) >> 15)
         };
 
         self.tick_envelope(v);
@@ -585,27 +612,8 @@ impl Spu {
             Phase::Off => return,
         };
 
-        // PSX-SPX envelope rate algorithm
-        let shift = (rate >> 2) as i32;
-        let base = if dec {
-            -8 + (rate & 3) as i32
-        } else {
-            7 - (rate & 3) as i32
-        };
-        let mut wait = 1u64 << (shift - 11).max(0);
-        let mut step = base << (11 - shift).max(0);
-        if exp {
-            if !dec && voice.adsr_vol > 0x6000 {
-                wait *= 4;
-            }
-            if dec {
-                step = step * voice.adsr_vol / 0x8000;
-                if step == 0 {
-                    step = -1; // keep decaying even at low levels
-                }
-            }
-        }
-        voice.env_wait = wait.min(u32::MAX as u64) as u32 - 1;
+        let (wait, step) = envelope_step(rate, dec, exp, voice.adsr_vol);
+        voice.env_wait = wait;
         voice.adsr_vol = (voice.adsr_vol + step).clamp(0, 0x7fff);
 
         match voice.phase {
@@ -621,6 +629,31 @@ impl Default for Spu {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// PSX-SPX envelope rate algorithm, shared by ADSR phases and volume
+/// sweeps: returns (samples to wait after this step, signed step).
+fn envelope_step(rate: u32, dec: bool, exp: bool, level: i32) -> (u32, i32) {
+    let shift = (rate >> 2) as i32;
+    let base = if dec {
+        -8 + (rate & 3) as i32
+    } else {
+        7 - (rate & 3) as i32
+    };
+    let mut wait = 1u64 << (shift - 11).max(0);
+    let mut step = base << (11 - shift).max(0);
+    if exp {
+        if !dec && level > 0x6000 {
+            wait *= 4;
+        }
+        if dec {
+            step = step * level / 0x8000;
+            if step == 0 {
+                step = -1; // keep decaying even at low levels
+            }
+        }
+    }
+    (wait.min(u32::MAX as u64) as u32 - 1, step)
 }
 
 /// Hardware gaussian interpolation table (PSX-SPX). Each quadruple
@@ -709,6 +742,27 @@ mod tests {
                 + GAUSS[0x1ff - i] as i32;
             assert!((0x7f7f..=0x7f81).contains(&sum), "i={i} sum={sum:#x}");
         }
+    }
+
+    #[test]
+    fn volume_sweep_ramps_between_extremes() {
+        let (mut cur, mut wait) = (0i32, 0u32);
+        // Linear increase at the fastest rate saturates at 0x7fff
+        for _ in 0..100 {
+            Spu::tick_volume(&mut cur, &mut wait, 0x8000);
+        }
+        assert_eq!(cur, 0x7fff);
+        // Linear decrease (bit 13) drains back to 0
+        for _ in 0..100 {
+            Spu::tick_volume(&mut cur, &mut wait, 0xa000);
+        }
+        assert_eq!(cur, 0);
+        // A fixed write snaps the level immediately
+        assert_eq!(Spu::tick_volume(&mut cur, &mut wait, 0x3fff), 0x7ffe);
+        // Negative phase (bit 12) applies the level inverted
+        cur = 0x4000;
+        wait = 0;
+        assert!(Spu::tick_volume(&mut cur, &mut wait, 0x9000) < 0);
     }
 
     #[test]
