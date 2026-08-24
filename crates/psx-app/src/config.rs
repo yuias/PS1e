@@ -33,16 +33,16 @@ volume = 0.5
 #down = "Down"
 #left = "Left"
 #right = "Right"
-#cross = "X"
-#circle = "C"
+#cross = "Z"
+#circle = "X"
 #square = "S"
 #triangle = "D"
-#l1 = "Q"
-#r1 = "E"
-#l2 = "1"
-#r2 = "3"
-#start = "Enter"
-#select = "Backspace"
+#l1 = "W"
+#r1 = "R"
+#l2 = "E"
+#r2 = "U"
+#start = "V"
+#select = "C"
 
 # Gamepad bindings for the digital pad. Values name gilrs buttons:
 # "South"/"East"/"North"/"West" for the action pad, "DPadUp".."DPadRight",
@@ -101,16 +101,16 @@ impl Default for KeyBindings {
             down: "Down".into(),
             left: "Left".into(),
             right: "Right".into(),
-            cross: "X".into(),
-            circle: "C".into(),
+            cross: "Z".into(),
+            circle: "X".into(),
             square: "S".into(),
             triangle: "D".into(),
-            l1: "Q".into(),
-            r1: "E".into(),
-            l2: "1".into(),
-            r2: "3".into(),
-            start: "Enter".into(),
-            select: "Backspace".into(),
+            l1: "W".into(),
+            r1: "R".into(),
+            l2: "E".into(),
+            r2: "U".into(),
+            start: "V".into(),
+            select: "C".into(),
         }
     }
 }
@@ -338,7 +338,7 @@ mod tests {
     fn defaults_round_trip_through_toml() {
         let text = toml::to_string_pretty(&Config::default()).expect("serialize");
         let back: Config = toml::from_str(&text).expect("deserialize");
-        assert_eq!(back.keys.cross, "X");
+        assert_eq!(back.keys.cross, "Z");
         assert_eq!(back.pad.cross, "South");
         assert_eq!(back.hotkeys.save_state, "F5");
     }
@@ -347,7 +347,7 @@ mod tests {
     fn partial_tables_fall_back_to_defaults() {
         let cfg: Config = toml::from_str("[keys]\ncross = \"Z\"\n").expect("deserialize");
         assert_eq!(cfg.keys.cross, "Z");
-        assert_eq!(cfg.keys.circle, "C");
+        assert_eq!(cfg.keys.circle, "X");
         assert_eq!(cfg.hotkeys.load_state, "F9");
     }
 }

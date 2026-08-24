@@ -33,9 +33,9 @@ swap.
 | Keys | |
 |---|---|
 | Arrows | D-pad |
-| X / C / S / D | Cross / Circle / Square / Triangle |
-| Q / E / 1 / 3 | L1 / R1 / L2 / R2 |
-| Enter / Backspace | Start / Select |
+| Z / X / S / D | Cross / Circle / Square / Triangle |
+| W / R / E / U | L1 / R1 / L2 / R2 |
+| V / C | Start / Select |
 | F5 / F9 | Save / load state |
 
 A gamepad, if one is connected, drives the same pad in parallel with the
@@ -62,8 +62,8 @@ volume = 0.5                # master volume, 0.0..1.0
 memcard = "memcard0.mcr"    # created and formatted automatically
 
 [keys]                      # digital pad; egui key names
-cross = "X"
-start = "Enter"
+cross = "Z"
+start = "V"
 
 [pad]                       # gamepad; gilrs button names
 cross = "South"
