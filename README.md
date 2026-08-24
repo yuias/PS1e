@@ -35,6 +35,9 @@ registers, a VRAM viewer, and a TTY console.
 | Enter / Backspace | Start / Select |
 | F5 / F9 | Save / load state |
 
+All of these are rebindable; see the `[keys]` and `[hotkeys]` tables under
+[Configuration](#configuration).
+
 Save states snapshot the full machine to `state0.sst` next to the memory
 card image. The BIOS, disc image and memory card are not part of a state
 and carry over on load.
@@ -49,7 +52,21 @@ run. CLI flags override the file.
 bios = "path/to/bios.bin"   # required to run
 volume = 0.5                # master volume, 0.0..1.0
 memcard = "memcard0.mcr"    # created and formatted automatically
+
+[keys]                      # digital pad; egui key names
+cross = "X"
+start = "Enter"
+
+[hotkeys]                   # frontend shortcuts
+save_state = "F5"
+load_state = "F9"
 ```
+
+Key names are the ones egui reports: letters and digits as themselves
+(`"X"`, `"1"`), arrows as `"Up"`/`"Down"`/`"Left"`/`"Right"`, plus
+`"Enter"`, `"Backspace"`, `"Space"`, `"F1"`..`"F20"`. Omitted buttons keep
+their defaults, and an unrecognized name falls back to the default with a
+warning in the log.
 
 ## Headless mode
 

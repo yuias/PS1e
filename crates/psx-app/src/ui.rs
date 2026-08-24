@@ -4,30 +4,31 @@
 //! commands, reads published snapshots and draws. Keeping it presentation-only
 //! is deliberate — a wasm frontend can reuse the same snapshot types.
 
+use crate::config;
 use crate::config::Config;
 use crate::emu::{Command, DebuggerState, Emu, FrameSnapshot};
 use eframe::egui;
-use psx_core::sio::button;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
-/// Keyboard -> digital pad mapping.
-const KEYMAP: [(egui::Key, u16); 14] = [
-    (egui::Key::ArrowUp, button::UP),
-    (egui::Key::ArrowDown, button::DOWN),
-    (egui::Key::ArrowLeft, button::LEFT),
-    (egui::Key::ArrowRight, button::RIGHT),
-    (egui::Key::X, button::CROSS),
-    (egui::Key::C, button::CIRCLE),
-    (egui::Key::S, button::SQUARE),
-    (egui::Key::D, button::TRIANGLE),
-    (egui::Key::Q, button::L1),
-    (egui::Key::E, button::R1),
-    (egui::Key::Num1, button::L2),
-    (egui::Key::Num3, button::R2),
-    (egui::Key::Enter, button::START),
-    (egui::Key::Backspace, button::SELECT),
-];
+/// Resolve configured key names to egui keys, paired with the pad bit each
+/// one drives. An unrecognized name falls back to the built-in default.
+fn resolve_keymap(keys: &config::KeyBindings) -> Vec<(egui::Key, u16)> {
+    let fallback = config::KeyBindings::default();
+    keys.pairs()
+        .into_iter()
+        .zip(fallback.pairs())
+        .filter_map(
+            |((name, bit), (default_name, _))| match egui::Key::from_name(name) {
+                Some(key) => Some((key, bit)),
+                None => {
+                    tracing::warn!("unknown key name '{name}'; using '{default_name}'");
+                    egui::Key::from_name(default_name).map(|key| (key, bit))
+                }
+            },
+        )
+        .collect()
+}
 
 const REG_NAMES: [&str; 32] = [
     "zero", "at", "v0", "v1", "a0", "a1", "a2", "a3", //
@@ -49,11 +50,26 @@ pub struct App {
     volume: f32,
     config: Config,
     config_path: Option<PathBuf>,
+    /// Key -> pad bit, resolved from the config once at startup.
+    keymap: Vec<(egui::Key, u16)>,
+    hotkey_save: Option<egui::Key>,
+    hotkey_load: Option<egui::Key>,
 }
 
 impl App {
     pub fn new(emu: Emu, config: Config, config_path: Option<PathBuf>, log_gpu: bool) -> Self {
         let volume = config.volume.clamp(0.0, 1.0);
+        let keymap = resolve_keymap(&config.keys);
+        let hotkey_save = egui::Key::from_name(&config.hotkeys.save_state);
+        let hotkey_load = egui::Key::from_name(&config.hotkeys.load_state);
+        for (name, key) in [
+            (&config.hotkeys.save_state, hotkey_save),
+            (&config.hotkeys.load_state, hotkey_load),
+        ] {
+            if key.is_none() {
+                tracing::warn!("unknown hotkey name '{name}'; that hotkey is disabled");
+            }
+        }
         Self {
             emu,
             show_vram: false,
@@ -65,6 +81,9 @@ impl App {
             volume,
             config,
             config_path,
+            keymap,
+            hotkey_save,
+            hotkey_load,
         }
     }
 }
@@ -148,7 +167,7 @@ fn vram_image(vram: &[u16], as_24bit: bool) -> egui::ColorImage {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let buttons = ctx.input(|i| {
-            KEYMAP
+            self.keymap
                 .iter()
                 .filter(|(k, _)| i.key_down(*k))
                 .fold(0u16, |acc, (_, b)| acc | b)
@@ -166,11 +185,14 @@ impl eframe::App for App {
         ) || status.debugger == DebuggerState::Waiting;
 
         // Save-state hotkeys; gating (debugger owns loads) is in the worker
-        let (f5, f9) = ctx.input(|i| (i.key_pressed(egui::Key::F5), i.key_pressed(egui::Key::F9)));
-        if f5 {
+        let (save, load) = ctx.input(|i| {
+            let pressed = |k: Option<egui::Key>| k.is_some_and(|k| i.key_pressed(k));
+            (pressed(self.hotkey_save), pressed(self.hotkey_load))
+        });
+        if save {
             self.emu.send(Command::SaveState);
         }
-        if f9 {
+        if load {
             self.emu.send(Command::LoadState);
         }
 
@@ -193,10 +215,12 @@ impl eframe::App for App {
                         self.emu.send(Command::Reset);
                     }
                     ui.separator();
-                    if ui.button("💾 Save (F5)").clicked() {
+                    let save_key = &self.config.hotkeys.save_state;
+                    if ui.button(format!("💾 Save ({save_key})")).clicked() {
                         self.emu.send(Command::SaveState);
                     }
-                    if ui.button("📂 Load (F9)").clicked() {
+                    let load_key = &self.config.hotkeys.load_state;
+                    if ui.button(format!("📂 Load ({load_key})")).clicked() {
                         self.emu.send(Command::LoadState);
                     }
                 });
