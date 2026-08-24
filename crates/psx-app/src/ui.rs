@@ -6,6 +6,7 @@
 
 use crate::config;
 use crate::config::Config;
+use crate::disc;
 use crate::emu::{Command, DebuggerState, Emu, FrameSnapshot};
 use crate::gamepad::Gamepad;
 use eframe::egui;
@@ -57,6 +58,8 @@ pub struct App {
     hotkey_load: Option<egui::Key>,
     /// Absent when no gamepad backend is available.
     gamepad: Option<Gamepad>,
+    /// Last failed disc pick, shown until the next one succeeds.
+    disc_error: Option<String>,
 }
 
 impl App {
@@ -89,6 +92,7 @@ impl App {
             hotkey_save,
             hotkey_load,
             gamepad,
+            disc_error: None,
         }
     }
 }
@@ -220,6 +224,28 @@ impl eframe::App for App {
                     if ui.button("Reset").clicked() {
                         self.emu.send(Command::Reset);
                     }
+                    if ui
+                        .button("💿 Open disc…")
+                        .on_hover_text(
+                            "load a disc image and reset; mid-game disc swaps are not modeled",
+                        )
+                        .clicked()
+                        && let Some(path) = rfd::FileDialog::new()
+                            .add_filter("PlayStation disc image", &["cue", "bin", "img"])
+                            .pick_file()
+                    {
+                        match disc::load_disc(&path) {
+                            Ok(d) => {
+                                self.disc_error = None;
+                                self.emu.send(Command::InsertDisc(d));
+                                self.emu.send(Command::Reset);
+                            }
+                            Err(e) => {
+                                tracing::error!("{e}");
+                                self.disc_error = Some(e);
+                            }
+                        }
+                    }
                     ui.separator();
                     let save_key = &self.config.hotkeys.save_state;
                     if ui.button(format!("💾 Save ({save_key})")).clicked() {
@@ -230,6 +256,10 @@ impl eframe::App for App {
                         self.emu.send(Command::LoadState);
                     }
                 });
+                if let Some(err) = &self.disc_error {
+                    ui.separator();
+                    ui.colored_label(egui::Color32::LIGHT_RED, err);
+                }
                 if status.debugger != DebuggerState::None {
                     ui.separator();
                     ui.label(match status.debugger {

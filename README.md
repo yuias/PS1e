@@ -25,7 +25,10 @@ ps1e [--bios <path>] [--disc <image.bin|image.cue>]
 ```
 
 Without `--disc`, the BIOS shell runs. The GUI shows the display, CPU
-registers, a VRAM viewer, and a TTY console.
+registers, a VRAM viewer, and a TTY console, and can pick a disc image at
+runtime ("Open disc…"). Opening one resets the machine: the drive's
+shell-open event is not modeled, so a running game would never notice a
+swap.
 
 | Keys | |
 |---|---|

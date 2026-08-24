@@ -24,6 +24,10 @@ pub enum Command {
     SetRunning(bool),
     Step,
     Reset,
+    /// Swap the disc in the drive. Followed by a Reset in practice: the
+    /// drive's shell-open event is not modeled, so a running game would
+    /// never notice the swap.
+    InsertDisc(psx_core::cdrom::Disc),
     SaveState,
     LoadState,
     SetGpuLog(bool),
@@ -241,7 +245,11 @@ impl Worker {
                     self.sys.bus.cdrom.set_disc(disc);
                     self.sys.bus.sio.memcard = memcard;
                 }
-                Command::SetRunning(_) | Command::Step | Command::Reset => {}
+                Command::InsertDisc(disc) if !debugger_active => self.sys.insert_disc(disc),
+                Command::SetRunning(_)
+                | Command::Step
+                | Command::Reset
+                | Command::InsertDisc(_) => {}
                 Command::SaveState => match self.sys.save_state() {
                     Ok(data) => match std::fs::write(&self.cfg.state_path, &data) {
                         Ok(()) => {
