@@ -107,13 +107,20 @@ pub struct Frame {
     pub enabled: bool,
 }
 
+/// Nominal video clocks, per psx-spx. A console always runs its own
+/// region's clock; keying off the selected display mode instead is what
+/// psx-spx recommends for emulation.
+const NTSC_VIDEO_CLOCK_HZ: u64 = 53_693_175;
+const PAL_VIDEO_CLOCK_HZ: u64 = 53_203_425;
+const NTSC_VCLK_PER_LINE: u64 = 3413;
+const PAL_VCLK_PER_LINE: u64 = 3406;
+
 /// Video timing of the current display mode: what the root counters gate
 /// on, and how long a field lasts.
 ///
-/// Derived from the nominal video clocks (NTSC 53.693175 MHz, PAL
-/// 53.203425 MHz) against the 33.8688 MHz CPU clock. Interlaced fields are
-/// rounded up to whole scanlines rather than the hardware's 262.5/312.5,
-/// which costs half a line of drift per field.
+/// Derived from the nominal video clocks against the 33.8688 MHz CPU
+/// clock. Interlaced fields are rounded up to whole scanlines rather than
+/// the hardware's 262.5/312.5, which costs half a line of drift per field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VideoTiming {
     /// CPU cycles per scanline.
@@ -122,6 +129,13 @@ pub struct VideoTiming {
     pub lines_per_frame: u64,
     /// Scanlines carrying picture; the remainder is vertical blanking.
     pub visible_lines: u64,
+    /// Horizontal blanking per scanline, in CPU cycles.
+    pub hblank_cycles: u64,
+    /// CPU cycles per dotclock tick, as `(cycles, ticks)`. Kept as a ratio
+    /// because it is fractional in every mode: 320-pixel NTSC, for one,
+    /// runs 5.05 cycles per dot. The hardware additionally truncates the
+    /// fractional dots at the end of each scanline; that is not modelled.
+    pub dotclock: (u64, u64),
 }
 
 impl VideoTiming {
@@ -130,12 +144,16 @@ impl VideoTiming {
         cycles_per_line: 2153,
         lines_per_frame: 263,
         visible_lines: 240,
+        hblank_cycles: 538,
+        dotclock: (8 * crate::CPU_CLOCK_HZ, NTSC_VIDEO_CLOCK_HZ),
     };
     /// 3406 video clocks per line, 314 lines per field.
     pub const PAL: Self = Self {
         cycles_per_line: 2168,
         lines_per_frame: 314,
         visible_lines: 288,
+        hblank_cycles: 538,
+        dotclock: (8 * crate::CPU_CLOCK_HZ, PAL_VIDEO_CLOCK_HZ),
     };
 
     /// CPU cycles per field.
@@ -146,12 +164,6 @@ impl VideoTiming {
     /// Vertical blanking, in CPU cycles.
     pub const fn vblank_cycles(&self) -> u64 {
         self.lines_per_frame.saturating_sub(self.visible_lines) * self.cycles_per_line
-    }
-
-    /// Horizontal blanking, in CPU cycles: the ~853 of a scanline's 3413
-    /// video clocks that fall outside the active picture.
-    pub const fn hblank_cycles(&self) -> u64 {
-        self.cycles_per_line * 853 / 3413
     }
 }
 
@@ -206,14 +218,55 @@ impl Gpu {
         !self.display_disabled
     }
 
-    /// Video timing for the region the display mode selects. Real consoles
-    /// always run their own region's clock; keying off the mode instead is
-    /// what psx-spx recommends for emulation.
+    /// Video timing for the current display mode: region-dependent field
+    /// geometry, refined by the configured display window and horizontal
+    /// resolution. A degenerate window (some titles leave one zeroed)
+    /// falls back to the region's nominal blanking.
     pub fn video_timing(&self) -> VideoTiming {
-        if self.pal_mode {
-            VideoTiming::PAL
+        let (base, vclk_per_line, video_clock) = if self.pal_mode {
+            (VideoTiming::PAL, PAL_VCLK_PER_LINE, PAL_VIDEO_CLOCK_HZ)
         } else {
-            VideoTiming::NTSC
+            (VideoTiming::NTSC, NTSC_VCLK_PER_LINE, NTSC_VIDEO_CLOCK_HZ)
+        };
+
+        // GP1(06): active picture per scanline, in video clocks
+        let active = self
+            .display_h_range
+            .1
+            .saturating_sub(self.display_h_range.0) as u64;
+        let hblank_cycles = if active == 0 || active > vclk_per_line {
+            base.hblank_cycles
+        } else {
+            (vclk_per_line - active) * base.cycles_per_line / vclk_per_line
+        };
+
+        // GP1(07): first and last displayed scanline
+        let lines = self
+            .display_v_range
+            .1
+            .saturating_sub(self.display_v_range.0) as u64;
+        let visible_lines = if lines == 0 || lines > base.lines_per_frame {
+            base.visible_lines
+        } else {
+            lines
+        };
+
+        VideoTiming {
+            visible_lines,
+            hblank_cycles,
+            dotclock: (self.dotclock_divider() * crate::CPU_CLOCK_HZ, video_clock),
+            ..base
+        }
+    }
+
+    /// Video clocks per dot for the current horizontal resolution.
+    fn dotclock_divider(&self) -> u64 {
+        match self.hres {
+            256 => 10,
+            320 => 8,
+            368 => 7,
+            512 => 5,
+            _ => 4, // 640
         }
     }
 
@@ -860,6 +913,38 @@ fn color_to_5551(c: u32) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn video_timing_follows_the_display_mode() {
+        let mut gpu = Gpu::new();
+        let ntsc = gpu.video_timing();
+        assert_eq!(ntsc.lines_per_frame, 263);
+        assert_eq!(ntsc.visible_lines, 240);
+        // Default window is 2560 of the 3413 video clocks on a scanline
+        assert_eq!(ntsc.hblank_cycles, 538);
+        assert_eq!(
+            ntsc.dotclock,
+            (8 * crate::CPU_CLOCK_HZ, NTSC_VIDEO_CLOCK_HZ)
+        );
+
+        // GP1(08): 640-pixel PAL
+        gpu.gp1(0x0800_000b);
+        let pal = gpu.video_timing();
+        assert_eq!(pal.lines_per_frame, 314);
+        assert_eq!(pal.dotclock, (4 * crate::CPU_CLOCK_HZ, PAL_VIDEO_CLOCK_HZ));
+        assert!(pal.cycles_per_frame() > ntsc.cycles_per_frame());
+    }
+
+    #[test]
+    fn video_timing_takes_the_visible_window_from_the_display_range() {
+        let mut gpu = Gpu::new();
+        // GP1(07): 232 displayed scanlines
+        gpu.gp1(0x0700_0000 | 0x10 | ((0x10 + 232) << 10));
+        assert_eq!(gpu.video_timing().visible_lines, 232);
+        // A degenerate range keeps the nominal window
+        gpu.gp1(0x0700_0000);
+        assert_eq!(gpu.video_timing().visible_lines, 240);
+    }
 
     /// Paint every VRAM row with a marker value.
     fn paint(gpu: &mut Gpu, base: u16) {

@@ -10,9 +10,6 @@
 use crate::bus::Irq;
 use crate::gpu::VideoTiming;
 
-/// Dotclock divider approximation for the common 320-pixel mode.
-const DOTCLOCK_DIV: u64 = 5;
-
 /// Cycles in `[origin, t)` whose phase falls in the leading `blank` cycles
 /// of each `period`. Blanking sits at the start of the period so that phase
 /// 0 of a field is the vblank edge the system raises IRQ0 on.
@@ -33,7 +30,8 @@ struct Timer {
     target: u32,
     /// CPU cycle of the last catch-up.
     last_sync: u64,
-    /// Sub-tick remainder in CPU cycles for divided clock sources.
+    /// Sub-tick remainder for divided clock sources, in CPU cycles scaled
+    /// by the clock source's tick numerator.
     frac: u64,
     /// Sync mode 3 only: the awaited blanking edge has been seen, so the
     /// counter has switched to free run.
@@ -133,7 +131,7 @@ impl Timers {
         // interval one blanking edge at a time: the resetting modes have to
         // observe each edge, not just the interval as a whole.
         let (period, blank) = if idx == 0 {
-            (timing.cycles_per_line, timing.hblank_cycles())
+            (timing.cycles_per_line, timing.hblank_cycles)
         } else {
             (timing.cycles_per_frame(), timing.vblank_cycles())
         };
@@ -170,18 +168,19 @@ impl Timers {
     /// target or an overflow is crossed.
     fn advance(&mut self, idx: usize, cycles: u64, timing: VideoTiming, irq: &mut Irq) {
         let t = &mut self.t[idx];
-        let elapsed = cycles + t.frac;
 
-        // CPU cycles per timer tick for the selected clock source
+        // Clock source as "`num` CPU cycles yield `den` ticks". A ratio,
+        // because the dotclock never divides the CPU clock evenly.
         let source = (t.mode >> 8) & 3;
-        let div = match (idx, source) {
-            (0, 1 | 3) => DOTCLOCK_DIV,
-            (1, 1 | 3) => timing.cycles_per_line,
-            (2, 2 | 3) => 8,
-            _ => 1,
+        let (num, den) = match (idx, source) {
+            (0, 1 | 3) => timing.dotclock,
+            (1, 1 | 3) => (timing.cycles_per_line, 1),
+            (2, 2 | 3) => (8, 1),
+            _ => (1, 1),
         };
-        let ticks = elapsed / div;
-        t.frac = elapsed % div;
+        let elapsed = cycles * den + t.frac;
+        let ticks = elapsed / num;
+        t.frac = elapsed % num;
         if ticks == 0 {
             return;
         }
@@ -264,7 +263,7 @@ mod tests {
     const PAL: VideoTiming = VideoTiming::PAL;
     const CYCLES_PER_LINE: u64 = NTSC.cycles_per_line;
     const CYCLES_PER_FRAME: u64 = NTSC.cycles_per_frame();
-    const HBLANK_CYCLES: u64 = NTSC.hblank_cycles();
+    const HBLANK_CYCLES: u64 = NTSC.hblank_cycles;
 
     /// Write mode at cycle 0, run to `now`, and read the counter back.
     fn run(mode_addr: u32, count_addr: u32, mode: u32, now: u64) -> u32 {
@@ -413,6 +412,23 @@ mod tests {
             timers.read(T2_MODE, 100, NTSC, &mut irq) & (1 << 10),
             1 << 10
         );
+    }
+
+    #[test]
+    fn dotclock_ticks_match_the_documented_dots_per_line() {
+        // psx-spx dots per NTSC scanline: 320pix 426.6, 640pix 853.2,
+        // 256pix 341.3 — the fractional dot is dropped
+        for (dot_vclk, expected) in [(8u64, 426), (4, 853), (10, 341)] {
+            let timing = VideoTiming {
+                dotclock: (dot_vclk * crate::CPU_CLOCK_HZ, 53_693_175),
+                ..NTSC
+            };
+            let mut timers = Timers::new();
+            let mut irq = Irq::default();
+            timers.write(T0_MODE, 1 << 8, 0, timing, &mut irq); // dotclock source
+            let ticks = timers.read(T0_COUNT, timing.cycles_per_line, timing, &mut irq);
+            assert_eq!(ticks, expected, "{dot_vclk} video clocks per dot");
+        }
     }
 
     #[test]
