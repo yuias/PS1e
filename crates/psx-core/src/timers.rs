@@ -46,6 +46,9 @@ struct Timer {
     /// Sync mode 3 only: the awaited blanking edge has been seen, so the
     /// counter has switched to free run.
     sync_started: bool,
+    /// One-shot mode only: an IRQ condition has already been served, so
+    /// further ones are suppressed until the mode register is rewritten.
+    irq_fired: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -88,6 +91,7 @@ impl Timers {
                 self.t[idx].counter = 0;
                 self.t[idx].frac = 0;
                 self.t[idx].sync_started = false;
+                self.t[idx].irq_fired = false;
             }
             0x8 => self.t[idx].target = val & 0xffff,
             _ => {}
@@ -202,7 +206,33 @@ impl Timers {
         t.counter = counter as u32 & 0xffff;
 
         if fire {
-            t.mode &= !(1 << 10); // IRQ requested (active low)
+            self.request_irq(idx, irq);
+        }
+    }
+
+    /// Serve an IRQ condition, honouring the one-shot (bit 6) and
+    /// pulse/toggle (bit 7) mode bits.
+    fn request_irq(&mut self, idx: usize, irq: &mut Irq) {
+        let t = &mut self.t[idx];
+        let repeat = t.mode & (1 << 6) != 0;
+        if !repeat && t.irq_fired {
+            return;
+        }
+        t.irq_fired = true;
+
+        let raise = if t.mode & (1 << 7) != 0 {
+            // Toggle: bit 10 inverts per condition, and the line is driven
+            // on its 1 -> 0 edge — so a repeating timer fires every other
+            // condition. One-shot leaves the bit low, having toggled once.
+            let was_idle = t.mode & (1 << 10) != 0;
+            t.mode ^= 1 << 10;
+            was_idle
+        } else {
+            // Pulse: bit 10 dips low for a few clocks, far too briefly to
+            // observe through the lazy catch-up, so leave it set.
+            true
+        };
+        if raise {
             irq.raise(4 + idx as u32);
         }
     }
@@ -224,6 +254,7 @@ mod tests {
     const T1_MODE: u32 = 0x1f80_1114;
     const T2_COUNT: u32 = 0x1f80_1120;
     const T2_MODE: u32 = 0x1f80_1124;
+    const T2_TARGET: u32 = 0x1f80_1128;
 
     /// Write mode at cycle 0, run to `now`, and read the counter back.
     fn run(mode_addr: u32, count_addr: u32, mode: u32, now: u64) -> u32 {
@@ -304,6 +335,68 @@ mod tests {
             coarse.read(T0_COUNT, end, &mut irq),
             fine.read(T0_COUNT, end, &mut irq)
         );
+    }
+
+    /// Timer 2 wrapping at a target of 99, so one IRQ condition occurs per
+    /// 100 cycles. `extra` adds the IRQ mode bits under test.
+    fn wrapping_timer2(extra: u32) -> (Timers, Irq) {
+        let mut timers = Timers::new();
+        let mut irq = Irq::default();
+        // Reset at target | IRQ at target
+        timers.write(T2_MODE, (1 << 3) | (1 << 4) | extra, 0, &mut irq);
+        timers.write(T2_TARGET, 99, 0, &mut irq);
+        (timers, irq)
+    }
+
+    /// Run to the `n`-th target wrap and report whether IRQ2 was raised.
+    fn wrap_raises_irq(timers: &mut Timers, irq: &mut Irq, n: u64) -> bool {
+        irq.stat = 0;
+        timers.read(T2_COUNT, n * 100, irq);
+        irq.stat & (1 << 6) != 0
+    }
+
+    #[test]
+    fn one_shot_irq_is_served_only_once() {
+        let (mut timers, mut irq) = wrapping_timer2(0);
+        assert!(wrap_raises_irq(&mut timers, &mut irq, 1));
+        assert!(!wrap_raises_irq(&mut timers, &mut irq, 2));
+        // Rewriting the mode re-arms it
+        timers.write(T2_MODE, (1 << 3) | (1 << 4), 200, &mut irq);
+        timers.write(T2_TARGET, 99, 200, &mut irq);
+        assert!(wrap_raises_irq(&mut timers, &mut irq, 3));
+    }
+
+    #[test]
+    fn repeat_irq_is_served_every_time() {
+        let (mut timers, mut irq) = wrapping_timer2(1 << 6);
+        for n in 1..=3 {
+            assert!(wrap_raises_irq(&mut timers, &mut irq, n), "wrap {n}");
+        }
+    }
+
+    #[test]
+    fn toggle_mode_drives_the_line_every_second_condition() {
+        let (mut timers, mut irq) = wrapping_timer2((1 << 6) | (1 << 7));
+        assert!(wrap_raises_irq(&mut timers, &mut irq, 1));
+        assert!(!wrap_raises_irq(&mut timers, &mut irq, 2));
+        assert!(wrap_raises_irq(&mut timers, &mut irq, 3));
+    }
+
+    #[test]
+    fn toggle_mode_inverts_the_request_bit() {
+        let (mut timers, mut irq) = wrapping_timer2((1 << 6) | (1 << 7));
+        assert_eq!(timers.read(T2_MODE, 0, &mut irq) & (1 << 10), 1 << 10);
+        timers.read(T2_COUNT, 100, &mut irq);
+        assert_eq!(timers.read(T2_MODE, 100, &mut irq) & (1 << 10), 0);
+        timers.read(T2_COUNT, 200, &mut irq);
+        assert_eq!(timers.read(T2_MODE, 200, &mut irq) & (1 << 10), 1 << 10);
+    }
+
+    #[test]
+    fn pulse_mode_leaves_the_request_bit_set() {
+        let (mut timers, mut irq) = wrapping_timer2(1 << 6);
+        timers.read(T2_COUNT, 100, &mut irq);
+        assert_eq!(timers.read(T2_MODE, 100, &mut irq) & (1 << 10), 1 << 10);
     }
 
     #[test]

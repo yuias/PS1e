@@ -160,8 +160,6 @@ commands are refused while a debugger is attached.
 - The dotclock and hblank timer sources, and the blanking windows the
   counter synchronization modes gate on, use fixed NTSC ratios derived
   from the cycle count rather than real GPU scanout.
-- Timer mode bits 6 and 7 (IRQ one-shot/repeat and pulse/toggle) are
-  stored but not acted on: a timer IRQ repeats regardless.
 - The controller is a digital pad, so a gamepad's analog sticks are not
   read. Memory cards respond on slot 1 only; slot 2 is empty.
 
