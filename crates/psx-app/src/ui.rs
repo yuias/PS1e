@@ -7,6 +7,7 @@
 use crate::config;
 use crate::config::Config;
 use crate::emu::{Command, DebuggerState, Emu, FrameSnapshot};
+use crate::gamepad::Gamepad;
 use eframe::egui;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -54,12 +55,15 @@ pub struct App {
     keymap: Vec<(egui::Key, u16)>,
     hotkey_save: Option<egui::Key>,
     hotkey_load: Option<egui::Key>,
+    /// Absent when no gamepad backend is available.
+    gamepad: Option<Gamepad>,
 }
 
 impl App {
     pub fn new(emu: Emu, config: Config, config_path: Option<PathBuf>, log_gpu: bool) -> Self {
         let volume = config.volume.clamp(0.0, 1.0);
         let keymap = resolve_keymap(&config.keys);
+        let gamepad = Gamepad::new(&config.pad);
         let hotkey_save = egui::Key::from_name(&config.hotkeys.save_state);
         let hotkey_load = egui::Key::from_name(&config.hotkeys.load_state);
         for (name, key) in [
@@ -84,6 +88,7 @@ impl App {
             keymap,
             hotkey_save,
             hotkey_load,
+            gamepad,
         }
     }
 }
@@ -172,6 +177,7 @@ impl eframe::App for App {
                 .filter(|(k, _)| i.key_down(*k))
                 .fold(0u16, |acc, (_, b)| acc | b)
         });
+        let buttons = buttons | self.gamepad.as_mut().map_or(0, Gamepad::poll);
         self.emu.shared.buttons.store(buttons, Ordering::Relaxed);
         self.emu
             .shared

@@ -27,6 +27,7 @@ eframe = { version = "0.32", default-features = false, features = [
 cpal = "0.16"
 serde = { version = "1", features = ["derive"] }
 toml = "0.9"
+gilrs = "0.11.2"
 
 # One native wgpu backend per OS keeps naga's shader translators to a single
 # target language. Excludes gles/webgpu everywhere.

@@ -44,6 +44,27 @@ volume = 0.5
 #start = "Enter"
 #select = "Backspace"
 
+# Gamepad bindings for the digital pad. Values name gilrs buttons:
+# "South"/"East"/"North"/"West" for the action pad, "DPadUp".."DPadRight",
+# "LeftTrigger"/"LeftTrigger2"/"RightTrigger"/"RightTrigger2", "Start",
+# "Select", "LeftThumb", "RightThumb", "Mode", "C", "Z". Gamepad input is
+# merged with the keyboard, so either can drive any button.
+#[pad]
+#up = "DPadUp"
+#down = "DPadDown"
+#left = "DPadLeft"
+#right = "DPadRight"
+#cross = "South"
+#circle = "East"
+#square = "West"
+#triangle = "North"
+#l1 = "LeftTrigger"
+#r1 = "RightTrigger"
+#l2 = "LeftTrigger2"
+#r2 = "RightTrigger2"
+#start = "Start"
+#select = "Select"
+
 # Frontend hotkeys (not part of the emulated pad).
 #[hotkeys]
 #save_state = "F5"
@@ -116,6 +137,71 @@ impl KeyBindings {
     }
 }
 
+/// One gamepad button name per digital-pad button.
+///
+/// Names are the `gilrs::Button` variants ("South", "DPadUp", ...).
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(default)]
+pub struct PadBindings {
+    pub up: String,
+    pub down: String,
+    pub left: String,
+    pub right: String,
+    pub cross: String,
+    pub circle: String,
+    pub square: String,
+    pub triangle: String,
+    pub l1: String,
+    pub r1: String,
+    pub l2: String,
+    pub r2: String,
+    pub start: String,
+    pub select: String,
+}
+
+impl Default for PadBindings {
+    fn default() -> Self {
+        Self {
+            up: "DPadUp".into(),
+            down: "DPadDown".into(),
+            left: "DPadLeft".into(),
+            right: "DPadRight".into(),
+            cross: "South".into(),
+            circle: "East".into(),
+            square: "West".into(),
+            triangle: "North".into(),
+            l1: "LeftTrigger".into(),
+            r1: "RightTrigger".into(),
+            l2: "LeftTrigger2".into(),
+            r2: "RightTrigger2".into(),
+            start: "Start".into(),
+            select: "Select".into(),
+        }
+    }
+}
+
+impl PadBindings {
+    /// Each binding paired with the pad bit it drives, in a fixed order.
+    pub fn pairs(&self) -> [(&str, u16); 14] {
+        [
+            (&self.up, button::UP),
+            (&self.down, button::DOWN),
+            (&self.left, button::LEFT),
+            (&self.right, button::RIGHT),
+            (&self.cross, button::CROSS),
+            (&self.circle, button::CIRCLE),
+            (&self.square, button::SQUARE),
+            (&self.triangle, button::TRIANGLE),
+            (&self.l1, button::L1),
+            (&self.r1, button::R1),
+            (&self.l2, button::L2),
+            (&self.r2, button::R2),
+            (&self.start, button::START),
+            (&self.select, button::SELECT),
+        ]
+    }
+}
+
 /// Frontend hotkeys. These drive the emulator shell, not the emulated pad.
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(default)]
@@ -141,6 +227,7 @@ pub struct Config {
     pub memcard: Option<PathBuf>,
     // Tables must stay last: TOML cannot emit a scalar after a table.
     pub keys: KeyBindings,
+    pub pad: PadBindings,
     pub hotkeys: Hotkeys,
 }
 
@@ -151,6 +238,7 @@ impl Default for Config {
             volume: 0.5,
             memcard: None,
             keys: KeyBindings::default(),
+            pad: PadBindings::default(),
             hotkeys: Hotkeys::default(),
         }
     }
@@ -251,6 +339,7 @@ mod tests {
         let text = toml::to_string_pretty(&Config::default()).expect("serialize");
         let back: Config = toml::from_str(&text).expect("deserialize");
         assert_eq!(back.keys.cross, "X");
+        assert_eq!(back.pad.cross, "South");
         assert_eq!(back.hotkeys.save_state, "F5");
     }
 

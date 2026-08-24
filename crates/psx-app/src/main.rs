@@ -21,6 +21,7 @@ mod audio;
 mod config;
 mod control;
 mod emu;
+mod gamepad;
 mod ui;
 
 use psx_core::PsxSystem;

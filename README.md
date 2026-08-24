@@ -35,8 +35,13 @@ registers, a VRAM viewer, and a TTY console.
 | Enter / Backspace | Start / Select |
 | F5 / F9 | Save / load state |
 
-All of these are rebindable; see the `[keys]` and `[hotkeys]` tables under
-[Configuration](#configuration).
+A gamepad, if one is connected, drives the same pad in parallel with the
+keyboard: face buttons to Cross/Circle/Square/Triangle, shoulders and
+triggers to L1/R1/L2/R2, D-pad and Start/Select as labelled. Analog
+sticks do nothing yet — the emulated controller is a digital pad.
+
+All of these are rebindable; see the `[keys]`, `[pad]` and `[hotkeys]`
+tables under [Configuration](#configuration).
 
 Save states snapshot the full machine to `state0.sst` next to the memory
 card image. The BIOS, disc image and memory card are not part of a state
@@ -57,6 +62,10 @@ memcard = "memcard0.mcr"    # created and formatted automatically
 cross = "X"
 start = "Enter"
 
+[pad]                       # gamepad; gilrs button names
+cross = "South"
+start = "Start"
+
 [hotkeys]                   # frontend shortcuts
 save_state = "F5"
 load_state = "F9"
@@ -67,6 +76,11 @@ Key names are the ones egui reports: letters and digits as themselves
 `"Enter"`, `"Backspace"`, `"Space"`, `"F1"`..`"F20"`. Omitted buttons keep
 their defaults, and an unrecognized name falls back to the default with a
 warning in the log.
+
+Gamepad names are the `gilrs::Button` variants: `"South"`, `"East"`,
+`"North"`, `"West"`, `"DPadUp"`..`"DPadRight"`, `"LeftTrigger"`,
+`"LeftTrigger2"`, `"RightTrigger"`, `"RightTrigger2"`, `"Start"`,
+`"Select"`, `"LeftThumb"`, `"RightThumb"`, `"Mode"`, `"C"`, `"Z"`.
 
 ## Headless mode
 
