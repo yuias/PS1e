@@ -153,6 +153,18 @@ repeat, with `savestate`/`loadstate` for branching exploration. The
 control port and the debugger can be active simultaneously; execution
 commands are refused while a debugger is attached.
 
+## Limitations
+
+- DMA channel 5 (expansion port / PIO) is not implemented. No retail
+  software uses it; transfers on it are logged and ignored.
+- The dotclock and hblank timer sources, and the blanking windows the
+  counter synchronization modes gate on, use fixed NTSC ratios derived
+  from the cycle count rather than real GPU scanout.
+- Timer mode bits 6 and 7 (IRQ one-shot/repeat and pulse/toggle) are
+  stored but not acted on: a timer IRQ repeats regardless.
+- The controller is a digital pad, so a gamepad's analog sticks are not
+  read. Memory cards respond on slot 1 only; slot 2 is empty.
+
 ## Architecture
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
