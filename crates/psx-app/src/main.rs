@@ -375,9 +375,10 @@ fn finish_headless(sys: &mut PsxSystem, args: &Args, wav_samples: Vec<i16>) {
         );
     }
     tracing::info!(
-        "done: pc={:#010x} cycles={} sr={:#010x} cause={:#010x} i_stat={:#06x} i_mask={:#06x}",
+        "done: pc={:#010x} cycles={} frames={} sr={:#010x} cause={:#010x} i_stat={:#06x} i_mask={:#06x}",
         sys.cpu.pc,
         sys.cycles(),
+        sys.bus.gpu.frame_count,
         sys.cpu.cop0.sr,
         sys.cpu.cop0.cause,
         sys.bus.irq.stat,
