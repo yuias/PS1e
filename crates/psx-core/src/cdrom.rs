@@ -478,9 +478,17 @@ impl Cdrom {
         };
         match action {
             Action::End => {
+                // Running into the lead-out ends the read the way a CD-DA
+                // stream ends at the end of the disc: INT4, once the previous
+                // interrupt is acknowledged.
+                if self.int_flag & 7 != 0 || !self.pending.is_empty() {
+                    return;
+                }
                 warn!(target: "psx_core::cdrom",
                       "read past end of disc at LBA {}", self.read_lba);
                 self.reading = false;
+                let st = self.stat_byte();
+                self.deliver(4, &[st], irq);
             }
             Action::Xa(raw) => {
                 if self.muted {
@@ -1061,6 +1069,36 @@ mod tests {
             );
             assert!(!cd.reading, "cmd {cmd:#04x} started the sector pump");
         }
+    }
+
+    /// A read that runs off the end of the disc ends the way a CD-DA stream
+    /// does at the same place: the drive says so instead of falling silent.
+    #[test]
+    fn reading_past_the_end_of_the_disc_reports_data_end() {
+        let mut cd = Cdrom::new();
+        let mut irq = Irq::default();
+        cd.int_enable = 0x1f;
+        cd.insert_disc(Disc::new(vec![0u8; RAW_SECTOR]).unwrap());
+        // Setloc 00:02:00 (LBA 0), then ReadN over the one-sector disc
+        cd.write8(2, 0x00, 0);
+        cd.write8(2, 0x02, 0);
+        cd.write8(2, 0x00, 0);
+        cd.write8(1, 0x02, 0);
+        cd.write8(0, 1, 0);
+        acked(&mut cd, &mut irq, ACK_DELAY + 1);
+        cd.write8(0, 0, 0);
+        cd.write8(1, 0x06, 100_000);
+        cd.write8(0, 1, 0);
+        let mut now = 100_000 + ACK_DELAY + 1;
+        assert_eq!(acked(&mut cd, &mut irq, now).0, 3);
+
+        let mut ints = Vec::new();
+        for _ in 0..2 {
+            now += cd.seek_cycles(0) + CPU_HZ / 75 + 1;
+            ints.push(acked(&mut cd, &mut irq, now).0);
+        }
+        assert_eq!(ints, vec![1, 4]); // the only sector, then end of disc
+        assert!(!cd.reading);
     }
 
     /// Opening the lid stops the drive but leaves the disc in it, so a
