@@ -22,8 +22,10 @@ use tracing::info;
 
 /// CPU clock: 33.8688 MHz.
 pub const CPU_CLOCK_HZ: u64 = 33_868_800;
-/// NTSC field, in CPU cycles.
-pub const CYCLES_PER_FRAME: u64 = timers::CYCLES_PER_LINE * timers::LINES_PER_FRAME;
+/// NTSC field, in CPU cycles. A nominal unit for callers that need a
+/// stable "one frame" figure; the running machine follows the display
+/// mode's [`gpu::VideoTiming`], which is longer in PAL.
+pub const CYCLES_PER_FRAME: u64 = gpu::VideoTiming::NTSC.cycles_per_frame();
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct PsxSystem {
@@ -38,7 +40,7 @@ pub struct PsxSystem {
 /// Save-state file magic + format version. Bump the version on any change
 /// to a serialized struct.
 const STATE_MAGIC: &[u8; 4] = b"PS1E";
-const STATE_VERSION: u16 = 5;
+const STATE_VERSION: u16 = 6;
 
 /// Cheap content fingerprint (FNV-1a) to flag cross-BIOS state loads.
 fn bios_fingerprint(bios: &[u8]) -> u32 {
@@ -168,12 +170,17 @@ impl PsxSystem {
 
     fn handle_event(&mut self, event: EventKind) {
         if event == EventKind::VBlank {
+            let timing = self.bus.gpu.video_timing();
             self.bus.irq.raise(0);
             self.bus.gpu.vblank();
-            // Keep lazily-synced components from lagging more than a frame
-            self.bus.timers.sync_all(self.cycles, &mut self.bus.irq);
+            // Keep lazily-synced components from lagging more than a frame,
+            // then hand them the field boundary they measure blanking from
+            self.bus
+                .timers
+                .sync_all(self.cycles, timing, &mut self.bus.irq);
+            self.bus.timers.set_frame_origin(self.cycles);
             self.scheduler
-                .schedule(self.cycles + CYCLES_PER_FRAME, EventKind::VBlank);
+                .schedule(self.cycles + timing.cycles_per_frame(), EventKind::VBlank);
         }
     }
 

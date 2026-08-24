@@ -157,9 +157,11 @@ commands are refused while a debugger is attached.
 
 - DMA channel 5 (expansion port / PIO) is not implemented. No retail
   software uses it; transfers on it are logged and ignored.
-- The dotclock and hblank timer sources, and the blanking windows the
-  counter synchronization modes gate on, use fixed NTSC ratios derived
-  from the cycle count rather than real GPU scanout.
+- Video timing follows the display region (NTSC/PAL), but the dotclock
+  timer source is fixed at the 320-pixel divider and the blanking windows
+  the counter synchronization modes gate on are nominal rather than taken
+  from the configured display range. Interlaced fields are rounded to
+  whole scanlines.
 - The controller is a digital pad, so a gamepad's analog sticks are not
   read. Memory cards respond on slot 1 only; slot 2 is empty.
 

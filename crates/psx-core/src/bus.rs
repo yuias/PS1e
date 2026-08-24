@@ -280,9 +280,13 @@ impl Bus {
             0x1f80_1080..0x1f80_1100 => self.dma.read_reg(p),
             0x1f80_1100..0x1f80_1130 => {
                 let Bus {
-                    timers, irq, now, ..
+                    timers,
+                    gpu,
+                    irq,
+                    now,
+                    ..
                 } = self;
-                timers.read(p, *now, irq)
+                timers.read(p, *now, gpu.video_timing(), irq)
             }
             0x1f80_1810 => self.gpu.gpuread(),
             0x1f80_1814 => self.gpu.status(),
@@ -393,9 +397,13 @@ impl Bus {
             }
             0x1f80_1100..0x1f80_1130 => {
                 let Bus {
-                    timers, irq, now, ..
+                    timers,
+                    gpu,
+                    irq,
+                    now,
+                    ..
                 } = self;
-                timers.write(p, val, *now, irq);
+                timers.write(p, val, *now, gpu.video_timing(), irq);
             }
             0x1f80_1800..0x1f80_1804 => self.cdrom.write8(p, val as u8, self.now),
             0x1f80_1810 => self.gpu.gp0(val),

@@ -107,6 +107,54 @@ pub struct Frame {
     pub enabled: bool,
 }
 
+/// Video timing of the current display mode: what the root counters gate
+/// on, and how long a field lasts.
+///
+/// Derived from the nominal video clocks (NTSC 53.693175 MHz, PAL
+/// 53.203425 MHz) against the 33.8688 MHz CPU clock. Interlaced fields are
+/// rounded up to whole scanlines rather than the hardware's 262.5/312.5,
+/// which costs half a line of drift per field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VideoTiming {
+    /// CPU cycles per scanline.
+    pub cycles_per_line: u64,
+    /// Scanlines per field, blanking included.
+    pub lines_per_frame: u64,
+    /// Scanlines carrying picture; the remainder is vertical blanking.
+    pub visible_lines: u64,
+}
+
+impl VideoTiming {
+    /// 3413 video clocks per line, 263 lines per field.
+    pub const NTSC: Self = Self {
+        cycles_per_line: 2153,
+        lines_per_frame: 263,
+        visible_lines: 240,
+    };
+    /// 3406 video clocks per line, 314 lines per field.
+    pub const PAL: Self = Self {
+        cycles_per_line: 2168,
+        lines_per_frame: 314,
+        visible_lines: 288,
+    };
+
+    /// CPU cycles per field.
+    pub const fn cycles_per_frame(&self) -> u64 {
+        self.cycles_per_line * self.lines_per_frame
+    }
+
+    /// Vertical blanking, in CPU cycles.
+    pub const fn vblank_cycles(&self) -> u64 {
+        self.lines_per_frame.saturating_sub(self.visible_lines) * self.cycles_per_line
+    }
+
+    /// Horizontal blanking, in CPU cycles: the ~853 of a scanline's 3413
+    /// video clocks that fall outside the active picture.
+    pub const fn hblank_cycles(&self) -> u64 {
+        self.cycles_per_line * 853 / 3413
+    }
+}
+
 impl Gpu {
     pub fn new() -> Self {
         Self {
@@ -156,6 +204,17 @@ impl Gpu {
 
     pub fn display_enabled(&self) -> bool {
         !self.display_disabled
+    }
+
+    /// Video timing for the region the display mode selects. Real consoles
+    /// always run their own region's clock; keying off the mode instead is
+    /// what psx-spx recommends for emulation.
+    pub fn video_timing(&self) -> VideoTiming {
+        if self.pal_mode {
+            VideoTiming::PAL
+        } else {
+            VideoTiming::NTSC
+        }
     }
 
     pub fn display_resolution(&self) -> (u32, u32) {

@@ -2,36 +2,28 @@
 //!
 //! Lazy catch-up model: counters advance only when their registers are
 //! accessed or when the system forces a sync (once per vblank), computing
-//! elapsed ticks from the CPU cycle count. Dotclock and hblank sources are
-//! approximated with fixed ratios, and so are the blanking windows the
-//! synchronization modes gate on: both are derived analytically from the
-//! absolute cycle count rather than driven by GPU scanout events.
+//! elapsed ticks from the CPU cycle count. The blanking windows the
+//! synchronization modes gate on are derived analytically from the current
+//! [`VideoTiming`] and the cycle the field started at, rather than driven
+//! by GPU scanout events.
 
-use crate::CYCLES_PER_FRAME;
 use crate::bus::Irq;
+use crate::gpu::VideoTiming;
 
-/// ~NTSC scanline length in CPU cycles (3413.6 video clocks / 1.5853).
-pub const CYCLES_PER_LINE: u64 = 2153;
-/// NTSC field: 263 scanlines, 240 of them visible.
-pub const LINES_PER_FRAME: u64 = 263;
-const VISIBLE_LINES: u64 = 240;
 /// Dotclock divider approximation for the common 320-pixel mode.
 const DOTCLOCK_DIV: u64 = 5;
-/// Blanking part of a scanline (~853 of the 3413.6 video clocks).
-const HBLANK_CYCLES: u64 = 538;
-/// Vertical blanking: the scanlines past the visible area.
-const VBLANK_CYCLES: u64 = (LINES_PER_FRAME - VISIBLE_LINES) * CYCLES_PER_LINE;
 
-/// Cycles in `[0, t)` whose phase falls in the leading `blank` cycles of
-/// each `period`. Blanking is modelled at the start of the period so that
-/// phase 0 of a frame is the vblank edge the system raises IRQ0 on.
-fn blanking_before(t: u64, period: u64, blank: u64) -> u64 {
-    (t / period) * blank + (t % period).min(blank)
+/// Cycles in `[origin, t)` whose phase falls in the leading `blank` cycles
+/// of each `period`. Blanking sits at the start of the period so that phase
+/// 0 of a field is the vblank edge the system raises IRQ0 on.
+fn blanking_before(t: u64, origin: u64, period: u64, blank: u64) -> u64 {
+    let d = t.saturating_sub(origin);
+    (d / period) * blank + (d % period).min(blank)
 }
 
 /// Cycles in `[from, to)` spent blanking.
-fn blanking_within(from: u64, to: u64, period: u64, blank: u64) -> u64 {
-    blanking_before(to, period, blank) - blanking_before(from, period, blank)
+fn blanking_within(from: u64, to: u64, origin: u64, period: u64, blank: u64) -> u64 {
+    blanking_before(to, origin, period, blank) - blanking_before(from, origin, period, blank)
 }
 
 #[derive(Default, Clone, Copy, serde::Serialize, serde::Deserialize)]
@@ -54,18 +46,23 @@ struct Timer {
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Timers {
     t: [Timer; 3],
+    /// CPU cycle the current field started at. Blanking phase is measured
+    /// from here rather than from cycle zero: the field length changes with
+    /// the display region, so vblank edges are not multiples of a period.
+    frame_origin: u64,
 }
 
 impl Timers {
     pub fn new() -> Self {
         Self {
             t: [Timer::default(); 3],
+            frame_origin: 0,
         }
     }
 
-    pub fn read(&mut self, p: u32, now: u64, irq: &mut Irq) -> u32 {
+    pub fn read(&mut self, p: u32, now: u64, timing: VideoTiming, irq: &mut Irq) -> u32 {
         let idx = ((p - 0x1f80_1100) >> 4) as usize;
-        self.catch_up(idx, now, irq);
+        self.catch_up(idx, now, timing, irq);
         match p & 0xf {
             0x0 => self.t[idx].counter,
             0x4 => {
@@ -79,9 +76,9 @@ impl Timers {
         }
     }
 
-    pub fn write(&mut self, p: u32, val: u32, now: u64, irq: &mut Irq) {
+    pub fn write(&mut self, p: u32, val: u32, now: u64, timing: VideoTiming, irq: &mut Irq) {
         let idx = ((p - 0x1f80_1100) >> 4) as usize;
-        self.catch_up(idx, now, irq);
+        self.catch_up(idx, now, timing, irq);
         match p & 0xf {
             0x0 => self.t[idx].counter = val & 0xffff,
             0x4 => {
@@ -100,20 +97,26 @@ impl Timers {
 
     /// Advance all timers (called once per vblank so IRQs cannot lag by
     /// more than a frame even without register accesses).
-    pub fn sync_all(&mut self, now: u64, irq: &mut Irq) {
+    pub fn sync_all(&mut self, now: u64, timing: VideoTiming, irq: &mut Irq) {
         for idx in 0..3 {
-            self.catch_up(idx, now, irq);
+            self.catch_up(idx, now, timing, irq);
         }
     }
 
-    fn catch_up(&mut self, idx: usize, now: u64, irq: &mut Irq) {
+    /// Start a new field at `cycle`. Call after [`Timers::sync_all`] has
+    /// closed out the field that just ended.
+    pub fn set_frame_origin(&mut self, cycle: u64) {
+        self.frame_origin = cycle;
+    }
+
+    fn catch_up(&mut self, idx: usize, now: u64, timing: VideoTiming, irq: &mut Irq) {
         let from = std::mem::replace(&mut self.t[idx].last_sync, now);
         if now <= from {
             return;
         }
         let mode = self.t[idx].mode;
         if mode & 1 == 0 {
-            self.advance(idx, now - from, irq);
+            self.advance(idx, now - from, timing, irq);
             return;
         }
 
@@ -121,7 +124,7 @@ impl Timers {
         if idx == 2 {
             // Counter 2 either stops dead (0/3) or runs free (1/2)
             if sync == 1 || sync == 2 {
-                self.advance(idx, now - from, irq);
+                self.advance(idx, now - from, timing, irq);
             }
             return;
         }
@@ -130,24 +133,25 @@ impl Timers {
         // interval one blanking edge at a time: the resetting modes have to
         // observe each edge, not just the interval as a whole.
         let (period, blank) = if idx == 0 {
-            (CYCLES_PER_LINE, HBLANK_CYCLES)
+            (timing.cycles_per_line, timing.hblank_cycles())
         } else {
-            (CYCLES_PER_FRAME, VBLANK_CYCLES)
+            (timing.cycles_per_frame(), timing.vblank_cycles())
         };
+        let origin = self.frame_origin;
         let mut cursor = from;
         while cursor < now {
-            let edge = (cursor / period + 1) * period;
+            let edge = origin + (cursor.saturating_sub(origin) / period + 1) * period;
             let end = edge.min(now);
             let cycles = match sync {
                 // Pause during blanking
-                0 => (end - cursor) - blanking_within(cursor, end, period, blank),
+                0 => (end - cursor) - blanking_within(cursor, end, origin, period, blank),
                 // Reset on the edge, and only count while blanking
-                2 => blanking_within(cursor, end, period, blank),
+                2 => blanking_within(cursor, end, origin, period, blank),
                 // Paused until the first edge, free-running after it
                 3 if !self.t[idx].sync_started => 0,
                 _ => end - cursor,
             };
-            self.advance(idx, cycles, irq);
+            self.advance(idx, cycles, timing, irq);
             cursor = end;
             if cursor == edge {
                 match sync {
@@ -164,7 +168,7 @@ impl Timers {
 
     /// Apply `cycles` of counting time, raising the timer's IRQ when the
     /// target or an overflow is crossed.
-    fn advance(&mut self, idx: usize, cycles: u64, irq: &mut Irq) {
+    fn advance(&mut self, idx: usize, cycles: u64, timing: VideoTiming, irq: &mut Irq) {
         let t = &mut self.t[idx];
         let elapsed = cycles + t.frac;
 
@@ -172,7 +176,7 @@ impl Timers {
         let source = (t.mode >> 8) & 3;
         let div = match (idx, source) {
             (0, 1 | 3) => DOTCLOCK_DIV,
-            (1, 1 | 3) => CYCLES_PER_LINE,
+            (1, 1 | 3) => timing.cycles_per_line,
             (2, 2 | 3) => 8,
             _ => 1,
         };
@@ -256,12 +260,18 @@ mod tests {
     const T2_MODE: u32 = 0x1f80_1124;
     const T2_TARGET: u32 = 0x1f80_1128;
 
+    const NTSC: VideoTiming = VideoTiming::NTSC;
+    const PAL: VideoTiming = VideoTiming::PAL;
+    const CYCLES_PER_LINE: u64 = NTSC.cycles_per_line;
+    const CYCLES_PER_FRAME: u64 = NTSC.cycles_per_frame();
+    const HBLANK_CYCLES: u64 = NTSC.hblank_cycles();
+
     /// Write mode at cycle 0, run to `now`, and read the counter back.
     fn run(mode_addr: u32, count_addr: u32, mode: u32, now: u64) -> u32 {
         let mut timers = Timers::new();
         let mut irq = Irq::default();
-        timers.write(mode_addr, mode, 0, &mut irq);
-        timers.read(count_addr, now, &mut irq)
+        timers.write(mode_addr, mode, 0, NTSC, &mut irq);
+        timers.read(count_addr, now, NTSC, &mut irq)
     }
 
     #[test]
@@ -325,15 +335,15 @@ mod tests {
         let mut coarse = Timers::new();
         let mut fine = Timers::new();
         let mut irq = Irq::default();
-        coarse.write(T0_MODE, 1, 0, &mut irq);
-        fine.write(T0_MODE, 1, 0, &mut irq);
+        coarse.write(T0_MODE, 1, 0, NTSC, &mut irq);
+        fine.write(T0_MODE, 1, 0, NTSC, &mut irq);
         let end = 3 * CYCLES_PER_LINE;
         for now in (1..=end).step_by(97) {
-            fine.read(T0_COUNT, now, &mut irq);
+            fine.read(T0_COUNT, now, NTSC, &mut irq);
         }
         assert_eq!(
-            coarse.read(T0_COUNT, end, &mut irq),
-            fine.read(T0_COUNT, end, &mut irq)
+            coarse.read(T0_COUNT, end, NTSC, &mut irq),
+            fine.read(T0_COUNT, end, NTSC, &mut irq)
         );
     }
 
@@ -343,15 +353,15 @@ mod tests {
         let mut timers = Timers::new();
         let mut irq = Irq::default();
         // Reset at target | IRQ at target
-        timers.write(T2_MODE, (1 << 3) | (1 << 4) | extra, 0, &mut irq);
-        timers.write(T2_TARGET, 99, 0, &mut irq);
+        timers.write(T2_MODE, (1 << 3) | (1 << 4) | extra, 0, NTSC, &mut irq);
+        timers.write(T2_TARGET, 99, 0, NTSC, &mut irq);
         (timers, irq)
     }
 
     /// Run to the `n`-th target wrap and report whether IRQ2 was raised.
     fn wrap_raises_irq(timers: &mut Timers, irq: &mut Irq, n: u64) -> bool {
         irq.stat = 0;
-        timers.read(T2_COUNT, n * 100, irq);
+        timers.read(T2_COUNT, n * 100, NTSC, irq);
         irq.stat & (1 << 6) != 0
     }
 
@@ -361,8 +371,8 @@ mod tests {
         assert!(wrap_raises_irq(&mut timers, &mut irq, 1));
         assert!(!wrap_raises_irq(&mut timers, &mut irq, 2));
         // Rewriting the mode re-arms it
-        timers.write(T2_MODE, (1 << 3) | (1 << 4), 200, &mut irq);
-        timers.write(T2_TARGET, 99, 200, &mut irq);
+        timers.write(T2_MODE, (1 << 3) | (1 << 4), 200, NTSC, &mut irq);
+        timers.write(T2_TARGET, 99, 200, NTSC, &mut irq);
         assert!(wrap_raises_irq(&mut timers, &mut irq, 3));
     }
 
@@ -385,18 +395,47 @@ mod tests {
     #[test]
     fn toggle_mode_inverts_the_request_bit() {
         let (mut timers, mut irq) = wrapping_timer2((1 << 6) | (1 << 7));
-        assert_eq!(timers.read(T2_MODE, 0, &mut irq) & (1 << 10), 1 << 10);
-        timers.read(T2_COUNT, 100, &mut irq);
-        assert_eq!(timers.read(T2_MODE, 100, &mut irq) & (1 << 10), 0);
-        timers.read(T2_COUNT, 200, &mut irq);
-        assert_eq!(timers.read(T2_MODE, 200, &mut irq) & (1 << 10), 1 << 10);
+        assert_eq!(timers.read(T2_MODE, 0, NTSC, &mut irq) & (1 << 10), 1 << 10);
+        timers.read(T2_COUNT, 100, NTSC, &mut irq);
+        assert_eq!(timers.read(T2_MODE, 100, NTSC, &mut irq) & (1 << 10), 0);
+        timers.read(T2_COUNT, 200, NTSC, &mut irq);
+        assert_eq!(
+            timers.read(T2_MODE, 200, NTSC, &mut irq) & (1 << 10),
+            1 << 10
+        );
     }
 
     #[test]
     fn pulse_mode_leaves_the_request_bit_set() {
         let (mut timers, mut irq) = wrapping_timer2(1 << 6);
-        timers.read(T2_COUNT, 100, &mut irq);
-        assert_eq!(timers.read(T2_MODE, 100, &mut irq) & (1 << 10), 1 << 10);
+        timers.read(T2_COUNT, 100, NTSC, &mut irq);
+        assert_eq!(
+            timers.read(T2_MODE, 100, NTSC, &mut irq) & (1 << 10),
+            1 << 10
+        );
+    }
+
+    #[test]
+    fn a_pal_field_runs_at_the_pal_refresh_rate() {
+        let hz = crate::CPU_CLOCK_HZ as f64 / PAL.cycles_per_frame() as f64;
+        assert!((hz - 49.76).abs() < 0.05, "{hz} Hz");
+        let hz = crate::CPU_CLOCK_HZ as f64 / NTSC.cycles_per_frame() as f64;
+        assert!((hz - 59.83).abs() < 0.05, "{hz} Hz");
+    }
+
+    #[test]
+    fn blanking_phase_follows_the_field_origin() {
+        let mut timers = Timers::new();
+        let mut irq = Irq::default();
+        // A field boundary that is not a multiple of the field length, as a
+        // switch between regions leaves behind
+        let origin = 12_345;
+        timers.set_frame_origin(origin);
+        let mode = 1 | (1 << 1); // sync enabled, reset at the vblank edge
+        timers.write(T1_MODE, mode, origin, PAL, &mut irq);
+        let past_edge = 100;
+        let now = origin + PAL.cycles_per_frame() + past_edge;
+        assert_eq!(timers.read(T1_COUNT, now, PAL, &mut irq), past_edge as u32);
     }
 
     #[test]
@@ -404,9 +443,9 @@ mod tests {
         let mut timers = Timers::new();
         let mut irq = Irq::default();
         // Sync mode 0 (pause during hblank), IRQ on target
-        timers.write(T0_MODE, 1 | (1 << 4), 0, &mut irq);
-        timers.write(T0_COUNT + 8, 100, 0, &mut irq);
-        timers.sync_all(1000, &mut irq);
+        timers.write(T0_MODE, 1 | (1 << 4), 0, NTSC, &mut irq);
+        timers.write(T0_COUNT + 8, 100, 0, NTSC, &mut irq);
+        timers.sync_all(1000, NTSC, &mut irq);
         assert_eq!(irq.stat & (1 << 4), 1 << 4);
     }
 }
