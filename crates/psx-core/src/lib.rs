@@ -22,8 +22,8 @@ use tracing::info;
 
 /// CPU clock: 33.8688 MHz.
 pub const CPU_CLOCK_HZ: u64 = 33_868_800;
-/// NTSC field: 263 scanlines.
-pub const CYCLES_PER_FRAME: u64 = timers::CYCLES_PER_LINE * 263;
+/// NTSC field, in CPU cycles.
+pub const CYCLES_PER_FRAME: u64 = timers::CYCLES_PER_LINE * timers::LINES_PER_FRAME;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct PsxSystem {
@@ -38,7 +38,7 @@ pub struct PsxSystem {
 /// Save-state file magic + format version. Bump the version on any change
 /// to a serialized struct.
 const STATE_MAGIC: &[u8; 4] = b"PS1E";
-const STATE_VERSION: u16 = 3;
+const STATE_VERSION: u16 = 4;
 
 /// Cheap content fingerprint (FNV-1a) to flag cross-BIOS state loads.
 fn bios_fingerprint(bios: &[u8]) -> u32 {
