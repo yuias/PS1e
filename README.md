@@ -37,9 +37,11 @@ fullscreen and the debug panels — CPU registers, the TTY console, the VRAM
 viewer and the GPU command log — all of which start hidden. Audio holds the
 master volume, and Help lists the current key bindings.
 
-"Open disc..." picks a disc image at runtime. Opening one resets the
-machine: the drive's shell-open event is not modeled, so a running game
-would never notice a swap.
+"Insert disc..." swaps the disc the way the console does: the drive opens,
+the file picker comes up, and the drive closes on whatever was picked —
+cancelling puts the old disc back. Emulation never stops, so this works
+mid-game, and from the BIOS menu the console boots the disc on its own,
+just as it does on hardware.
 
 | Keys | |
 |---|---|
@@ -161,6 +163,8 @@ psxctl frame shot.bmp         # dump the current display frame
 psxctl vram vram.bmp          # dump the full 1024x512 VRAM
 psxctl peek 801ffc38 64       # hex dump memory (side-effect-free)
 psxctl poke 80100000 deadbeef # write RAM
+psxctl disc open              # open the drive lid
+psxctl disc close game.cue    # close it on a new image (or bare: the old one)
 psxctl tty                    # TTY output since the last call
 psxctl savestate s.sst        # snapshot; loadstate restores it
 psxctl state                  # pc, cycles, frames, held buttons, display

@@ -112,26 +112,29 @@ impl App {
         }
     }
 
-    /// Pick a disc image and reset into it, keeping the failure visible in the
+    /// Swap the disc the way the console does it: lid open, pick, lid shut.
+    /// The emulator keeps running throughout — the picker is up for exactly
+    /// as long as the drive is open, which is the window a game watches for.
+    /// Cancelling or picking an unreadable image just shuts the lid again on
+    /// the disc that was already in there; the failure stays visible in the
     /// status bar until the next pick succeeds.
     fn open_disc(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
+        self.emu.send(Command::OpenShell);
+        let picked = rfd::FileDialog::new()
             .add_filter("PlayStation disc image", &["cue", "bin", "img"])
-            .pick_file()
-        else {
-            return;
-        };
-        match disc::load_disc(&path) {
+            .pick_file();
+        let disc = picked.and_then(|path| match disc::load_disc(&path) {
             Ok(d) => {
                 self.disc_error = None;
-                self.emu.send(Command::InsertDisc(d));
-                self.emu.send(Command::Reset);
+                Some(d)
             }
             Err(e) => {
                 tracing::error!("{e}");
                 self.disc_error = Some(e);
+                None
             }
-        }
+        });
+        self.emu.send(Command::CloseShell(disc));
     }
 
     /// Dump the currently displayed frame to a timestamped BMP in the working
@@ -181,15 +184,21 @@ impl App {
                             self.emu.send(Command::Step);
                             ui.close();
                         }
-                        if ui.button("Reset").clicked() {
+                        if ui
+                            .button("Hardware reset")
+                            .on_hover_text(
+                                "power-cycle the console; the disc and memory card stay in",
+                            )
+                            .clicked()
+                        {
                             self.emu.send(Command::Reset);
                             ui.close();
                         }
                         ui.separator();
                         if ui
-                            .button("Open disc...")
+                            .button("Insert disc...")
                             .on_hover_text(
-                                "load a disc image and reset; mid-game disc swaps are not modeled",
+                                "opens the drive and closes it on the new image; swapping mid-game works, no reset needed",
                             )
                             .clicked()
                         {

@@ -251,6 +251,24 @@ impl Controller {
                 }
                 Reply::ok(format!("wrote {} bytes", bytes.len()))
             }
+            // Disc swap, split into the two halves a real drive has, so a
+            // script can leave the lid open across several `run`s and watch
+            // how the game reacts before the new disc goes in.
+            ("disc", ["open"]) => {
+                sys.open_shell();
+                Reply::ok("drive open")
+            }
+            ("disc", ["close"]) => {
+                sys.close_shell(None);
+                Reply::ok("drive closed")
+            }
+            ("disc", ["close", path]) => match crate::disc::load_disc(std::path::Path::new(path)) {
+                Ok(d) => {
+                    sys.close_shell(Some(d));
+                    Reply::ok(format!("drive closed on {path}"))
+                }
+                Err(e) => Reply::err(e),
+            },
             ("tty", _) => {
                 let all = sys.tty_output();
                 let new = all[self.tty_read.min(all.len())..].to_string();
@@ -312,6 +330,8 @@ frame <path>          dump the latched display frame as BMP
 vram <path>           dump full 1024x512 VRAM as BMP
 peek <hexaddr> <len>  hex dump memory (side-effect-free, MMIO shows --)
 poke <hexaddr> <hex>  write bytes to RAM/scratchpad
+disc open             open the drive lid (stops the drive, flags shell open)
+disc close [path]     close the lid, on a new image if given, else the old one
 tty                   TTY output accumulated since the last `tty`
 savestate <path>      snapshot the full machine state to a file
 loadstate <path>      restore a snapshot (BIOS/disc/memcard carry over)

@@ -24,10 +24,13 @@ pub enum Command {
     SetRunning(bool),
     Step,
     Reset,
-    /// Swap the disc in the drive. Followed by a Reset in practice: the
-    /// drive's shell-open event is not modeled, so a running game would
-    /// never notice the swap.
-    InsertDisc(psx_core::cdrom::Disc),
+    /// Open the drive lid. The drive stops and reports the shell as open
+    /// until a [`Command::CloseShell`] follows.
+    OpenShell,
+    /// Close the lid, optionally over a new disc (`None` puts the current
+    /// one back). A running game sees the swap through the drive status,
+    /// so this needs no reset.
+    CloseShell(Option<psx_core::cdrom::Disc>),
     SaveState,
     LoadState,
     SetGpuLog(bool),
@@ -245,11 +248,13 @@ impl Worker {
                     self.sys.bus.cdrom.set_disc(disc);
                     self.sys.bus.sio.memcard = memcard;
                 }
-                Command::InsertDisc(disc) if !debugger_active => self.sys.insert_disc(disc),
+                Command::OpenShell if !debugger_active => self.sys.open_shell(),
+                Command::CloseShell(disc) if !debugger_active => self.sys.close_shell(disc),
                 Command::SetRunning(_)
                 | Command::Step
                 | Command::Reset
-                | Command::InsertDisc(_) => {}
+                | Command::OpenShell
+                | Command::CloseShell(_) => {}
                 Command::SaveState => match self.sys.save_state() {
                     Ok(data) => match std::fs::write(&self.cfg.state_path, &data) {
                         Ok(()) => {
