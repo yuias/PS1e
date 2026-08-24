@@ -127,7 +127,8 @@ mod stat {
 
 /// Error byte of the unsolicited INT5 raised when the lid opens.
 const ERR_DOOR_OPENED: u8 = 0x08;
-/// Error byte for commands the drive cannot service with the lid open.
+/// Error byte for commands the drive cannot service without a disc it
+/// can reach: the lid is open, or the drive is empty.
 const ERR_NOT_READY: u8 = 0x80;
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -719,12 +720,15 @@ impl Cdrom {
         self.response.clear();
         debug!(target: "psx_core::cdrom", "cmd {cmd:#04x} {params:02x?}");
         let st = self.stat_byte();
-        // With the lid open everything that needs the disc fails; the
-        // command set that still answers is what a game polls to find out
-        // when the drive is usable again (psx-spx: error 80h).
-        if self.shell_open
-            && matches!(cmd, 0x02..=0x09 | 0x0b..=0x0d | 0x10..=0x16 | 0x1a | 0x1b | 0x1d)
-        {
+        // Without a disc the drive can reach — lid open, or nothing loaded
+        // — there is no TOC to lock onto, so everything needing one fails
+        // (psx-spx: error 80h on 02h..09h, 0Bh..0Dh, 10h..16h, 1Ah, 1Bh, 1Dh).
+        // The command set that still answers is what a game polls to find out
+        // when the drive becomes usable. GetID is the exception once the lid
+        // is shut: an empty drive reports "no disc" instead of failing.
+        let needs_disc = matches!(cmd, 0x02..=0x09 | 0x0b..=0x0d | 0x10..=0x16 | 0x1b | 0x1d)
+            || (cmd == 0x1a && self.shell_open);
+        if needs_disc && (self.shell_open || self.disc.is_none()) {
             self.push_int(now, ACK_DELAY, 5, vec![st | stat::ERROR, ERR_NOT_READY]);
             return;
         }
@@ -1037,6 +1041,28 @@ mod tests {
         assert_eq!(resp, vec![0x11, ERR_NOT_READY]);
     }
 
+    /// A boot path that probes the drive by reading, rather than by GetID,
+    /// gets an error instead of silence — without one it waits forever.
+    #[test]
+    fn empty_drive_fails_the_commands_that_need_a_disc() {
+        // ReadN, SeekL, Setloc: one from each range of the psx-spx list
+        for cmd in [0x06u8, 0x15, 0x02] {
+            let mut cd = Cdrom::new();
+            let mut irq = Irq::default();
+            cd.int_enable = 0x1f;
+            cd.write8(1, cmd, 0);
+            cd.write8(0, 1, 0);
+            let (int, resp) = acked(&mut cd, &mut irq, ACK_DELAY + 1);
+            assert_eq!(int, 5, "cmd {cmd:#04x}");
+            assert_eq!(
+                resp,
+                vec![stat::MOTOR_ON | stat::ERROR, ERR_NOT_READY],
+                "cmd {cmd:#04x}"
+            );
+            assert!(!cd.reading, "cmd {cmd:#04x} started the sector pump");
+        }
+    }
+
     /// Opening the lid stops the drive but leaves the disc in it, so a
     /// cancelled swap resumes on the same image.
     #[test]
@@ -1063,6 +1089,9 @@ mod tests {
         assert!(irq.stat & (1 << 2) != 0);
     }
 
+    /// GetID is the one disc-requiring command an empty drive answers with
+    /// the lid shut: a shell tells "no disc" from "drive unusable" by it, so
+    /// the empty-drive gate must not swallow it.
     #[test]
     fn getid_without_disc_reports_int5() {
         let mut cd = Cdrom::new();
@@ -1074,7 +1103,7 @@ mod tests {
         assert_eq!(int, 3);
         let (int, resp) = acked(&mut cd, &mut irq, ACK_DELAY + COMPLETE_DELAY + 2);
         assert_eq!(int, 5);
-        assert_eq!(resp[0], 0x08);
+        assert_eq!(resp[..2], [0x08, 0x40]);
     }
 
     #[test]
