@@ -11,6 +11,10 @@
 //!
 //! Seek and pause latencies model the mechanics coarsely (distance-based),
 //! so boot/loading pacing resembles real hardware.
+//!
+//! The drive lid is modeled too ([`Cdrom::open_shell`] /
+//! [`Cdrom::close_shell`]), which is what makes a disc swap observable: the
+//! disc itself never changes under a running game, the lid does.
 
 use crate::bus::Irq;
 use std::collections::VecDeque;
@@ -114,10 +118,17 @@ impl Disc {
 
 /// Drive status byte bits.
 mod stat {
+    pub const ERROR: u8 = 1 << 0;
     pub const MOTOR_ON: u8 = 1 << 1;
+    pub const SHELL_OPEN: u8 = 1 << 4;
     pub const READING: u8 = 1 << 5;
     pub const PLAYING: u8 = 1 << 7;
 }
+
+/// Error byte of the unsolicited INT5 raised when the lid opens.
+const ERR_DOOR_OPENED: u8 = 0x08;
+/// Error byte for commands the drive cannot service with the lid open.
+const ERR_NOT_READY: u8 = 0x80;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Cdrom {
@@ -141,6 +152,12 @@ pub struct Cdrom {
     /// bank without ever calling Setfilter.
     xa_latch: Option<(u8, u8)>,
     motor_on: bool,
+    /// The lid is physically open right now.
+    shell_open: bool,
+    /// Sticky "is/was open" half of stat bit 4. Only Getstat clears it, and
+    /// only once the lid is shut again — that latch is how a game polling
+    /// Getstat learns a swap happened instead of missing the event entirely.
+    shell_latched: bool,
     reading: bool,
     /// CD-DA playback (Play command) is active.
     playing: bool,
@@ -201,6 +218,8 @@ impl Cdrom {
             filter_channel: 0,
             xa_latch: None,
             motor_on: true,
+            shell_open: false,
+            shell_latched: false,
             reading: false,
             playing: false,
             play_track: 0,
@@ -242,10 +261,49 @@ impl Cdrom {
         self.disc = Some(disc);
     }
 
+    /// Open the drive lid. The disc stays in the drive — what a game
+    /// observes is the lid, not the platter: the spindle stops, an
+    /// unsolicited INT5 fires and stat bit 4 goes up. Queued command
+    /// responses are dropped; on hardware the error pre-empts them.
+    pub fn open_shell(&mut self, now: u64) {
+        if self.shell_open {
+            return;
+        }
+        debug!(target: "psx_core::cdrom", "shell opened");
+        self.shell_open = true;
+        self.shell_latched = true;
+        self.motor_on = false;
+        self.reading = false;
+        self.playing = false;
+        self.xa_out.clear();
+        self.pending.clear();
+        let st = self.stat_byte() | stat::ERROR;
+        self.push_int(now, ACK_DELAY, 5, vec![st, ERR_DOOR_OPENED]);
+    }
+
+    /// Close the lid, optionally over a different disc (`None` puts the
+    /// current one back, which is what a cancelled swap does). The motor
+    /// spins back up; stat bit 4 stays set until the game's next Getstat,
+    /// which is the edge it swaps on.
+    pub fn close_shell(&mut self, disc: Option<Disc>) {
+        if let Some(disc) = disc {
+            self.insert_disc(disc);
+        }
+        debug!(target: "psx_core::cdrom", "shell closed");
+        self.shell_open = false;
+        self.motor_on = true;
+        // The sled parks at the lead-in while the lid is open, so the first
+        // seek after a swap pays full travel time.
+        self.head_lba = 0;
+    }
+
     fn stat_byte(&self) -> u8 {
         let mut s = 0;
         if self.motor_on {
             s |= stat::MOTOR_ON;
+        }
+        if self.shell_open || self.shell_latched {
+            s |= stat::SHELL_OPEN;
         }
         if self.reading {
             s |= stat::READING;
@@ -661,8 +719,22 @@ impl Cdrom {
         self.response.clear();
         debug!(target: "psx_core::cdrom", "cmd {cmd:#04x} {params:02x?}");
         let st = self.stat_byte();
+        // With the lid open everything that needs the disc fails; the
+        // command set that still answers is what a game polls to find out
+        // when the drive is usable again (psx-spx: error 80h).
+        if self.shell_open
+            && matches!(cmd, 0x02..=0x09 | 0x0b..=0x0d | 0x10..=0x16 | 0x1a | 0x1b | 0x1d)
+        {
+            self.push_int(now, ACK_DELAY, 5, vec![st | stat::ERROR, ERR_NOT_READY]);
+            return;
+        }
         match cmd {
-            0x01 => self.push_int(now, ACK_DELAY, 3, vec![st]), // Getstat
+            0x01 => {
+                // Getstat, alias Nop. Uniquely among the commands it clears
+                // the sticky shell-open flag, once the lid is shut.
+                self.shell_latched &= self.shell_open;
+                self.push_int(now, ACK_DELAY, 3, vec![st]);
+            }
             0x02 => {
                 // Setloc(mm, ss, ff) in BCD
                 if params.len() >= 3 {
@@ -911,6 +983,71 @@ mod tests {
         let resp: Vec<u8> = cd.response.iter().copied().collect();
         cd.write8(3, 0x1f, now); // ack (index must be 1)
         (int, resp)
+    }
+
+    /// A swap is observed entirely through stat bit 4: it goes up when the
+    /// lid opens, survives the lid closing, and only a Getstat clears it.
+    #[test]
+    fn shell_open_latches_until_getstat_with_the_lid_shut() {
+        let mut cd = Cdrom::new();
+        let mut irq = Irq::default();
+        cd.int_enable = 0x1f;
+
+        cd.write8(0, 1, 0); // index 1: the flag register `acked` writes
+        cd.open_shell(0);
+        // Unsolicited INT5: stat with shell-open + error, "door became opened"
+        let (int, resp) = acked(&mut cd, &mut irq, ACK_DELAY);
+        assert_eq!(int, 5);
+        assert_eq!(resp, vec![stat::SHELL_OPEN | stat::ERROR, ERR_DOOR_OPENED]);
+
+        cd.close_shell(None);
+        assert!(
+            cd.stat_byte() & stat::SHELL_OPEN != 0,
+            "latch survives close"
+        );
+
+        // The Getstat that clears the latch still reports it, so the game
+        // sees the swap exactly once.
+        let now = ACK_DELAY * 2;
+        cd.write8(0, 0, now);
+        cd.write8(1, 0x01, now);
+        cd.write8(0, 1, now);
+        let (int, resp) = acked(&mut cd, &mut irq, now + ACK_DELAY);
+        assert_eq!(int, 3);
+        assert_eq!(resp, vec![stat::MOTOR_ON | stat::SHELL_OPEN]);
+        assert_eq!(cd.stat_byte(), stat::MOTOR_ON);
+    }
+
+    #[test]
+    fn getid_reports_the_door_open_error() {
+        let mut cd = Cdrom::new();
+        let mut irq = Irq::default();
+        cd.int_enable = 0x1f;
+        cd.insert_disc(Disc::new(vec![0; RAW_SECTOR]).unwrap());
+        cd.write8(0, 1, 0); // index 1: the flag register `acked` writes
+        cd.open_shell(0);
+        acked(&mut cd, &mut irq, ACK_DELAY); // the lid-open INT5
+
+        let now = ACK_DELAY * 2;
+        cd.write8(0, 0, now);
+        cd.write8(1, 0x1a, now);
+        cd.write8(0, 1, now);
+        let (int, resp) = acked(&mut cd, &mut irq, now + ACK_DELAY);
+        assert_eq!(int, 5);
+        assert_eq!(resp, vec![0x11, ERR_NOT_READY]);
+    }
+
+    /// Opening the lid stops the drive but leaves the disc in it, so a
+    /// cancelled swap resumes on the same image.
+    #[test]
+    fn closing_without_a_disc_keeps_the_old_one() {
+        let mut cd = Cdrom::new();
+        cd.insert_disc(Disc::new(vec![0; RAW_SECTOR * 4]).unwrap());
+        cd.open_shell(0);
+        assert!(!cd.motor_on && cd.disc.is_some());
+        cd.close_shell(None);
+        assert!(cd.motor_on);
+        assert_eq!(cd.disc.as_ref().unwrap().sector_count(), 4);
     }
 
     #[test]

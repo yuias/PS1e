@@ -40,7 +40,7 @@ pub struct PsxSystem {
 /// Save-state file magic + format version. Bump the version on any change
 /// to a serialized struct.
 const STATE_MAGIC: &[u8; 4] = b"PS1E";
-const STATE_VERSION: u16 = 6;
+const STATE_VERSION: u16 = 7;
 
 /// Cheap content fingerprint (FNV-1a) to flag cross-BIOS state loads.
 fn bios_fingerprint(bios: &[u8]) -> u32 {
@@ -115,6 +115,19 @@ impl PsxSystem {
 
     pub fn insert_disc(&mut self, disc: cdrom::Disc) {
         self.bus.cdrom.insert_disc(disc);
+    }
+
+    /// Open the drive lid, stopping the drive and flagging the shell as
+    /// open. Pair with [`PsxSystem::close_shell`] to swap a disc while a
+    /// game runs — resetting instead would defeat the point.
+    pub fn open_shell(&mut self) {
+        self.bus.cdrom.open_shell(self.cycles);
+    }
+
+    /// Close the lid, optionally over a new disc (`None` keeps the current
+    /// one, e.g. when the user cancels the picker).
+    pub fn close_shell(&mut self, disc: Option<cdrom::Disc>) {
+        self.bus.cdrom.close_shell(disc);
     }
 
     /// Update controller state (bits per [`sio::button`], set = pressed).
