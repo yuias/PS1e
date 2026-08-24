@@ -1,8 +1,9 @@
 # PS1e
 
 A PlayStation 1 emulator written in Rust. Software-rasterized GPU, SPU with
-reverb and XA audio, CD-ROM with mechanical timing, GTE, memory cards, an
-LLDB-compatible remote debugger, and a lockstep automation interface.
+reverb and XA audio, CD-ROM with mechanical timing, GTE, MDEC, memory
+cards, an LLDB-compatible remote debugger, and a lockstep automation
+interface.
 
 A PlayStation BIOS image (512 KiB, e.g. SCPH-1000) is required and not
 included.
@@ -21,8 +22,13 @@ Produces `ps1e` (emulator) and `psxctl` (automation client) in
 ## Run
 
 ```
-ps1e [--bios <path>] [--disc <image.bin|image.cue>]
+ps1e [--bios <path>] [--disc <image>]
 ```
+
+A disc image is either a `.cue` sheet or a raw image of 2352-byte sectors
+(`.bin`, `.img`); only the `.cue` extension is treated specially.
+2048-byte sector images are not supported — they would need sector
+reconstruction.
 
 Without `--disc`, the BIOS shell runs. The GUI shows the display, CPU
 registers, a VRAM viewer, and a TTY console, and can pick a disc image at
@@ -76,7 +82,7 @@ load_state = "F9"
 
 Key names are the ones egui reports: letters and digits as themselves
 (`"X"`, `"1"`), arrows as `"Up"`/`"Down"`/`"Left"`/`"Right"`, plus
-`"Enter"`, `"Backspace"`, `"Space"`, `"F1"`..`"F20"`. Omitted buttons keep
+`"Enter"`, `"Backspace"`, `"Space"`, `"F1"`..`"F35"`. Omitted buttons keep
 their defaults, and an unrecognized name falls back to the default with a
 warning in the log.
 
@@ -91,17 +97,18 @@ Gamepad names are the `gilrs::Button` variants: `"South"`, `"East"`,
 ps1e --headless [--cycles N] [--disc <image>] ...
 ```
 
-Runs without a window and prints a run summary (TTY output, pc, audio and
-CD statistics). Useful flags:
+Runs without a window and prints a run summary (TTY output, pc, frame
+count, audio and CD statistics). Useful flags:
 
 | Flag | |
 |---|---|
 | `--cycles N` | CPU cycles to run (default 30,000,000) |
-| `--input <file>` | Replay an input script: `<start-sec> <dur-sec> <BTN+BTN>` per line |
+| `--input <file>` | Replay an input script: `<start-sec> <dur-sec> <BTN+BTN>` per line, `#` comments |
 | `--mash-start` | Tap START/CROSS periodically to advance menus |
 | `--dump-frame <p>` / `--dump-vram <p>` | Write the display frame / full VRAM as BMP |
 | `--dump-wav <p>` | Write captured audio as WAV |
 | `--log-gpu` | Decode every GP0/GP1 command to the log |
+| `--peek <hex>` | Hex dump 96 bytes of RAM at the end of the run |
 
 ## Debugger (LLDB / GDB)
 
@@ -139,7 +146,9 @@ over TCP:
 psxctl run 20s                # advance (frames by default; s/c suffixes)
 psxctl press START 30         # hold buttons for 30 frames, then release
 psxctl input set UP           # hold until changed; applied during run
+psxctl input clear            # release everything held
 psxctl frame shot.bmp         # dump the current display frame
+psxctl vram vram.bmp          # dump the full 1024x512 VRAM
 psxctl peek 801ffc38 64       # hex dump memory (side-effect-free)
 psxctl poke 80100000 deadbeef # write RAM
 psxctl tty                    # TTY output since the last call
@@ -147,6 +156,8 @@ psxctl savestate s.sst        # snapshot; loadstate restores it
 psxctl state                  # pc, cycles, frames, held buttons, display
 psxctl quit
 ```
+
+`psxctl help` lists the full command set.
 
 A typical agent loop: `press`/`run` → `frame`/`peek`/`tty` → decide →
 repeat, with `savestate`/`loadstate` for branching exploration. The
@@ -171,4 +182,4 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## License
 
-To be decided.
+MIT. See [LICENSE](LICENSE).
