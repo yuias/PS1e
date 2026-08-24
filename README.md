@@ -30,9 +30,11 @@ A disc image is either a `.cue` sheet or a raw image of 2352-byte sectors
 2048-byte sector images are not supported — they would need sector
 reconstruction.
 
-Without `--disc`, the BIOS shell runs. The window shows the display, with
-a menu bar for run control and a status bar underneath. Emulation covers
-run/pause, step, reset, save/load state and screenshots; View toggles
+Without `--disc`, the BIOS shell runs. The machine starts running as soon
+as the window opens. The window shows the display, with a menu bar for run
+control and a status bar underneath. Emulation covers run/pause, step,
+hardware reset (a power cycle; the disc and memory card stay in, and the
+machine keeps running), save/load state and screenshots; View toggles
 fullscreen and the debug panels — CPU registers, the TTY console, the VRAM
 viewer and the GPU command log — all of which start hidden. Audio holds the
 master volume, and Help lists the current key bindings.

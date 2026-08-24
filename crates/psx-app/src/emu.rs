@@ -169,6 +169,7 @@ impl Worker {
         rx: mpsc::Receiver<Command>,
         ctx: eframe::egui::Context,
     ) -> Self {
+        let autostart = !cfg.wait_debugger;
         Self {
             sys,
             cfg,
@@ -176,7 +177,10 @@ impl Worker {
             rx,
             ctx,
             audio: None,
-            running: false,
+            // A configured BIOS is enough to boot, so start the machine
+            // instead of opening every session on a paused black screen.
+            // Only --wait-debugger deliberately holds at the reset vector.
+            running: autostart,
             debugger_seen: false,
             scratch: Vec::new(),
             published_frame: 0,
@@ -237,7 +241,6 @@ impl Worker {
                     self.sys.step();
                 }
                 Command::Reset if !debugger_active => {
-                    self.running = false;
                     // Ambient assets survive a reset: disc, memory card
                     // (mid-write contents included) and the log switch
                     let log = self.sys.bus.gpu.log_commands;
