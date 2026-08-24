@@ -30,11 +30,16 @@ A disc image is either a `.cue` sheet or a raw image of 2352-byte sectors
 2048-byte sector images are not supported — they would need sector
 reconstruction.
 
-Without `--disc`, the BIOS shell runs. The GUI shows the display, CPU
-registers, a VRAM viewer, and a TTY console, and can pick a disc image at
-runtime ("Open disc…"). Opening one resets the machine: the drive's
-shell-open event is not modeled, so a running game would never notice a
-swap.
+Without `--disc`, the BIOS shell runs. The window shows the display, with
+a menu bar for run control and a status bar underneath. Emulation covers
+run/pause, step, reset, save/load state and screenshots; View toggles
+fullscreen and the debug panels — CPU registers, the TTY console, the VRAM
+viewer and the GPU command log — all of which start hidden. Audio holds the
+master volume, and Help lists the current key bindings.
+
+"Open disc..." picks a disc image at runtime. Opening one resets the
+machine: the drive's shell-open event is not modeled, so a running game
+would never notice a swap.
 
 | Keys | |
 |---|---|
@@ -43,14 +48,19 @@ swap.
 | W / R / E / U | L1 / R1 / L2 / R2 |
 | V / C | Start / Select |
 | F5 / F9 | Save / load state |
+| F11 / F12 | Fullscreen (Esc leaves) / screenshot |
 
 A gamepad, if one is connected, drives the same pad in parallel with the
 keyboard: face buttons to Cross/Circle/Square/Triangle, shoulders and
 triggers to L1/R1/L2/R2, D-pad and Start/Select as labelled. Analog
 sticks do nothing yet — the emulated controller is a digital pad.
 
-All of these are rebindable; see the `[keys]`, `[pad]` and `[hotkeys]`
-tables under [Configuration](#configuration).
+The pad and the save/load hotkeys are rebindable; see the `[keys]`, `[pad]`
+and `[hotkeys]` tables under [Configuration](#configuration). Fullscreen
+and screenshot are fixed.
+
+A screenshot writes the displayed frame as `screenshot_<epoch>.bmp` in the
+working directory, the same encoding as headless `--dump-frame`.
 
 Save states snapshot the full machine to `state0.sst` next to the memory
 card image. The BIOS, disc image and memory card are not part of a state

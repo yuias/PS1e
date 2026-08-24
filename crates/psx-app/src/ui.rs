@@ -7,7 +7,7 @@
 use crate::config;
 use crate::config::Config;
 use crate::disc;
-use crate::emu::{Command, DebuggerState, Emu, FrameSnapshot};
+use crate::emu::{Command, DebuggerState, Emu, FrameSnapshot, Status};
 use crate::gamepad::Gamepad;
 use eframe::egui;
 use std::path::PathBuf;
@@ -39,10 +39,20 @@ const REG_NAMES: [&str; 32] = [
     "t8", "t9", "k0", "k1", "gp", "sp", "fp", "ra",
 ];
 
+/// Pad button names, index-aligned with [`config::KeyBindings::pairs`], for
+/// listing the configured bindings in the Help menu.
+const BUTTON_NAMES: [&str; 14] = [
+    "up", "down", "left", "right", "cross", "circle", "square", "triangle", "L1", "R1", "L2", "R2",
+    "start", "select",
+];
+
 pub struct App {
     emu: Emu,
     show_vram: bool,
     vram_as_24bit: bool,
+    show_regs: bool,
+    show_tty: bool,
+    fullscreen: bool,
     display_tex: Option<egui::TextureHandle>,
     vram_tex: Option<egui::TextureHandle>,
     /// Vblank count of the frame currently uploaded to `display_tex`.
@@ -60,6 +70,8 @@ pub struct App {
     gamepad: Option<Gamepad>,
     /// Last failed disc pick, shown until the next one succeeds.
     disc_error: Option<String>,
+    /// Path of the most recent screenshot, shown in the status bar.
+    last_screenshot: Option<String>,
 }
 
 impl App {
@@ -81,6 +93,9 @@ impl App {
             emu,
             show_vram: false,
             vram_as_24bit: false,
+            show_regs: false,
+            show_tty: false,
+            fullscreen: false,
             display_tex: None,
             vram_tex: None,
             shown_frame: 0,
@@ -93,7 +108,189 @@ impl App {
             hotkey_load,
             gamepad,
             disc_error: None,
+            last_screenshot: None,
         }
+    }
+
+    /// Pick a disc image and reset into it, keeping the failure visible in the
+    /// status bar until the next pick succeeds.
+    fn open_disc(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("PlayStation disc image", &["cue", "bin", "img"])
+            .pick_file()
+        else {
+            return;
+        };
+        match disc::load_disc(&path) {
+            Ok(d) => {
+                self.disc_error = None;
+                self.emu.send(Command::InsertDisc(d));
+                self.emu.send(Command::Reset);
+            }
+            Err(e) => {
+                tracing::error!("{e}");
+                self.disc_error = Some(e);
+            }
+        }
+    }
+
+    /// Dump the currently displayed frame to a timestamped BMP in the working
+    /// directory, mirroring the headless `--dump-frame` writer.
+    fn take_screenshot(&mut self) {
+        let frame = self.emu.shared.frame.lock().unwrap();
+        if frame.width == 0 || frame.height == 0 {
+            tracing::warn!("no frame to screenshot yet");
+            return;
+        }
+        let epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let path = format!("screenshot_{epoch}.bmp");
+        let written = crate::write_frame_bmp(
+            &path,
+            frame.width,
+            frame.height,
+            frame.stride,
+            frame.is_24bit,
+            &frame.pixels,
+        );
+        drop(frame);
+        match written {
+            Ok(()) => {
+                tracing::info!("screenshot written to {path}");
+                self.last_screenshot = Some(path);
+            }
+            Err(e) => tracing::error!("screenshot failed: {e}"),
+        }
+    }
+
+    /// Menu bar: every command the shell offers, grouped by what it acts on.
+    fn menu_bar(&mut self, ctx: &egui::Context, running: bool, debugger_active: bool) {
+        egui::TopBottomPanel::top("menu").show(ctx, |ui| {
+            egui::MenuBar::new().ui(ui, |ui| {
+                ui.menu_button("Emulation", |ui| {
+                    // The debugger owns run control while attached.
+                    ui.add_enabled_ui(!debugger_active, |ui| {
+                        let label = if running { "Pause" } else { "Run" };
+                        if ui.button(label).clicked() {
+                            self.emu.send(Command::SetRunning(!running));
+                            ui.close();
+                        }
+                        if ui.button("Step").clicked() {
+                            self.emu.send(Command::Step);
+                            ui.close();
+                        }
+                        if ui.button("Reset").clicked() {
+                            self.emu.send(Command::Reset);
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui
+                            .button("Open disc...")
+                            .on_hover_text(
+                                "load a disc image and reset; mid-game disc swaps are not modeled",
+                            )
+                            .clicked()
+                        {
+                            self.open_disc();
+                            ui.close();
+                        }
+                        ui.separator();
+                        let save_key = self.config.hotkeys.save_state.clone();
+                        if ui.button(format!("Save state\t{save_key}")).clicked() {
+                            self.emu.send(Command::SaveState);
+                            ui.close();
+                        }
+                        let load_key = self.config.hotkeys.load_state.clone();
+                        if ui.button(format!("Load state\t{load_key}")).clicked() {
+                            self.emu.send(Command::LoadState);
+                            ui.close();
+                        }
+                    });
+                    ui.separator();
+                    if ui.button("Screenshot\tF12").clicked() {
+                        self.take_screenshot();
+                        ui.close();
+                    }
+                });
+                ui.menu_button("View", |ui| {
+                    if ui.button("Fullscreen\tF11").clicked() {
+                        self.fullscreen = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                        ui.close();
+                    }
+                    ui.separator();
+                    ui.checkbox(&mut self.show_regs, "Registers panel");
+                    ui.checkbox(&mut self.show_tty, "TTY panel");
+                    ui.checkbox(&mut self.show_vram, "VRAM viewer");
+                    ui.separator();
+                    if ui
+                        .checkbox(&mut self.gpu_log, "GPU cmd log")
+                        .on_hover_text("decode every GP0/GP1 command to the log (debug level)")
+                        .changed()
+                    {
+                        self.emu.send(Command::SetGpuLog(self.gpu_log));
+                    }
+                });
+                ui.menu_button("Audio", |ui| {
+                    ui.add(
+                        egui::Slider::new(&mut self.volume, 0.0..=1.0)
+                            .text("volume")
+                            .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+                    );
+                });
+                ui.menu_button("Help", |ui| {
+                    ui.label("Pad, as bound in the config file:");
+                    for (name, (key, _)) in BUTTON_NAMES.iter().zip(self.config.keys.pairs()) {
+                        ui.monospace(format!("{name:>8} = {key}"));
+                    }
+                    ui.separator();
+                    ui.monospace(format!("    save = {}", self.config.hotkeys.save_state));
+                    ui.monospace(format!("    load = {}", self.config.hotkeys.load_state));
+                    ui.separator();
+                    ui.label("F11 fullscreen (Esc leaves), F12 screenshot.");
+                });
+            });
+        });
+    }
+
+    /// Status bar: what the emulator is doing right now, plus the last
+    /// one-shot result worth reporting.
+    fn status_bar(&self, ctx: &egui::Context, status: &Status) {
+        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                let state = match status.debugger {
+                    DebuggerState::Halted => "debugger: halted",
+                    DebuggerState::Running => "debugger: running",
+                    DebuggerState::Waiting => "waiting for debugger",
+                    DebuggerState::None if status.running => "running",
+                    DebuggerState::None => "paused",
+                    _ => "debugger: listening",
+                };
+                ui.monospace(state);
+                ui.separator();
+                ui.monospace(format!(
+                    "pc {:#010x}   cycles {}   audio {:3} ms{}",
+                    status.pc,
+                    status.cycles,
+                    status.audio_buffered * 1000 / 44_100,
+                    if status.audio_underruns > 0 {
+                        format!("   underruns {}", status.audio_underruns)
+                    } else {
+                        String::new()
+                    }
+                ));
+                if let Some(path) = &self.last_screenshot {
+                    ui.separator();
+                    ui.monospace(format!("saved {path}"));
+                }
+                if let Some(err) = &self.disc_error {
+                    ui.separator();
+                    ui.colored_label(egui::Color32::LIGHT_RED, err);
+                }
+            });
+        });
     }
 }
 
@@ -205,140 +402,80 @@ impl eframe::App for App {
         if load {
             self.emu.send(Command::LoadState);
         }
+        if ctx.input(|i| i.key_pressed(egui::Key::F12)) {
+            self.take_screenshot();
+        }
 
-        egui::TopBottomPanel::top("controls").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                // The debugger owns run control while attached
-                ui.add_enabled_ui(!debugger_active, |ui| {
-                    let label = if status.running {
-                        "⏸ Pause"
-                    } else {
-                        "▶ Run"
-                    };
-                    if ui.button(label).clicked() {
-                        self.emu.send(Command::SetRunning(!status.running));
-                    }
-                    if ui.button("Step").clicked() {
-                        self.emu.send(Command::Step);
-                    }
-                    if ui.button("Reset").clicked() {
-                        self.emu.send(Command::Reset);
-                    }
-                    if ui
-                        .button("💿 Open disc…")
-                        .on_hover_text(
-                            "load a disc image and reset; mid-game disc swaps are not modeled",
-                        )
-                        .clicked()
-                        && let Some(path) = rfd::FileDialog::new()
-                            .add_filter("PlayStation disc image", &["cue", "bin", "img"])
-                            .pick_file()
-                    {
-                        match disc::load_disc(&path) {
-                            Ok(d) => {
-                                self.disc_error = None;
-                                self.emu.send(Command::InsertDisc(d));
-                                self.emu.send(Command::Reset);
-                            }
-                            Err(e) => {
-                                tracing::error!("{e}");
-                                self.disc_error = Some(e);
+        // F11 toggles fullscreen; the chrome (menu, status bar, panels) hides
+        // while fullscreen so only the display shows.
+        if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
+            self.fullscreen = !self.fullscreen;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+        }
+        if self.fullscreen && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.fullscreen = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+        }
+        let chrome = !self.fullscreen;
+
+        if chrome {
+            self.menu_bar(ctx, status.running, debugger_active);
+            self.status_bar(ctx, &status);
+        }
+
+        if chrome && self.show_regs {
+            egui::SidePanel::right("registers")
+                .default_width(220.0)
+                .show(ctx, |ui| {
+                    ui.heading("CPU");
+                    egui::Grid::new("regs").striped(true).show(ui, |ui| {
+                        for (i, name) in REG_NAMES.iter().enumerate() {
+                            ui.monospace(format!("{name:>4}"));
+                            ui.monospace(format!("{:08x}", status.regs[i]));
+                            if i % 2 == 1 {
+                                ui.end_row();
                             }
                         }
-                    }
-                    ui.separator();
-                    let save_key = &self.config.hotkeys.save_state;
-                    if ui.button(format!("💾 Save ({save_key})")).clicked() {
-                        self.emu.send(Command::SaveState);
-                    }
-                    let load_key = &self.config.hotkeys.load_state;
-                    if ui.button(format!("📂 Load ({load_key})")).clicked() {
-                        self.emu.send(Command::LoadState);
-                    }
-                });
-                if let Some(err) = &self.disc_error {
-                    ui.separator();
-                    ui.colored_label(egui::Color32::LIGHT_RED, err);
-                }
-                if status.debugger != DebuggerState::None {
-                    ui.separator();
-                    ui.label(match status.debugger {
-                        DebuggerState::Halted => "🔌 debugger: halted",
-                        DebuggerState::Running => "🔌 debugger: running",
-                        DebuggerState::Waiting => "🔌 waiting for debugger",
-                        _ => "🔌 debugger: listening",
+                        ui.monospace("  hi");
+                        ui.monospace(format!("{:08x}", status.hi));
+                        ui.monospace("  lo");
+                        ui.monospace(format!("{:08x}", status.lo));
+                        ui.end_row();
                     });
-                }
-                ui.separator();
-                ui.checkbox(&mut self.show_vram, "VRAM viewer");
-                if ui
-                    .checkbox(&mut self.gpu_log, "GPU cmd log")
-                    .on_hover_text("decode every GP0/GP1 command to the log (debug level)")
-                    .changed()
-                {
-                    self.emu.send(Command::SetGpuLog(self.gpu_log));
-                }
-                ui.separator();
-                ui.label("🔊");
-                ui.add(
-                    egui::Slider::new(&mut self.volume, 0.0..=1.0)
-                        .show_value(false)
-                        .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
-                );
-                ui.separator();
-                ui.monospace(format!(
-                    "pc {:#010x}   cycles {}   🔉{:3}ms{}",
-                    status.pc,
-                    status.cycles,
-                    status.audio_buffered * 1000 / 44_100,
-                    if status.audio_underruns > 0 {
-                        format!("   underruns {}", status.audio_underruns)
-                    } else {
-                        String::new()
-                    }
-                ));
-            });
-        });
+                });
+        }
 
-        egui::SidePanel::right("registers")
-            .default_width(220.0)
-            .show(ctx, |ui| {
-                ui.heading("CPU");
-                egui::Grid::new("regs").striped(true).show(ui, |ui| {
-                    for (i, name) in REG_NAMES.iter().enumerate() {
-                        ui.monospace(format!("{name:>4}"));
-                        ui.monospace(format!("{:08x}", status.regs[i]));
-                        if i % 2 == 1 {
-                            ui.end_row();
+        if chrome && self.show_tty {
+            egui::TopBottomPanel::bottom("tty")
+                .resizable(true)
+                .default_height(160.0)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.heading("TTY");
+                        if ui.button("Clear").clicked() {
+                            self.emu.shared.tty.lock().unwrap().clear();
                         }
-                    }
-                    ui.monospace("  hi");
-                    ui.monospace(format!("{:08x}", status.hi));
-                    ui.monospace("  lo");
-                    ui.monospace(format!("{:08x}", status.lo));
-                    ui.end_row();
-                });
-            });
-
-        egui::TopBottomPanel::bottom("tty")
-            .resizable(true)
-            .default_height(160.0)
-            .show(ctx, |ui| {
-                ui.heading("TTY");
-                egui::ScrollArea::vertical()
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        let tty = self.emu.shared.tty.lock().unwrap().clone();
-                        ui.add(
-                            egui::TextEdit::multiline(&mut tty.as_str())
-                                .font(egui::TextStyle::Monospace)
-                                .desired_width(f32::INFINITY)
-                                .interactive(false),
-                        );
                     });
-            });
+                    egui::ScrollArea::vertical()
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            let tty = self.emu.shared.tty.lock().unwrap().clone();
+                            ui.add(
+                                egui::TextEdit::multiline(&mut tty.as_str())
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(f32::INFINITY)
+                                    .interactive(false),
+                            );
+                        });
+                });
+        }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        let central = if self.fullscreen {
+            egui::CentralPanel::default().frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
+        } else {
+            egui::CentralPanel::default()
+        };
+        central.show(ctx, |ui| {
             let (enabled, image) = {
                 let frame = self.emu.shared.frame.lock().unwrap();
                 // Convert only when the worker published a new frame
@@ -391,11 +528,13 @@ impl eframe::App for App {
             });
         });
 
+        // Fullscreen shows the display alone, so stop paying for VRAM copies.
+        let want_vram = chrome && self.show_vram;
         self.emu
             .shared
             .vram_requested
-            .store(self.show_vram, Ordering::Relaxed);
-        if self.show_vram {
+            .store(want_vram, Ordering::Relaxed);
+        if want_vram {
             let vram = self.emu.shared.vram.lock().unwrap();
             if vram.len() == 1024 * 512 {
                 let image = vram_image(&vram, self.vram_as_24bit);
@@ -413,6 +552,7 @@ impl eframe::App for App {
                 };
                 egui::Window::new("VRAM (1024x512)")
                     .default_width(1024.0)
+                    .open(&mut self.show_vram)
                     .show(ctx, |ui| {
                         ui.checkbox(&mut self.vram_as_24bit, "interpret as 24-bit RGB");
                         ui.add(egui::Image::new(&tex));

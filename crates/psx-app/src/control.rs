@@ -262,8 +262,17 @@ impl Controller {
                 if frame.width == 0 || frame.height == 0 {
                     return Reply::err("no frame captured yet (run at least one frame)");
                 }
-                crate::write_frame_bmp(path, frame);
-                Reply::ok(format!("{}x{} -> {path}", frame.width, frame.height))
+                match crate::write_frame_bmp(
+                    path,
+                    frame.width,
+                    frame.height,
+                    frame.stride,
+                    frame.is_24bit,
+                    &frame.pixels,
+                ) {
+                    Ok(()) => Reply::ok(format!("{}x{} -> {path}", frame.width, frame.height)),
+                    Err(e) => Reply::err(format!("write {path}: {e}")),
+                }
             }
             ("vram", [path]) => {
                 crate::write_vram_bmp(path, &sys.bus.gpu.vram);

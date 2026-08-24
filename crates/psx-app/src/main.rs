@@ -441,7 +441,17 @@ fn finish_headless(sys: &mut PsxSystem, args: &Args, wav_samples: Vec<i16>) {
         if frame.width == 0 || frame.height == 0 {
             tracing::warn!("no frame captured yet; skipping --dump-frame");
         } else {
-            write_frame_bmp(path, frame);
+            if let Err(e) = write_frame_bmp(
+                path,
+                frame.width,
+                frame.height,
+                frame.stride,
+                frame.is_24bit,
+                &frame.pixels,
+            ) {
+                tracing::error!("frame dump to {path} failed: {e}");
+                return;
+            }
             tracing::info!(
                 "frame dumped to {path} ({}x{}{}{})",
                 frame.width,
@@ -479,14 +489,18 @@ fn write_wav(path: &str, samples: &[i16]) {
     std::fs::write(path, out).expect("failed to write WAV");
 }
 
-/// Dump the last vblank-latched display frame (what the TV shows) as a
-/// 24-bit BMP, decoding 15-bit or packed 24-bit rows as appropriate.
-fn write_frame_bmp(path: &str, frame: &psx_core::gpu::Frame) {
-    let (w, h, stride) = (
-        frame.width as usize,
-        frame.height as usize,
-        frame.stride as usize,
-    );
+/// Dump a vblank-latched display frame (what the TV shows) as a 24-bit BMP,
+/// decoding 15-bit or packed 24-bit rows as appropriate. Takes the geometry
+/// loose so the GUI can pass its own snapshot instead of a `gpu::Frame`.
+fn write_frame_bmp(
+    path: &str,
+    width: u32,
+    height: u32,
+    stride: u32,
+    is_24bit: bool,
+    pixels: &[u16],
+) -> std::io::Result<()> {
+    let (w, h, stride) = (width as usize, height as usize, stride as usize);
     let pad = (4 - (w * 3) % 4) % 4;
     let data_size = (w * 3 + pad) * h;
     let mut out = Vec::with_capacity(54 + data_size);
@@ -501,9 +515,9 @@ fn write_frame_bmp(path: &str, frame: &psx_core::gpu::Frame) {
     out.extend_from_slice(&24u16.to_le_bytes());
     out.extend_from_slice(&[0; 24]); // no compression, default resolution
     for y in (0..h).rev() {
-        let row = &frame.pixels[y * stride..(y + 1) * stride];
+        let row = &pixels[y * stride..(y + 1) * stride];
         for x in 0..w {
-            let (r, g, b) = if frame.is_24bit {
+            let (r, g, b) = if is_24bit {
                 let byte = x * 3;
                 let read = |b: usize| (row[(byte + b) / 2] >> (((byte + b) & 1) * 8)) as u8;
                 (read(0), read(1), read(2))
@@ -516,7 +530,7 @@ fn write_frame_bmp(path: &str, frame: &psx_core::gpu::Frame) {
         }
         out.extend_from_slice(&[0, 0, 0][..pad]);
     }
-    std::fs::write(path, out).expect("failed to write BMP");
+    std::fs::write(path, out)
 }
 
 /// Dump the full 1024x512 VRAM as a 24-bit BMP for offline inspection.
