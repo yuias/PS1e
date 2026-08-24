@@ -152,7 +152,7 @@ impl Controller {
         let args: Vec<&str> = words.collect();
         // The debugger and the control port must not both drive execution
         // (loadstate mutates it just as much as running does).
-        if debugger_owns && matches!(cmd, "run" | "press" | "reset" | "loadstate") {
+        if debugger_owns && matches!(cmd, "run" | "press" | "loadstate") {
             return Reply::err("debugger attached; execution is owned by the debugger");
         }
         match (cmd, args.as_slice()) {
