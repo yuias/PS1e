@@ -88,6 +88,11 @@ impl Cpu {
             return;
         }
 
+        if self.cop0.debug_enabled() && self.cop0.code_break(self.current_pc) {
+            self.debug_break();
+            return;
+        }
+
         let instr = bus.fetch32(self.pc);
         self.pc = self.next_pc;
         self.next_pc = self.next_pc.wrapping_add(4);
@@ -130,6 +135,17 @@ impl Cpu {
         self.next_pc = handler.wrapping_add(4);
     }
 
+    /// Take a COP0 breakpoint exception in place of the current instruction.
+    fn debug_break(&mut self) {
+        let handler = self
+            .cop0
+            .enter_debug_break(self.current_pc, self.in_delay_slot);
+        trace!(target: "psx_core::cpu",
+               "cop0 debug break at {:#010x} -> {handler:#010x}", self.current_pc);
+        self.pc = handler;
+        self.next_pc = handler.wrapping_add(4);
+    }
+
     fn branch_to(&mut self, target: u32) {
         self.next_pc = target;
     }
@@ -143,6 +159,18 @@ impl Cpu {
         let imm = instr & 0xffff;
         let imm_se = imm as i16 as i32 as u32; // sign-extended immediate
         let target = instr & 0x03ff_ffff;
+
+        // COP0 data breakpoints watch the effective address of every load
+        // and store; all of them address memory as rs+imm.
+        if self.cop0.debug_enabled()
+            && let Some(is_write) = data_access(op)
+            && self
+                .cop0
+                .data_break(self.regs[rs].wrapping_add(imm_se), is_write)
+        {
+            self.debug_break();
+            return;
+        }
 
         match op {
             0x00 => match instr & 0x3f {
@@ -522,6 +550,17 @@ impl Cpu {
     }
 }
 
+/// Whether `op` is a load or store, and if so whether it writes memory.
+/// The coprocessor loads/stores that raise CoprocessorUnusable never reach
+/// the bus, so they are not accesses.
+fn data_access(op: u32) -> Option<bool> {
+    match op {
+        0x20..=0x26 | 0x32 => Some(false),
+        0x28..=0x2b | 0x2e | 0x3a => Some(true),
+        _ => None,
+    }
+}
+
 impl Default for Cpu {
     fn default() -> Self {
         Self::new()
@@ -601,6 +640,92 @@ mod tests {
         assert_eq!(cpu.pc, 0xbfc0_0180);
         // ExcCode = 8 (Syscall)
         assert_eq!((cpu.cop0.cause >> 2) & 0x1f, 8);
+    }
+
+    /// DCIC r7 value enabling kernel-mode breaks with the given extra bits.
+    const fn dcic(extra: u32) -> u32 {
+        (1 << 23) | (1 << 29) | extra // DE | KD
+    }
+
+    /// Arm the program-counter breakpoint on `pc` with an exact-match mask.
+    fn arm_code_break(cpu: &mut Cpu, pc: u32, dcic_bits: u32) {
+        cpu.cop0.write(3, pc); // BPC
+        cpu.cop0.write(11, 0xffff_ffff); // BPCM
+        cpu.cop0.write(7, dcic_bits);
+    }
+
+    #[test]
+    fn code_breakpoint_traps_to_the_debug_vector() {
+        let (mut cpu, mut bus) = setup(&[0, 0]);
+        // PCE | TR
+        arm_code_break(&mut cpu, 0x8000_0004, dcic((1 << 24) | (1 << 31)));
+        cpu.step(&mut bus);
+        assert_eq!(cpu.pc, 0x8000_0004);
+        cpu.step(&mut bus);
+        // Its own vector, not the general 0x80000080 one
+        assert_eq!(cpu.pc, 0x8000_0040);
+        assert_eq!(cpu.cop0.epc, 0x8000_0004);
+        // ExcCode = 9, as for the BREAK opcode
+        assert_eq!((cpu.cop0.cause >> 2) & 0x1f, 9);
+    }
+
+    #[test]
+    fn code_breakpoint_without_trap_only_records_the_hit() {
+        let (mut cpu, mut bus) = setup(&[0, 0x2409_0001]); // nop; addiu $9, $0, 1
+        arm_code_break(&mut cpu, 0x8000_0004, dcic(1 << 24)); // PCE, no TR
+        cpu.step(&mut bus);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[9], 1, "execution must continue");
+        // DB | PC
+        assert_eq!(cpu.cop0.read(7) & 0b11, 0b11);
+    }
+
+    #[test]
+    fn code_breakpoint_stays_disarmed_for_the_other_privilege_level() {
+        let (mut cpu, mut bus) = setup(&[0, 0]);
+        // UD only, while SR.KUc says kernel mode
+        arm_code_break(
+            &mut cpu,
+            0x8000_0004,
+            (1 << 23) | (1 << 30) | (1 << 24) | (1 << 31),
+        );
+        cpu.step(&mut bus);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.pc, 0x8000_0008);
+    }
+
+    #[test]
+    fn data_breakpoint_traps_before_the_store_lands() {
+        let (mut cpu, mut bus) = setup(&[0xac08_0100]); // sw $8, 0x100($0)
+        cpu.regs[8] = 0x1234_5678;
+        cpu.cop0.write(5, 0x100); // BDA
+        cpu.cop0.write(9, 0xffff_ffff); // BDAM
+        // DAE | DW | TR
+        cpu.cop0.write(7, dcic((1 << 25) | (1 << 27) | (1 << 31)));
+        cpu.step(&mut bus);
+        assert_eq!(cpu.pc, 0x8000_0040);
+        assert_eq!(bus.read32(0x100), 0);
+        // DB | DA | W
+        assert_eq!(cpu.cop0.read(7) & 0b1_1101, 0b1_0101);
+    }
+
+    #[test]
+    fn data_breakpoint_ignores_the_direction_it_was_not_armed_for() {
+        let (mut cpu, mut bus) = setup(&[0xac08_0100]); // sw $8, 0x100($0)
+        cpu.regs[8] = 0x1234_5678;
+        cpu.cop0.write(5, 0x100);
+        cpu.cop0.write(9, 0xffff_ffff);
+        // DAE | DR | TR: reads only, so a store must pass through
+        cpu.cop0.write(7, dcic((1 << 25) | (1 << 26) | (1 << 31)));
+        cpu.step(&mut bus);
+        assert_eq!(bus.read32(0x100), 0x1234_5678);
+    }
+
+    #[test]
+    fn dcic_read_only_bits_stay_zero() {
+        let mut cop0 = Cop0::default();
+        cop0.write(7, 0xffff_ffff);
+        assert_eq!(cop0.read(7), 0xff80_f03f);
     }
 
     #[test]
