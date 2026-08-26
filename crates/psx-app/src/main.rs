@@ -148,9 +148,13 @@ fn main() -> eframe::Result {
         .unwrap_or_else(|e| panic!("failed to read BIOS '{}': {e}", bios_path.display()));
     let mut sys = PsxSystem::new(bios.clone()).expect("failed to create system");
     sys.bus.gpu.log_commands = args.log_gpu;
+    let mut disc_info = None;
     if let Some(path) = &args.disc {
         match disc::load_disc(std::path::Path::new(path)) {
-            Ok(d) => sys.insert_disc(d),
+            Ok((d, info)) => {
+                sys.insert_disc(d);
+                disc_info = Some(info);
+            }
             Err(e) => {
                 eprintln!("{e}");
                 std::process::exit(2);
@@ -224,7 +228,13 @@ fn main() -> eframe::Result {
                 log_gpu: args.log_gpu,
             };
             let emu = emu::spawn(sys, worker_cfg, cc.egui_ctx.clone());
-            Ok(Box::new(ui::App::new(emu, cfg, cfg_path, args.log_gpu)))
+            Ok(Box::new(ui::App::new(
+                emu,
+                cfg,
+                cfg_path,
+                args.log_gpu,
+                disc_info,
+            )))
         }),
     )
 }

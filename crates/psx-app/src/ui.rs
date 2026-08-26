@@ -7,6 +7,7 @@
 use crate::config;
 use crate::config::Config;
 use crate::disc;
+use crate::disc::DiscInfo;
 use crate::emu::{Command, DebuggerState, Emu, FrameSnapshot, Status};
 use crate::gamepad::Gamepad;
 use eframe::egui;
@@ -68,6 +69,11 @@ pub struct App {
     hotkey_load: Option<egui::Key>,
     /// Absent when no gamepad backend is available.
     gamepad: Option<Gamepad>,
+    /// The disc currently in the drive, `None` when it is empty.
+    disc: Option<DiscInfo>,
+    /// Set whenever `disc` changes, so the next frame retitles the window.
+    /// `App::new` has no `Context` yet, which is why this is not immediate.
+    title_dirty: bool,
     /// Last failed disc pick, shown until the next one succeeds.
     disc_error: Option<String>,
     /// Path of the most recent screenshot, shown in the status bar.
@@ -75,7 +81,13 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(emu: Emu, config: Config, config_path: Option<PathBuf>, log_gpu: bool) -> Self {
+    pub fn new(
+        emu: Emu,
+        config: Config,
+        config_path: Option<PathBuf>,
+        log_gpu: bool,
+        disc: Option<DiscInfo>,
+    ) -> Self {
         let volume = config.volume.clamp(0.0, 1.0);
         let keymap = resolve_keymap(&config.keys);
         let gamepad = Gamepad::new(&config.pad);
@@ -107,6 +119,8 @@ impl App {
             hotkey_save,
             hotkey_load,
             gamepad,
+            disc,
+            title_dirty: true,
             disc_error: None,
             last_screenshot: None,
         }
@@ -124,8 +138,10 @@ impl App {
             .add_filter("PlayStation disc image", &["cue", "bin", "img"])
             .pick_file();
         let disc = picked.and_then(|path| match disc::load_disc(&path) {
-            Ok(d) => {
+            Ok((d, info)) => {
                 self.disc_error = None;
+                self.disc = Some(info);
+                self.title_dirty = true;
                 Some(d)
             }
             Err(e) => {
@@ -135,6 +151,17 @@ impl App {
             }
         });
         self.emu.send(Command::CloseShell(disc));
+    }
+
+    /// Name the window after the disc, so several instances stay tellable
+    /// apart in the task switcher.
+    fn apply_window_title(&mut self, ctx: &egui::Context) {
+        self.title_dirty = false;
+        let title = match &self.disc {
+            Some(d) => format!("PS1e - {}", d.title),
+            None => "PS1e".to_string(),
+        };
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
     }
 
     /// Dump the currently displayed frame to a timestamped BMP in the working
@@ -278,6 +305,11 @@ impl App {
                     _ => "debugger: listening",
                 };
                 ui.monospace(state);
+                ui.separator();
+                match &self.disc {
+                    Some(d) => ui.monospace(&d.file),
+                    None => ui.weak("no disc"),
+                };
                 ui.separator();
                 ui.monospace(format!(
                     "pc {:#010x}   cycles {}   audio {:3} ms{}",
@@ -426,6 +458,9 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
         }
         let chrome = !self.fullscreen;
+        if self.title_dirty {
+            self.apply_window_title(ctx);
+        }
 
         if chrome {
             self.menu_bar(ctx, status.running, debugger_active);

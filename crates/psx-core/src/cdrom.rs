@@ -85,6 +85,19 @@ impl Disc {
         &self.tracks
     }
 
+    /// The 2048-byte user data of a data sector, for readers that want the
+    /// filesystem rather than the drive (the ISO9660 volume descriptors, for
+    /// one). Mode 1 keeps its data right after the header, mode 2 form 1
+    /// after the subheader; audio sectors have no such field.
+    pub fn user_data(&self, lba: u32) -> Option<&[u8]> {
+        let raw = self.sector(lba)?;
+        if self.track_at(lba).audio {
+            return None;
+        }
+        let ofs = if raw[0x0f] == 1 { 0x10 } else { 0x18 };
+        raw.get(ofs..ofs + 0x800)
+    }
+
     fn sector(&self, lba: u32) -> Option<&[u8]> {
         let ofs = lba as usize * RAW_SECTOR;
         self.data.get(ofs..ofs + RAW_SECTOR)

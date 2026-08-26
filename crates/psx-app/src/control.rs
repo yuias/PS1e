@@ -263,9 +263,9 @@ impl Controller {
                 Reply::ok("drive closed")
             }
             ("disc", ["close", path]) => match crate::disc::load_disc(std::path::Path::new(path)) {
-                Ok(d) => {
+                Ok((d, info)) => {
                     sys.close_shell(Some(d));
-                    Reply::ok(format!("drive closed on {path}"))
+                    Reply::ok(format!("drive closed on {} ({path})", info.title))
                 }
                 Err(e) => Reply::err(e),
             },

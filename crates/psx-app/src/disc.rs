@@ -7,9 +7,55 @@
 use psx_core::cdrom::Disc;
 use std::path::Path;
 
+/// What the frontend shows about the disc in the drive.
+#[derive(Clone, Debug)]
+pub struct DiscInfo {
+    /// File name of the image, for the status bar. The full path is too wide
+    /// for it, and the directory rarely identifies the disc.
+    pub file: String,
+    /// Best name the disc itself yields: its ISO9660 volume identifier, or
+    /// the file stem when the disc carries none.
+    pub title: String,
+}
+
 /// Load a disc image: a raw .bin (single data track), or a .cue sheet
-/// (multi-track, multi-file).
-pub fn load_disc(path: &Path) -> Result<Disc, String> {
+/// (multi-track, multi-file), together with the [`DiscInfo`] the UI names it
+/// by. The core never looks at that info.
+pub fn load_disc(path: &Path) -> Result<(Disc, DiscInfo), String> {
+    let disc = read_disc(path)?;
+    let lossy = |s: &std::ffi::OsStr| s.to_string_lossy().into_owned();
+    let file = path
+        .file_name()
+        .map_or_else(|| path.display().to_string(), lossy);
+    let title = volume_label(&disc)
+        .or_else(|| path.file_stem().map(lossy))
+        .unwrap_or_else(|| file.clone());
+    Ok((disc, DiscInfo { file, title }))
+}
+
+/// The ISO9660 volume identifier of the data track, or `None` when the disc
+/// has no primary volume descriptor (a pure audio disc) or leaves the field
+/// blank.
+///
+/// PS1 discs carry no human-readable game title anywhere, so this label — in
+/// practice the release serial, or the publisher's working name — is as close
+/// as the disc alone gets to one.
+fn volume_label(disc: &Disc) -> Option<String> {
+    // The PVD sits 16 sectors into the filesystem, i.e. past track 1's pregap.
+    let start = disc.tracks().first()?.start;
+    let pvd = disc.user_data(start + 16)?;
+    if pvd[0] != 1 || &pvd[1..6] != b"CD001" {
+        return None;
+    }
+    let label: String = pvd[40..72]
+        .iter()
+        .map(|&b| if b.is_ascii_graphic() { b as char } else { ' ' })
+        .collect();
+    let label = label.trim();
+    (!label.is_empty()).then(|| label.to_string())
+}
+
+fn read_disc(path: &Path) -> Result<Disc, String> {
     if path
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("cue"))
@@ -176,6 +222,36 @@ FILE "audio.bin" BINARY
         let cue = "FILE \"game.bin\" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n";
         let disc = parse_cue(cue, &dir).unwrap();
         assert_eq!(disc.tracks().len(), 1);
+    }
+
+    /// 17 mode-2 form-1 sectors with an ISO9660 PVD carrying `label`.
+    fn iso_image(label: &[u8]) -> Vec<u8> {
+        let mut img = vec![0u8; RAW_SECTOR * 17];
+        let pvd = 16 * RAW_SECTOR + 0x18;
+        img[16 * RAW_SECTOR + 0x0f] = 2; // mode 2
+        img[pvd] = 1; // primary volume descriptor
+        img[pvd + 1..pvd + 6].copy_from_slice(b"CD001");
+        img[pvd + 40..pvd + 72].fill(b' ');
+        img[pvd + 40..pvd + 40 + label.len()].copy_from_slice(label);
+        img
+    }
+
+    #[test]
+    fn volume_label_comes_from_the_primary_volume_descriptor() {
+        let disc = Disc::new(iso_image(b"SLUS_007.47")).unwrap();
+        assert_eq!(volume_label(&disc).as_deref(), Some("SLUS_007.47"));
+    }
+
+    #[test]
+    fn a_blank_volume_label_is_no_label() {
+        let disc = Disc::new(iso_image(b"")).unwrap();
+        assert_eq!(volume_label(&disc), None);
+    }
+
+    #[test]
+    fn a_disc_without_a_filesystem_has_no_label() {
+        let disc = Disc::new(vec![0u8; RAW_SECTOR * 17]).unwrap();
+        assert_eq!(volume_label(&disc), None);
     }
 
     #[test]
