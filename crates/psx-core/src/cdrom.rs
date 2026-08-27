@@ -24,9 +24,25 @@ use tracing::{debug, trace, warn};
 pub const RAW_SECTOR: usize = 2352;
 
 const CPU_HZ: u64 = 33_868_800;
-/// Rough latency between accepting a command and its first response.
-const ACK_DELAY: u64 = 25_000;
-/// Extra latency for the second response of two-phase commands.
+// First-response latencies, averaged from hardware measurements. The drive
+// answers most commands in the same time, and answers quicker while the
+// motor is stopped; Init and ReadTOC initialise the drive before replying.
+const ACK_RUNNING: u64 = 0x0000_c4e1;
+const ACK_STOPPED: u64 = 0x0000_5cf4;
+const ACK_INIT: u64 = 0x0001_3cce;
+
+// Second-response latencies, from the same measurements. Pause and Stop
+// both depend on the drive's state; Stop takes longer at double speed than
+// at single, as the motor has further to spin down.
+const GETID_DELAY: u64 = 0x0000_4a00;
+const PAUSE_SINGLE: u64 = 0x0021_181c;
+const PAUSE_DOUBLE: u64 = 0x0010_bd93;
+const PAUSE_PAUSED: u64 = 0x0000_1df2;
+const STOP_SINGLE: u64 = 0x00d3_8aca;
+const STOP_DOUBLE: u64 = 0x018a_6076;
+const STOP_STOPPED: u64 = 0x0000_1d7b;
+
+/// Second response of the commands whose duration has not been measured.
 const COMPLETE_DELAY: u64 = 120_000;
 
 const ADPCM_POS: [i32; 5] = [0, 60, 115, 98, 122];
@@ -292,7 +308,7 @@ impl Cdrom {
         self.xa_out.clear();
         self.pending.clear();
         let st = self.stat_byte() | stat::ERROR;
-        self.push_int(now, ACK_DELAY, 5, vec![st, ERR_DOOR_OPENED]);
+        self.push_int(now, self.ack_delay(), 5, vec![st, ERR_DOOR_OPENED]);
     }
 
     /// Close the lid, optionally over a different disc (`None` puts the
@@ -334,6 +350,17 @@ impl Cdrom {
             CPU_HZ / 150
         } else {
             CPU_HZ / 75
+        }
+    }
+
+    /// Latency before the first response. The drive's mainloop is quicker
+    /// to answer while the motor is stopped, since it has less maintenance
+    /// work to interleave.
+    fn ack_delay(&self) -> u64 {
+        if self.motor_on {
+            ACK_RUNNING
+        } else {
+            ACK_STOPPED
         }
     }
 
@@ -750,7 +777,12 @@ impl Cdrom {
         let needs_disc = matches!(cmd, 0x02..=0x09 | 0x0b..=0x0d | 0x10..=0x16 | 0x1b | 0x1d)
             || (cmd == 0x1a && self.shell_open);
         if needs_disc && (self.shell_open || self.disc.is_none()) {
-            self.push_int(now, ACK_DELAY, 5, vec![st | stat::ERROR, ERR_NOT_READY]);
+            self.push_int(
+                now,
+                self.ack_delay(),
+                5,
+                vec![st | stat::ERROR, ERR_NOT_READY],
+            );
             return;
         }
         match cmd {
@@ -758,7 +790,7 @@ impl Cdrom {
                 // Getstat, alias Nop. Uniquely among the commands it clears
                 // the sticky shell-open flag, once the lid is shut.
                 self.shell_latched &= self.shell_open;
-                self.push_int(now, ACK_DELAY, 3, vec![st]);
+                self.push_int(now, self.ack_delay(), 3, vec![st]);
             }
             0x02 => {
                 // Setloc(mm, ss, ff) in BCD
@@ -770,7 +802,7 @@ impl Cdrom {
                     );
                     self.seek_target = (mm * 60 + ss) * 75 + ff - 150;
                 }
-                self.push_int(now, ACK_DELAY, 3, vec![st]);
+                self.push_int(now, self.ack_delay(), 3, vec![st]);
             }
             0x03 => {
                 // Play(track?): CD-DA from the given track's start, or from
@@ -793,15 +825,15 @@ impl Cdrom {
                 self.play_track = self.disc.as_ref().map_or(1, |d| d.track_at(target).number);
                 self.report_in = 0;
                 self.xa_out.clear();
-                self.next_sector_at = now + ACK_DELAY + seek + self.sector_period();
+                self.next_sector_at = now + self.ack_delay() + seek + self.sector_period();
                 debug!(target: "psx_core::cdrom",
                        "Play track {} from LBA {target}", self.play_track);
-                self.push_int(now, ACK_DELAY, 3, vec![self.stat_byte()]);
+                self.push_int(now, self.ack_delay(), 3, vec![self.stat_byte()]);
             }
             0x07 => {
                 // MotorOn
                 self.motor_on = true;
-                self.push_int(now, ACK_DELAY, 3, vec![st]);
+                self.push_int(now, self.ack_delay(), 3, vec![st]);
                 self.push_int(now, COMPLETE_DELAY, 2, vec![self.stat_byte()]);
             }
             0x06 | 0x1b => {
@@ -818,28 +850,38 @@ impl Cdrom {
                 self.xa_prev = (0, 0);
                 self.xa_phase = 0;
                 self.xa_latch = None;
-                self.next_sector_at = now + ACK_DELAY + seek + self.sector_period();
+                self.next_sector_at = now + self.ack_delay() + seek + self.sector_period();
                 let st = self.stat_byte();
-                self.push_int(now, ACK_DELAY, 3, vec![st]);
+                self.push_int(now, self.ack_delay(), 3, vec![st]);
             }
             0x08 => {
                 // Stop
                 self.reading = false;
                 self.playing = false;
-                self.push_int(now, ACK_DELAY, 3, vec![self.stat_byte()]);
+                self.push_int(now, self.ack_delay(), 3, vec![self.stat_byte()]);
+                let spin_down = if !self.motor_on {
+                    STOP_STOPPED
+                } else if self.mode & 0x80 != 0 {
+                    STOP_DOUBLE
+                } else {
+                    STOP_SINGLE
+                };
                 self.motor_on = false;
-                self.push_int(now, CPU_HZ / 2, 2, vec![self.stat_byte()]);
+                self.push_int(now, spin_down, 2, vec![self.stat_byte()]);
             }
             0x09 => {
-                // Pause: ~70ms at single speed, half at double
-                self.push_int(now, ACK_DELAY, 3, vec![self.stat_byte()]);
+                // Pause: about five sectors' worth of time, unless the
+                // drive had already stopped delivering them
+                self.push_int(now, self.ack_delay(), 3, vec![self.stat_byte()]);
+                let pause = if !self.reading && !self.playing {
+                    PAUSE_PAUSED
+                } else if self.mode & 0x80 != 0 {
+                    PAUSE_DOUBLE
+                } else {
+                    PAUSE_SINGLE
+                };
                 self.reading = false;
                 self.playing = false;
-                let pause = if self.mode & 0x80 != 0 {
-                    CPU_HZ / 1000 * 35
-                } else {
-                    CPU_HZ / 1000 * 70
-                };
                 self.push_int(now, pause, 2, vec![self.stat_byte()]);
             }
             0x0a => {
@@ -849,7 +891,7 @@ impl Cdrom {
                 self.playing = false;
                 self.motor_on = true;
                 let st = self.stat_byte();
-                self.push_int(now, ACK_DELAY, 3, vec![st]);
+                self.push_int(now, ACK_INIT, 3, vec![st]);
                 self.push_int(now, COMPLETE_DELAY, 2, vec![st]);
             }
             0x0b => {
@@ -857,11 +899,11 @@ impl Cdrom {
                 // already decoded but not yet mixed
                 self.muted = true;
                 self.xa_out.clear();
-                self.push_int(now, ACK_DELAY, 3, vec![st]);
+                self.push_int(now, self.ack_delay(), 3, vec![st]);
             }
             0x0c => {
                 self.muted = false;
-                self.push_int(now, ACK_DELAY, 3, vec![st]);
+                self.push_int(now, self.ack_delay(), 3, vec![st]);
             }
             0x0d => {
                 // Setfilter(file, channel); also re-arms the implicit latch
@@ -870,20 +912,20 @@ impl Cdrom {
                     self.filter_channel = params[1];
                 }
                 self.xa_latch = None;
-                self.push_int(now, ACK_DELAY, 3, vec![st]);
+                self.push_int(now, self.ack_delay(), 3, vec![st]);
             }
             0x0e => {
                 // Setmode
                 if let Some(&m) = params.first() {
                     self.mode = m;
                 }
-                self.push_int(now, ACK_DELAY, 3, vec![st]);
+                self.push_int(now, self.ack_delay(), 3, vec![st]);
             }
             0x10 => {
                 // GetlocL: real header + subheader of the last read sector.
                 // The subheader matters: XA voice clips end with an
                 // EOF-flagged sector that games poll for here.
-                self.push_int(now, ACK_DELAY, 3, self.last_header.to_vec());
+                self.push_int(now, self.ack_delay(), 3, self.last_header.to_vec());
             }
             0x11 => {
                 // GetlocP: track, index, track-relative and absolute MSF
@@ -898,7 +940,7 @@ impl Cdrom {
                 let (amm, ass, aff) = lba_to_bcd_msf(self.read_lba);
                 self.push_int(
                     now,
-                    ACK_DELAY,
+                    self.ack_delay(),
                     3,
                     vec![to_bcd(track as u32), 0x01, mm, ss, ff, amm, ass, aff],
                 );
@@ -906,7 +948,12 @@ impl Cdrom {
             0x13 => {
                 // GetTN: first and last track number
                 let last = self.disc.as_ref().map_or(1, Disc::last_track);
-                self.push_int(now, ACK_DELAY, 3, vec![st, 0x01, to_bcd(last as u32)]);
+                self.push_int(
+                    now,
+                    self.ack_delay(),
+                    3,
+                    vec![st, 0x01, to_bcd(last as u32)],
+                );
             }
             0x14 => {
                 // GetTD: track start (0 = end-of-disc)
@@ -920,7 +967,7 @@ impl Cdrom {
                     None => 0,
                 };
                 let (mm, ss, _) = lba_to_bcd_msf(lba);
-                self.push_int(now, ACK_DELAY, 3, vec![st, mm, ss]);
+                self.push_int(now, self.ack_delay(), 3, vec![st, mm, ss]);
             }
             0x15 | 0x16 => {
                 // SeekL / SeekP with distance-based latency
@@ -928,43 +975,45 @@ impl Cdrom {
                 self.read_lba = self.seek_target;
                 self.head_lba = self.seek_target;
                 self.reading = false;
-                self.push_int(now, ACK_DELAY, 3, vec![st]);
+                self.push_int(now, self.ack_delay(), 3, vec![st]);
                 self.push_int(now, seek, 2, vec![self.stat_byte()]);
             }
             0x19 => {
                 // Test: only the BIOS-version sub-command is meaningful here
                 match params.first() {
-                    Some(0x20) => self.push_int(now, ACK_DELAY, 3, vec![0x94, 0x09, 0x19, 0xc0]),
+                    Some(0x20) => {
+                        self.push_int(now, self.ack_delay(), 3, vec![0x94, 0x09, 0x19, 0xc0])
+                    }
                     sub => {
                         warn!(target: "psx_core::cdrom", "Test sub-command {sub:02x?} stubbed");
-                        self.push_int(now, ACK_DELAY, 3, vec![st]);
+                        self.push_int(now, self.ack_delay(), 3, vec![st]);
                     }
                 }
             }
             0x1a => {
                 // GetID
-                self.push_int(now, ACK_DELAY, 3, vec![st]);
+                self.push_int(now, self.ack_delay(), 3, vec![st]);
                 if self.disc.is_some() {
                     // Licensed NTSC-J disc
                     self.push_int(
                         now,
-                        COMPLETE_DELAY,
+                        GETID_DELAY,
                         2,
                         vec![0x02, 0x00, 0x20, 0x00, b'S', b'C', b'E', b'I'],
                     );
                 } else {
                     // Door closed, no disc
-                    self.push_int(now, COMPLETE_DELAY, 5, vec![0x08, 0x40, 0, 0, 0, 0, 0, 0]);
+                    self.push_int(now, GETID_DELAY, 5, vec![0x08, 0x40, 0, 0, 0, 0, 0, 0]);
                 }
             }
             0x1e => {
-                // ReadTOC: a full TOC scan takes about a second
-                self.push_int(now, ACK_DELAY, 3, vec![st]);
+                // ReadTOC: initialises like Init, then scans the whole TOC
+                self.push_int(now, ACK_INIT, 3, vec![st]);
                 self.push_int(now, CPU_HZ, 2, vec![self.stat_byte()]);
             }
             _ => {
                 warn!(target: "psx_core::cdrom", "unknown command {cmd:#04x}");
-                self.push_int(now, ACK_DELAY, 5, vec![0x11, 0x40]);
+                self.push_int(now, self.ack_delay(), 5, vec![0x11, 0x40]);
             }
         }
     }
@@ -1010,6 +1059,53 @@ mod tests {
         (int, resp)
     }
 
+    /// Issue `cmd` with no parameters at `now`.
+    fn command(cd: &mut Cdrom, cmd: u8, now: u64) {
+        cd.write8(0, 0, now);
+        cd.write8(1, cmd, now);
+        cd.write8(0, 1, now);
+    }
+
+    /// Pause and Stop both answer far quicker when the drive has nothing to
+    /// wind down, which is the difference the flat latency used to hide.
+    /// Responses chain, so a second response lands one ack later.
+    #[test]
+    fn second_response_follows_the_drive_state() {
+        let mut cd = Cdrom::new();
+        let mut irq = Irq::default();
+        cd.int_enable = 0x1f;
+        cd.insert_disc(Disc::new(vec![0; RAW_SECTOR * 4]).unwrap());
+
+        // Pausing a running read waits about five sectors...
+        cd.reading = true;
+        command(&mut cd, 0x09, 0);
+        acked(&mut cd, &mut irq, ACK_RUNNING + 1);
+        let settled = ACK_RUNNING + PAUSE_SINGLE;
+        assert_eq!(acked(&mut cd, &mut irq, settled - 1).0, 0, "not yet");
+        assert_eq!(acked(&mut cd, &mut irq, settled).0, 2, "pause completed");
+
+        // ...whereas pausing an idle drive returns almost at once.
+        let t0 = settled + 1;
+        command(&mut cd, 0x09, t0);
+        acked(&mut cd, &mut irq, t0 + ACK_RUNNING);
+        let quick = t0 + ACK_RUNNING + PAUSE_PAUSED;
+        assert_eq!(acked(&mut cd, &mut irq, quick).0, 2, "already paused");
+    }
+
+    /// The first response is quicker while the motor is stopped.
+    #[test]
+    fn first_response_follows_the_motor() {
+        let mut cd = Cdrom::new();
+        let mut irq = Irq::default();
+        cd.int_enable = 0x1f;
+        cd.insert_disc(Disc::new(vec![0; RAW_SECTOR]).unwrap());
+        assert_eq!(cd.ack_delay(), ACK_RUNNING);
+
+        command(&mut cd, 0x08, 0); // Stop
+        acked(&mut cd, &mut irq, ACK_RUNNING);
+        assert_eq!(cd.ack_delay(), ACK_STOPPED);
+    }
+
     /// A swap is observed entirely through stat bit 4: it goes up when the
     /// lid opens, survives the lid closing, and only a Getstat clears it.
     #[test]
@@ -1021,7 +1117,7 @@ mod tests {
         cd.write8(0, 1, 0); // index 1: the flag register `acked` writes
         cd.open_shell(0);
         // Unsolicited INT5: stat with shell-open + error, "door became opened"
-        let (int, resp) = acked(&mut cd, &mut irq, ACK_DELAY);
+        let (int, resp) = acked(&mut cd, &mut irq, ACK_RUNNING);
         assert_eq!(int, 5);
         assert_eq!(resp, vec![stat::SHELL_OPEN | stat::ERROR, ERR_DOOR_OPENED]);
 
@@ -1033,11 +1129,11 @@ mod tests {
 
         // The Getstat that clears the latch still reports it, so the game
         // sees the swap exactly once.
-        let now = ACK_DELAY * 2;
+        let now = ACK_RUNNING * 2;
         cd.write8(0, 0, now);
         cd.write8(1, 0x01, now);
         cd.write8(0, 1, now);
-        let (int, resp) = acked(&mut cd, &mut irq, now + ACK_DELAY);
+        let (int, resp) = acked(&mut cd, &mut irq, now + ACK_RUNNING);
         assert_eq!(int, 3);
         assert_eq!(resp, vec![stat::MOTOR_ON | stat::SHELL_OPEN]);
         assert_eq!(cd.stat_byte(), stat::MOTOR_ON);
@@ -1051,13 +1147,13 @@ mod tests {
         cd.insert_disc(Disc::new(vec![0; RAW_SECTOR]).unwrap());
         cd.write8(0, 1, 0); // index 1: the flag register `acked` writes
         cd.open_shell(0);
-        acked(&mut cd, &mut irq, ACK_DELAY); // the lid-open INT5
+        acked(&mut cd, &mut irq, ACK_RUNNING); // the lid-open INT5
 
-        let now = ACK_DELAY * 2;
+        let now = ACK_RUNNING * 2;
         cd.write8(0, 0, now);
         cd.write8(1, 0x1a, now);
         cd.write8(0, 1, now);
-        let (int, resp) = acked(&mut cd, &mut irq, now + ACK_DELAY);
+        let (int, resp) = acked(&mut cd, &mut irq, now + ACK_RUNNING);
         assert_eq!(int, 5);
         assert_eq!(resp, vec![0x11, ERR_NOT_READY]);
     }
@@ -1073,7 +1169,7 @@ mod tests {
             cd.int_enable = 0x1f;
             cd.write8(1, cmd, 0);
             cd.write8(0, 1, 0);
-            let (int, resp) = acked(&mut cd, &mut irq, ACK_DELAY + 1);
+            let (int, resp) = acked(&mut cd, &mut irq, ACK_RUNNING + 1);
             assert_eq!(int, 5, "cmd {cmd:#04x}");
             assert_eq!(
                 resp,
@@ -1098,11 +1194,11 @@ mod tests {
         cd.write8(2, 0x00, 0);
         cd.write8(1, 0x02, 0);
         cd.write8(0, 1, 0);
-        acked(&mut cd, &mut irq, ACK_DELAY + 1);
+        acked(&mut cd, &mut irq, ACK_RUNNING + 1);
         cd.write8(0, 0, 0);
         cd.write8(1, 0x06, 100_000);
         cd.write8(0, 1, 0);
-        let mut now = 100_000 + ACK_DELAY + 1;
+        let mut now = 100_000 + ACK_RUNNING + 1;
         assert_eq!(acked(&mut cd, &mut irq, now).0, 3);
 
         let mut ints = Vec::new();
@@ -1134,7 +1230,7 @@ mod tests {
         cd.int_enable = 0x1f;
         cd.write8(1, 0x01, 0); // Getstat (index 0)
         cd.write8(0, 1, 0); // switch to index 1 for the flag register
-        let (int, resp) = acked(&mut cd, &mut irq, ACK_DELAY + 1);
+        let (int, resp) = acked(&mut cd, &mut irq, ACK_RUNNING + 1);
         assert_eq!(int, 3);
         assert_eq!(resp, vec![stat::MOTOR_ON]);
         assert!(irq.stat & (1 << 2) != 0);
@@ -1150,9 +1246,9 @@ mod tests {
         cd.int_enable = 0x1f;
         cd.write8(1, 0x1a, 0);
         cd.write8(0, 1, 0);
-        let (int, _) = acked(&mut cd, &mut irq, ACK_DELAY + 1);
+        let (int, _) = acked(&mut cd, &mut irq, ACK_RUNNING + 1);
         assert_eq!(int, 3);
-        let (int, resp) = acked(&mut cd, &mut irq, ACK_DELAY + COMPLETE_DELAY + 2);
+        let (int, resp) = acked(&mut cd, &mut irq, ACK_RUNNING + COMPLETE_DELAY + 2);
         assert_eq!(int, 5);
         assert_eq!(resp[..2], [0x08, 0x40]);
     }
@@ -1172,16 +1268,16 @@ mod tests {
         cd.write8(2, 0x00, 0);
         cd.write8(1, 0x02, 0);
         cd.write8(0, 1, 0);
-        let (int, _) = acked(&mut cd, &mut irq, ACK_DELAY + 1);
+        let (int, _) = acked(&mut cd, &mut irq, ACK_RUNNING + 1);
         assert_eq!(int, 3);
         cd.write8(0, 0, 0);
         cd.write8(1, 0x06, 100_000); // ReadN
         cd.write8(0, 1, 0);
-        let t = 100_000 + ACK_DELAY + 1;
+        let t = 100_000 + ACK_RUNNING + 1;
         let (int, _) = acked(&mut cd, &mut irq, t);
         assert_eq!(int, 3);
         // Includes the implicit-seek latency before the first sector
-        let t = t + cd.seek_cycles(0) + CPU_HZ / 75 + ACK_DELAY + 1;
+        let t = t + cd.seek_cycles(0) + CPU_HZ / 75 + ACK_RUNNING + 1;
         let (int, _) = acked(&mut cd, &mut irq, t);
         assert_eq!(int, 1); // first sector announced
         cd.write8(0, 0, 0);
@@ -1204,18 +1300,18 @@ mod tests {
         cd.write8(2, 0xc0, 0);
         cd.write8(1, 0x0e, 0); // Setmode XA
         cd.write8(0, 1, 0);
-        acked(&mut cd, &mut irq, ACK_DELAY + 1);
+        acked(&mut cd, &mut irq, ACK_RUNNING + 1);
         cd.write8(0, 0, 0);
         cd.write8(1, 0x06, 0); // ReadN LBA 0
         cd.write8(0, 1, 0);
-        let t = ACK_DELAY + 2;
+        let t = ACK_RUNNING + 2;
         acked(&mut cd, &mut irq, t);
-        let t = t + cd.seek_cycles(0) + CPU_HZ / 150 + ACK_DELAY;
+        let t = t + cd.seek_cycles(0) + CPU_HZ / 150 + ACK_RUNNING;
         cd.tick(t, &mut irq); // XA sector consumed silently
         cd.write8(0, 0, 0);
         cd.write8(1, 0x10, t); // GetlocL
         cd.write8(0, 1, 0);
-        let (int, resp) = acked(&mut cd, &mut irq, t + ACK_DELAY + 1);
+        let (int, resp) = acked(&mut cd, &mut irq, t + ACK_RUNNING + 1);
         assert_eq!(int, 3);
         assert_eq!(resp, vec![0x00, 0x02, 0x00, 0x00, 2, 1, 0xc4, 0x00]);
     }
@@ -1238,12 +1334,12 @@ mod tests {
         cd.write8(2, 0xe0, 0); // double speed + XA + whole sector, filter OFF
         cd.write8(1, 0x0e, 0);
         cd.write8(0, 1, 0);
-        acked(&mut cd, &mut irq, ACK_DELAY + 1);
+        acked(&mut cd, &mut irq, ACK_RUNNING + 1);
         cd.write8(0, 0, 0);
         cd.write8(1, 0x1b, 0); // ReadS from LBA 0 (first sector: file 1)
         cd.write8(0, 1, 0);
-        acked(&mut cd, &mut irq, ACK_DELAY + 1);
-        let mut now = ACK_DELAY + 2;
+        acked(&mut cd, &mut irq, ACK_RUNNING + 1);
+        let mut now = ACK_RUNNING + 2;
         // Drain aggressively so back-pressure never holds
         for _ in 0..2_000_000 {
             now += 768;
@@ -1273,14 +1369,14 @@ mod tests {
         cd.write8(2, 0xc0, 0); // double speed + XA
         cd.write8(1, 0x0e, 0);
         cd.write8(0, 1, 0);
-        acked(&mut cd, &mut irq, ACK_DELAY + 1);
+        acked(&mut cd, &mut irq, ACK_RUNNING + 1);
         cd.write8(0, 0, 0);
         cd.write8(1, 0x06, 0); // ReadN from LBA 0
         cd.write8(0, 1, 0);
-        acked(&mut cd, &mut irq, ACK_DELAY + 1);
+        acked(&mut cd, &mut irq, ACK_RUNNING + 1);
 
         // Drain like the SPU: 1 frame per 768 cycles
-        let mut now = ACK_DELAY + 2;
+        let mut now = ACK_RUNNING + 2;
         let mut consumed = 0u64;
         // Mono 37800 sector -> 4704 output frames; 20 sectors ~ 2.1s audio
         for _ in 0..150_000_000u64 / 768 {
@@ -1326,11 +1422,11 @@ mod tests {
         cd.write8(2, 0x02, 0); // Play(track 2, BCD)
         cd.write8(1, 0x03, 0);
         cd.write8(0, 1, 0);
-        let (int, _) = acked(&mut cd, &mut irq, ACK_DELAY + 1);
+        let (int, _) = acked(&mut cd, &mut irq, ACK_RUNNING + 1);
         assert_eq!(int, 3);
         assert!(cd.stat_byte() & stat::PLAYING != 0);
 
-        let mut now = ACK_DELAY + 2;
+        let mut now = ACK_RUNNING + 2;
         let mut first = None;
         for _ in 0..10_000_000u64 / 768 {
             now += 768;
@@ -1353,14 +1449,14 @@ mod tests {
         cd.write8(2, 0x02, 0); // Setmode: auto-pause
         cd.write8(1, 0x0e, 0);
         cd.write8(0, 1, 0);
-        acked(&mut cd, &mut irq, ACK_DELAY + 1);
+        acked(&mut cd, &mut irq, ACK_RUNNING + 1);
         cd.write8(0, 0, 0);
         cd.write8(2, 0x02, 0);
         cd.write8(1, 0x03, 0); // Play(track 2)
         cd.write8(0, 1, 0);
-        acked(&mut cd, &mut irq, 2 * ACK_DELAY + 2);
+        acked(&mut cd, &mut irq, 2 * ACK_RUNNING + 2);
 
-        let mut now = 2 * ACK_DELAY + 3;
+        let mut now = 2 * ACK_RUNNING + 3;
         let mut frames = 0u64;
         let mut int4 = false;
         for _ in 0..200_000_000u64 / 768 {
@@ -1387,20 +1483,20 @@ mod tests {
         cd.insert_disc(multitrack_disc());
         cd.write8(1, 0x13, 0); // GetTN
         cd.write8(0, 1, 0);
-        let (int, resp) = acked(&mut cd, &mut irq, ACK_DELAY + 1);
+        let (int, resp) = acked(&mut cd, &mut irq, ACK_RUNNING + 1);
         assert_eq!(int, 3);
         assert_eq!(&resp[1..], &[0x01, 0x03]);
         cd.write8(0, 0, 0);
         cd.write8(2, 0x02, 0); // GetTD(2): LBA 75 -> absolute 00:03
         cd.write8(1, 0x14, 0);
         cd.write8(0, 1, 0);
-        let (_, resp) = acked(&mut cd, &mut irq, 2 * ACK_DELAY + 2);
+        let (_, resp) = acked(&mut cd, &mut irq, 2 * ACK_RUNNING + 2);
         assert_eq!(&resp[1..], &[0x00, 0x03]);
         cd.write8(0, 0, 0);
         cd.write8(2, 0x00, 0); // GetTD(0): end of disc, 225 -> 00:05
         cd.write8(1, 0x14, 0);
         cd.write8(0, 1, 0);
-        let (_, resp) = acked(&mut cd, &mut irq, 3 * ACK_DELAY + 3);
+        let (_, resp) = acked(&mut cd, &mut irq, 3 * ACK_RUNNING + 3);
         assert_eq!(&resp[1..], &[0x00, 0x05]);
     }
 
@@ -1419,14 +1515,14 @@ mod tests {
         cd.write8(2, 0xc0, 0); // Setmode: double speed + XA enable
         cd.write8(1, 0x0e, 0);
         cd.write8(0, 1, 0);
-        acked(&mut cd, &mut irq, ACK_DELAY + 1);
+        acked(&mut cd, &mut irq, ACK_RUNNING + 1);
         cd.write8(0, 0, 0);
         cd.write8(1, 0x06, 200_000); // ReadN from LBA 0
         cd.write8(0, 1, 0);
-        let t = 200_000 + ACK_DELAY + 1;
+        let t = 200_000 + ACK_RUNNING + 1;
         let (int, _) = acked(&mut cd, &mut irq, t);
         assert_eq!(int, 3);
-        let t = t + cd.seek_cycles(0) + CPU_HZ / 150 + ACK_DELAY + 1;
+        let t = t + cd.seek_cycles(0) + CPU_HZ / 150 + ACK_RUNNING + 1;
         let (int, _) = acked(&mut cd, &mut irq, t);
         assert_eq!(int, 0, "XA sector must not raise INT1");
         // 18 groups * 8 units * 28 samples = 2016 stereo frames at 37800 Hz

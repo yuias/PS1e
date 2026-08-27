@@ -118,9 +118,12 @@ slightly earlier than on real hardware (observed with SLPS-01770).
   back at intervals, so a cache-resident loop is charged more here than it
   costs on the console. Channel priority and the chopping windows are not
   modeled at all.
-- The CD-ROM applies one flat acknowledge latency to every command. Mechanical
-  seek latency is modeled; the per-command differences (Init and GetID are far
-  slower on hardware) are not.
+- CD-ROM command latencies follow the measured averages, including the ones
+  that depend on drive state (Pause and Stop are far quicker with nothing to
+  wind down, and the drive acknowledges sooner while the motor is stopped).
+  Seek time is still a coarse distance model rather than the drive's own
+  coarse/fine stepping, and the second responses of Init and ReadTOC are
+  guesses — hardware figures for those have not been published.
 - GPU draw commands complete instantly. GPUSTAT's ready flags are pinned to
   ready and there is no FIFO depth, so nothing ever sees the GPU busy.
 - GTE operations complete in zero cycles, so COP2 result latency is invisible
