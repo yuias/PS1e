@@ -18,7 +18,7 @@ use std::path::PathBuf;
 /// Where the BIOS hands control to the executable it has loaded.
 const SHELL_ENTRY: u32 = 0x8003_0000;
 /// Cycles allowed for the BIOS to reach the shell. A retail image gets there
-/// in under 60 million; anything far beyond that is not going to arrive.
+/// in about 80 million; anything far beyond that is not going to arrive.
 const BOOT_CAP: u64 = 200_000_000;
 /// Cycles per observation chunk while a test executable runs.
 const CHUNK: u64 = 2_000_000;

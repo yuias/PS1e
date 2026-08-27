@@ -100,10 +100,16 @@ logging (MMIO trace, TTY, PC history) is the primary bring-up tool for it.
 Timing. These are one cluster: together they let control reach the game
 slightly earlier than on real hardware (observed with SLPS-01770).
 
-- CPU wait states are a coarse per-region approximation (`bus::read_penalty`):
-  one figure per address range, stores treated as free because the write
-  queue is not modeled, and the I-cache modeled as an unconditional hit for
-  cached segments — there are no cache lines and so no misses.
+- Read timing matches the figures measured on hardware per region, and for
+  the external bus follows the delay registers the BIOS programs. Still
+  missing: the load shadow (a slow load partly overlaps the instructions
+  after it, so a load with independent work behind it costs about 3 cycles
+  rather than the full 5), and the DRAM refresh collisions that push main
+  RAM a little above its nominal 7 cycles.
+- The I-cache is modeled as an unconditional hit for cached segments: there
+  are no cache lines, so no misses and no line fills.
+- Stores cost only their issue cycle. The write queue is not modeled, so a
+  full queue never stalls the CPU.
 - The multiplier and divider retire instantly; nothing stalls on HI/LO.
 - DMA transfers complete instantly on the CHCR start bit; no per-word bus
   timing, no CPU stalling.

@@ -16,6 +16,77 @@ use crate::timers::Timers;
 use tracing::{debug, trace, warn};
 
 pub const RAM_SIZE: usize = 2 * 1024 * 1024;
+
+/// `mem_ctrl` slots holding a delay/size register, in [`Bus::access`] order.
+const ACCESS_REGS: [usize; 5] = [2, 4, 5, 6, 7];
+const EXP1: usize = 0;
+const BIOS: usize = 1;
+const SPU: usize = 2;
+const CDROM: usize = 3;
+const EXP2: usize = 4;
+/// `mem_ctrl` slot of COM_DELAY (0x1f801020).
+const COM_DELAY_IDX: usize = 8;
+/// Reset value of a delay/size register: the slowest read and write the
+/// hardware offers, over an 8-bit bus. The BIOS speeds them up immediately.
+const DELAY_RESET: u32 = 0x0000_00ff;
+
+/// What one access to a region behind the external bus costs, derived from
+/// its delay/size register and COM_DELAY.
+#[derive(Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+struct AccessCost {
+    /// Cycles for the first access of a transfer.
+    first: u64,
+    /// Cycles for each further access, when the bus is narrower than the
+    /// transfer and the CPU has to repeat it.
+    seq: u64,
+    /// Bytes moved per bus access: 1 for an 8-bit bus, 2 for a 16-bit one.
+    bus_bytes: u32,
+}
+
+impl AccessCost {
+    /// The psx-spx access-time formula. `delay` is a delay/size register,
+    /// `com` is COM_DELAY; only COM0, COM2 and COM3 take part.
+    fn derive(delay: u32, com: u32) -> Self {
+        let (com0, com2, com3) = (com & 0xf, (com >> 8) & 0xf, (com >> 12) & 0xf);
+        // Read delay, 0..0Fh encoding 1..16 cycles.
+        let access = ((delay >> 4) & 0xf) + 1;
+
+        let (mut first, mut seq, mut min) = (0, 0, 0);
+        if delay & (1 << 8) != 0 {
+            // Recovery period
+            first += com0.saturating_sub(1);
+            seq += com0.saturating_sub(1);
+        }
+        if delay & (1 << 10) != 0 {
+            // Floating period
+            first += com2;
+            seq += com2;
+        }
+        if delay & (1 << 11) != 0 {
+            // Pre-strobe period sets a floor rather than an offset.
+            min = com3;
+        }
+        if first < 6 {
+            first += 1;
+        }
+        first = (first + access + 2).max(min + 6);
+        seq = (seq + access + 2).max(min + 2);
+
+        Self {
+            first: first as u64,
+            seq: seq as u64,
+            bus_bytes: if delay & (1 << 12) != 0 { 2 } else { 1 },
+        }
+    }
+
+    /// Cycles for a transfer of `width` bytes. A transfer wider than the bus
+    /// is split into repeated accesses with !CS held active throughout.
+    fn cycles(&self, width: u32) -> u64 {
+        let accesses = width.div_ceil(self.bus_bytes) as u64;
+        self.first + self.seq * (accesses - 1)
+    }
+}
+
 pub const BIOS_SIZE: usize = 512 * 1024;
 pub const SCRATCHPAD_SIZE: usize = 1024;
 
@@ -82,6 +153,9 @@ pub struct Bus {
     /// SIO1 (serial port) registers 0x1f801050..0x1f801060, stored raw
     /// (stub: nothing connected).
     sio1_regs: [u32; 4],
+    /// Access costs derived from `mem_ctrl`, kept in step with it by
+    /// [`Bus::refresh_access`].
+    access: [AccessCost; 5],
 }
 
 impl Bus {
@@ -92,7 +166,11 @@ impl Bus {
                 bios.len()
             ));
         }
-        Ok(Self {
+        let mut mem_ctrl = [0; 9];
+        for reg in ACCESS_REGS {
+            mem_ctrl[reg] = DELAY_RESET;
+        }
+        let mut bus = Self {
             ram: vec![0; RAM_SIZE].into_boxed_slice(),
             scratchpad: vec![0; SCRATCHPAD_SIZE].into_boxed_slice(),
             bios: bios.into_boxed_slice(),
@@ -106,11 +184,14 @@ impl Bus {
             mdec: Mdec::new(),
             now: 0,
             penalty: 0,
-            mem_ctrl: [0; 9],
+            mem_ctrl,
             ram_size: 0,
             cache_control: 0,
             sio1_regs: [0; 4],
-        })
+            access: [AccessCost::default(); 5],
+        };
+        bus.refresh_access();
+        Ok(bus)
     }
 
     /// Strip the virtual-memory segment, yielding a physical address.
@@ -133,16 +214,32 @@ impl Bus {
         addr & REGION_MASK[(addr >> 29) as usize]
     }
 
-    /// Read wait states by region. Approximations: RAM pays its access
-    /// latency, the 8-bit BIOS ROM is painfully slow (4 byte reads per
-    /// word), scratchpad is on the CPU and free. Stores go through the
-    /// write queue and are modeled as free.
-    fn read_penalty(p: u32) -> u64 {
-        match p {
-            0x0000_0000..0x0080_0000 => 3,
-            0x1f80_0000..0x1f80_0400 => 0,
-            0x1fc0_0000..0x1fc8_0000 => 18,
-            _ => 3, // MMIO / expansion
+    /// Wait states charged on top of the one cycle every load already
+    /// costs, so the totals match the figures measured on hardware: 1 cycle
+    /// for scratchpad, 5 for on-die I/O, 7 for main RAM. Regions behind the
+    /// external bus (BIOS, expansion, SPU, CD-ROM) come from their delay
+    /// registers, which the BIOS reprograms early in boot. Stores go through
+    /// the write queue and cost only their issue cycle.
+    fn read_penalty(&self, p: u32, width: u32) -> u64 {
+        let total = match p {
+            0x0000_0000..0x0080_0000 => 7, // main RAM, plus DRAM refresh
+            0x1f80_0000..0x1f80_0400 => 1, // scratchpad: on-chip SRAM
+            0x1f00_0000..0x1f80_0000 => self.access[EXP1].cycles(width),
+            0x1f80_1800..0x1f80_1804 => self.access[CDROM].cycles(width),
+            0x1f80_1c00..0x1f80_2000 => self.access[SPU].cycles(width),
+            0x1f80_2000..0x1fa0_0000 => self.access[EXP2].cycles(width),
+            0x1fc0_0000..0x1fc8_0000 => self.access[BIOS].cycles(width),
+            _ => 5, // on-die I/O shares one decoder
+        };
+        total - 1
+    }
+
+    /// Recompute the external-bus access costs. Call after any write to the
+    /// delay registers, which the BIOS reprograms during boot.
+    fn refresh_access(&mut self) {
+        let com = self.mem_ctrl[COM_DELAY_IDX];
+        for (slot, reg) in ACCESS_REGS.iter().enumerate() {
+            self.access[slot] = AccessCost::derive(self.mem_ctrl[*reg], com);
         }
     }
 
@@ -151,7 +248,7 @@ impl Bus {
     pub fn fetch32(&mut self, addr: u32) -> u32 {
         let p = Self::mask_address(addr);
         if addr >= 0xa000_0000 {
-            self.penalty += Self::read_penalty(p);
+            self.penalty += self.read_penalty(p, 4);
         }
         self.read32_at(p)
     }
@@ -195,7 +292,7 @@ impl Bus {
 
     pub fn read8(&mut self, addr: u32) -> u8 {
         let p = Self::mask_address(addr);
-        self.penalty += Self::read_penalty(p);
+        self.penalty += self.read_penalty(p, 1);
         match p {
             0x0000_0000..0x0080_0000 => self.ram[(p as usize) & (RAM_SIZE - 1)],
             0x1f80_0000..0x1f80_0400 => self.scratchpad[(p - 0x1f80_0000) as usize],
@@ -214,7 +311,7 @@ impl Bus {
 
     pub fn read16(&mut self, addr: u32) -> u16 {
         let p = Self::mask_address(addr);
-        self.penalty += Self::read_penalty(p);
+        self.penalty += self.read_penalty(p, 2);
         match p {
             0x0000_0000..0x0080_0000 => {
                 let i = (p as usize) & (RAM_SIZE - 1);
@@ -238,7 +335,7 @@ impl Bus {
 
     pub fn read32(&mut self, addr: u32) -> u32 {
         let p = Self::mask_address(addr);
-        self.penalty += Self::read_penalty(p);
+        self.penalty += self.read_penalty(p, 4);
         self.read32_at(p)
     }
 
@@ -355,6 +452,7 @@ impl Bus {
             0x1f80_1000..0x1f80_1024 => {
                 debug!(target: "psx_core::bus", "mem-ctrl write {p:#010x} = {val:#010x}");
                 self.mem_ctrl[((p - 0x1f80_1000) / 4) as usize] = val;
+                self.refresh_access();
             }
             0x1f80_1060 => self.ram_size = val,
             0x1f80_1070 => self.irq.stat &= val, // write-0-to-acknowledge
@@ -608,5 +706,47 @@ impl Bus {
             }
             _ => warn!(target: "psx_core::dma", "GPU dma sync mode 3 invalid"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The values the BIOS programs, against the range measured on hardware
+    /// for a `lw` from ROM (27..33 cycles).
+    #[test]
+    fn bios_read_matches_hardware() {
+        let cost = AccessCost::derive(0x0013_243f, 0x0003_1125);
+        assert_eq!(cost.bus_bytes, 1, "the BIOS ROM sits on an 8-bit bus");
+        assert_eq!(cost.cycles(4), 29);
+        assert_eq!(cost.cycles(1), cost.first);
+    }
+
+    /// Until the BIOS reprograms them, every region uses the slowest timing.
+    #[test]
+    fn reset_timing_is_the_slowest_available() {
+        let slow = AccessCost::derive(DELAY_RESET, 0);
+        let fast = AccessCost::derive(0x0013_243f, 0x0003_1125);
+        assert!(slow.cycles(4) > fast.cycles(4));
+    }
+
+    /// A 16-bit bus halves the accesses a word costs.
+    #[test]
+    fn bus_width_sets_the_access_count() {
+        let eight = AccessCost::derive(0x0000_0033, 0);
+        let sixteen = AccessCost::derive(0x0000_1033, 0);
+        assert_eq!(eight.cycles(4), eight.first + eight.seq * 3);
+        assert_eq!(sixteen.cycles(4), sixteen.first + sixteen.seq);
+        assert_eq!(sixteen.cycles(2), sixteen.first);
+    }
+
+    /// The regions the CPU reaches without leaving the chip are fixed.
+    #[test]
+    fn on_die_regions_ignore_the_delay_registers() {
+        let bus = Bus::new(vec![0; BIOS_SIZE]).unwrap();
+        assert_eq!(bus.read_penalty(0x0000_0000, 4), 6, "main RAM totals 7");
+        assert_eq!(bus.read_penalty(0x1f80_0000, 4), 0, "scratchpad totals 1");
+        assert_eq!(bus.read_penalty(0x1f80_1070, 4), 4, "on-die I/O totals 5");
     }
 }
