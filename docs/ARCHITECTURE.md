@@ -97,22 +97,39 @@ logging (MMIO trace, TTY, PC history) is the primary bring-up tool for it.
 
 ## Known accuracy gaps (polish backlog)
 
-- Boot pacing: control still passes to the game slightly earlier than real
-  hardware (observed with SLPS-01770). Suspects: per-command CD latencies
-  (ACK/Init/GetID), CPU timing at 1 cycle/instruction (no memory wait
-  states or I-cache), instant DMA. Revisit during the accuracy milestone.
-- GPU: no dithering, rectangle texture flip, or line-accurate timing.
-- SPU: no noise, FM, volume sweeps or gaussian interpolation; XA uses
-  nearest-neighbor resampling.
+Timing. These are one cluster: together they let control reach the game
+slightly earlier than on real hardware (observed with SLPS-01770).
+
+- The CPU runs one cycle per instruction — no memory wait states, no I-cache.
+- DMA transfers complete instantly on the CHCR start bit; no per-word bus
+  timing, no CPU stalling.
+- The CD-ROM applies one flat acknowledge latency to every command. Mechanical
+  seek latency is modeled; the per-command differences (Init and GetID are far
+  slower on hardware) are not.
+- GPU draw commands complete instantly. GPUSTAT's ready flags are pinned to
+  ready and there is no FIFO depth, so nothing ever sees the GPU busy.
+- GTE operations complete in zero cycles, so COP2 result latency is invisible
+  to the program.
+
+Component coverage.
+
+- XA audio resamples linearly to 44100 Hz; hardware uses the ZigZag
+  interpolation tables.
 - MDEC 24-bit output ordering unverified against hardware captures.
+- SIO1 is a stub: the status register reports an idle port and writes are
+  only kept for read-back.
+- The emulated controller is a digital pad; there is no analog mode, so the
+  frontend has nothing to map the sticks onto.
 
 ## Milestones
 
 1. **CPU bring-up** — workspace, bus, R3000A interpreter; retail BIOS executes,
-   TTY prints the kernel banner. *(current)*
+   TTY prints the kernel banner.
 2. **GPU** — software rasterizer, VRAM viewer, boot logo renders; DMA (OTC/GPU),
    timers, vblank IRQ.
 3. **Game boot** — CD-ROM controller, BIN/CUE loading, SIO controllers, GTE.
 4. **Sound** — SPU, audio output (cpal), CD-DA/XA.
 5. **Accuracy & speed** — wait states, DMA contention, GTE timing; profiling.
-6. **Platform reach** — wasm build, LLDB-first remote debug stub.
+   *(current)*
+6. **Platform reach** — LLDB-first remote debug stub *(done)*; wasm build
+   still to come.

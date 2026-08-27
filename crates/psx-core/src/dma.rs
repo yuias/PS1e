@@ -1,8 +1,9 @@
 //! DMA controller (7 channels).
 //!
 //! Transfers currently complete instantly on the CHCR start bit; per-word
-//! bus timing and CPU stalling are a later accuracy milestone. Only the
-//! channels the BIOS needs so far are implemented: GPU (2) and OTC (6).
+//! bus timing and CPU stalling are a later accuracy milestone. Channels are
+//! implemented in `bus`: MDEC in/out (0/1), GPU (2), CD-ROM (3), SPU (4) and
+//! OTC (6). PIO (5) has no device behind it.
 
 use tracing::{debug, warn};
 
