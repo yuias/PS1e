@@ -15,10 +15,14 @@ use psx_core::PsxSystem;
 
 const BIOS_SIZE: usize = 512 * 1024;
 
-/// Physical RAM address of result slot 0. Slots are consecutive words.
+/// Physical RAM address of result slot 0 in a BIOS-image program. Slots are
+/// consecutive words; the flag sits one word below the region's end.
 const RESULT_BASE: u32 = 0x0000_1000;
-/// Physical RAM address of the completion flag.
-const DONE_ADDR: u32 = 0x0000_1ffc;
+/// Result base for programs loaded as an executable, which must stay clear
+/// of the kernel the BIOS has already put at the bottom of RAM.
+pub const EXE_RESULT_BASE: u32 = 0x0010_0000;
+/// Words of results before the completion flag.
+const SLOTS: u32 = 0x3ff;
 /// Word a program stores at `DONE_ADDR` once it has finished.
 const DONE_MARKER: u32 = 0xc0de_d09e;
 
@@ -130,14 +134,29 @@ pub fn nop() -> u32 {
 
 // --- Program builder ---------------------------------------------------
 
-#[derive(Default)]
 pub struct Program {
     words: Vec<u32>,
+    /// Physical address of result slot 0.
+    result_base: u32,
 }
 
 impl Program {
+    /// A program to be run as a BIOS image, from the reset vector.
     pub fn new() -> Self {
-        Self::default()
+        Self::with_results(RESULT_BASE)
+    }
+
+    /// A program whose results land at `result_base`, for when the default
+    /// region is already occupied.
+    pub fn with_results(result_base: u32) -> Self {
+        Self {
+            words: Vec::new(),
+            result_base,
+        }
+    }
+
+    fn done_addr(&self) -> u32 {
+        self.result_base + SLOTS * 4
     }
 
     pub fn emit(&mut self, word: u32) -> &mut Self {
@@ -162,9 +181,21 @@ impl Program {
 
     /// Store `rt` into result slot `slot`. Clobbers `AT`.
     pub fn store_result(&mut self, slot: u32, rt: u32) -> &mut Self {
-        let off = RESULT_BASE + slot * 4;
-        assert!(off < DONE_ADDR, "result slot {slot} overruns the done flag");
-        self.emit(lui(AT, 0x8000)).emit(sw(rt, off as i16, AT))
+        assert!(slot < SLOTS, "result slot {slot} overruns the done flag");
+        self.store_word(self.result_base + slot * 4, rt)
+    }
+
+    /// Store `rt` at a physical address, through KSEG0. Clobbers `AT`.
+    fn store_word(&mut self, phys: u32, rt: u32) -> &mut Self {
+        let addr = 0x8000_0000 | phys;
+        // `sw` sign-extends its offset, so a high half-word borrows a 1.
+        let (lo, hi) = (addr as u16, (addr >> 16) as u16);
+        let hi = if lo & 0x8000 != 0 {
+            hi.wrapping_add(1)
+        } else {
+            hi
+        };
+        self.emit(lui(AT, hi)).emit(sw(rt, lo as i16, AT))
     }
 
     /// Address of the next instruction, for computing branch targets.
@@ -172,39 +203,67 @@ impl Program {
         psx_core::cpu::RESET_VECTOR + self.words.len() as u32 * 4
     }
 
-    /// Signal completion and spin, then pad out to a full BIOS image.
-    fn into_image(mut self) -> Vec<u8> {
-        self.emit(lui(AT, 0x8000));
+    /// Append the completion marker and a spin, and flatten to bytes.
+    fn finish(mut self) -> Vec<u8> {
         self.li(V0, DONE_MARKER);
-        self.emit(sw(V0, DONE_ADDR as i16, AT));
+        self.store_word(self.done_addr(), V0);
         // Branch to self; the delay slot runs on every iteration.
         self.emit(beq(ZERO, ZERO, -1)).emit(nop());
+        self.words.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
 
-        let mut image = vec![0u8; BIOS_SIZE];
+    /// Pad the program out to a full BIOS image, to run from the reset vector.
+    fn into_image(self) -> Vec<u8> {
+        let code = self.finish();
         assert!(
-            self.words.len() * 4 <= BIOS_SIZE,
+            code.len() <= BIOS_SIZE,
             "program does not fit in a BIOS image"
         );
-        for (i, w) in self.words.iter().enumerate() {
-            image[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
-        }
+        let mut image = vec![0u8; BIOS_SIZE];
+        image[..code.len()].copy_from_slice(&code);
         image
     }
 
-    /// Run the program to its completion marker and return the results.
-    pub fn run(self) -> Results {
-        let mut sys = PsxSystem::new(self.into_image()).expect("test ROM image");
-        while sys.cycles() < CYCLE_CAP {
-            sys.run_cycles(10_000);
-            if read_ram(&sys, DONE_ADDR) == DONE_MARKER {
-                return Results { sys };
-            }
-        }
-        panic!(
-            "test ROM never signalled completion (pc = {:#010x})",
-            sys.cpu.pc
-        );
+    /// Wrap the program in a PS-X EXE, to be side-loaded over a booted BIOS.
+    pub fn into_exe(self, load_addr: u32, sp: u32) -> Vec<u8> {
+        const HEADER_SIZE: usize = 0x800;
+        let code = self.finish();
+        // The body is stored in whole 2 KiB blocks, as the shell expects.
+        let size = code.len().next_multiple_of(HEADER_SIZE);
+
+        let mut exe = vec![0u8; HEADER_SIZE + size];
+        exe[..8].copy_from_slice(b"PS-X EXE");
+        let mut put = |off: usize, v: u32| exe[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        put(0x10, load_addr); // entry point
+        put(0x18, load_addr);
+        put(0x1c, size as u32);
+        put(0x30, sp);
+        exe[HEADER_SIZE..HEADER_SIZE + code.len()].copy_from_slice(&code);
+        exe
     }
+
+    /// Run the program as a BIOS image, to its completion marker.
+    pub fn run(self) -> Results {
+        let result_base = self.result_base;
+        let sys = PsxSystem::new(self.into_image()).expect("test ROM image");
+        run_to_marker(sys, result_base)
+    }
+}
+
+/// Advance `sys` until the program stores its completion marker.
+pub fn run_to_marker(mut sys: PsxSystem, result_base: u32) -> Results {
+    let done = result_base + SLOTS * 4;
+    let deadline = sys.cycles() + CYCLE_CAP;
+    while sys.cycles() < deadline {
+        sys.run_cycles(10_000);
+        if read_ram(&sys, done) == DONE_MARKER {
+            return Results { sys, result_base };
+        }
+    }
+    panic!(
+        "test program never signalled completion (pc = {:#010x})",
+        sys.cpu.pc
+    );
 }
 
 fn read_ram(sys: &PsxSystem, addr: u32) -> u32 {
@@ -214,11 +273,12 @@ fn read_ram(sys: &PsxSystem, addr: u32) -> u32 {
 
 pub struct Results {
     sys: PsxSystem,
+    result_base: u32,
 }
 
 impl Results {
     /// The word the program stored into result slot `slot`.
     pub fn slot(&self, slot: u32) -> u32 {
-        read_ram(&self.sys, RESULT_BASE + slot * 4)
+        read_ram(&self.sys, self.result_base + slot * 4)
     }
 }
