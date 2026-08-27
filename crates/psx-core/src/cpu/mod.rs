@@ -63,6 +63,18 @@ impl Cpu {
         }
     }
 
+    /// Redirect execution to `pc`, dropping any in-flight branch or load.
+    /// A loader that has just placed a program in RAM enters it this way.
+    pub fn set_pc(&mut self, pc: u32) {
+        self.pc = pc;
+        self.next_pc = pc.wrapping_add(4);
+        self.current_pc = pc;
+        self.pending_load = None;
+        self.written_reg = None;
+        self.in_delay_slot = false;
+        self.is_branch = false;
+    }
+
     /// Execute one instruction.
     pub fn step(&mut self, bus: &mut Bus) {
         // Mirror the interrupt controller into CAUSE bit 10 (hardware line).
