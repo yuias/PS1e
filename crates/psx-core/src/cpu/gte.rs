@@ -541,7 +541,39 @@ impl Gte {
     // Commands
     // ---------------------------------------------------------------
 
-    pub fn execute(&mut self, cmd: u32) {
+    /// Cycles a command occupies the GTE for, as documented per opcode.
+    /// Hardware runs these alongside the CPU; only an instruction that
+    /// touches the GTE has to wait for them.
+    fn cycles(op: u32) -> u64 {
+        match op {
+            0x01 => 15, // RTPS
+            0x06 => 8,  // NCLIP
+            0x0c => 6,  // OP
+            0x10 => 8,  // DPCS
+            0x11 => 8,  // INTPL
+            0x12 => 8,  // MVMVA
+            0x13 => 19, // NCDS
+            0x14 => 13, // CDP
+            0x16 => 44, // NCDT
+            0x1b => 17, // NCCS
+            0x1c => 11, // CC
+            0x1e => 14, // NCS
+            0x20 => 30, // NCT
+            0x28 => 5,  // SQR
+            0x29 => 8,  // DCPL
+            0x2a => 17, // DPCT
+            0x2d => 5,  // AVSZ3
+            0x2e => 6,  // AVSZ4
+            0x30 => 23, // RTPT
+            0x3d => 5,  // GPF
+            0x3e => 5,  // GPL
+            0x3f => 39, // NCCT
+            _ => 1,
+        }
+    }
+
+    /// Run one command, returning how long the GTE stays busy with it.
+    pub fn execute(&mut self, cmd: u32) -> u64 {
         self.flag = 0; // every command starts with a clean FLAG
 
         let sf = (cmd >> 19) & 1 != 0;
@@ -608,6 +640,7 @@ impl Gte {
             }
             _ => tracing::warn!(target: "psx_core::gte", cmd, op, "unknown GTE command"),
         }
+        Self::cycles(op)
     }
 
     /// RTPS core, also used 3x by RTPT. `depth_cue` gates the IR0/MAC0

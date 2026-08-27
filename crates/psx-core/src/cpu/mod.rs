@@ -41,6 +41,9 @@ pub struct Cpu {
     is_branch: bool,
     pub cop0: Cop0,
     pub gte: Gte,
+    /// Cycle the GTE finishes its current command at. The CPU runs on
+    /// alongside it and only waits when an instruction touches the GTE.
+    gte_done_at: u64,
 }
 
 pub const RESET_VECTOR: u32 = 0xbfc0_0000;
@@ -60,6 +63,7 @@ impl Cpu {
             is_branch: false,
             cop0: Cop0::default(),
             gte: Gte::new(),
+            gte_done_at: 0,
         }
     }
 
@@ -351,7 +355,7 @@ impl Cpu {
             0x0f => self.set_reg(rt, imm << 16),                          // LUI
 
             0x10 => self.op_cop0(instr, rs, rt, rd),
-            0x12 => self.op_cop2(instr, rs, rt, rd),
+            0x12 => self.op_cop2(bus, instr, rs, rt, rd),
             0x11 | 0x13 => self.exception(Exception::CoprocessorUnusable),
 
             0x20 => {
@@ -485,6 +489,7 @@ impl Cpu {
                     self.exception(Exception::AdEL);
                 } else {
                     let v = bus.read32(addr);
+                    self.gte_sync(bus);
                     self.gte.write_data(rt as u32, v);
                 }
             }
@@ -495,6 +500,7 @@ impl Cpu {
                     self.cop0.bad_vaddr = addr;
                     self.exception(Exception::AdES);
                 } else if !self.cop0.cache_isolated() {
+                    self.gte_sync(bus);
                     let v = self.gte.read_data(rt as u32);
                     bus.write32(addr, v);
                 }
@@ -535,9 +541,18 @@ impl Cpu {
         }
     }
 
-    fn op_cop2(&mut self, instr: u32, rs: usize, rt: usize, rd: usize) {
+    /// Hold the CPU until the GTE has finished the command it is running.
+    /// Every instruction that touches the GTE goes through here first.
+    fn gte_sync(&mut self, bus: &mut Bus) {
+        let now = bus.now + bus.penalty;
+        bus.penalty += self.gte_done_at.saturating_sub(now);
+    }
+
+    fn op_cop2(&mut self, bus: &mut Bus, instr: u32, rs: usize, rt: usize, rd: usize) {
+        self.gte_sync(bus);
         if instr & (1 << 25) != 0 {
-            self.gte.execute(instr & 0x1ff_ffff);
+            let busy = self.gte.execute(instr & 0x1ff_ffff);
+            self.gte_done_at = bus.now + bus.penalty + busy;
             return;
         }
         match rs {
@@ -595,6 +610,45 @@ mod tests {
         cpu.pc = 0x8000_0000;
         cpu.next_pc = 0x8000_0004;
         (cpu, bus)
+    }
+
+    /// Step once and return what it cost, draining the bus the way the
+    /// system does between instructions.
+    fn step_cycles(cpu: &mut Cpu, bus: &mut Bus) -> u64 {
+        cpu.step(bus);
+        let cost = 1 + std::mem::take(&mut bus.penalty);
+        bus.now += cost;
+        cost
+    }
+
+    /// The GTE runs alongside the CPU, so a command is free until an
+    /// instruction wants the result; only then does the CPU wait.
+    #[test]
+    fn gte_holds_the_cpu_only_when_its_result_is_wanted() {
+        const RTPS: u32 = 0x4a18_0001; // COP2 imm25 = 0180001h, 15 cycles
+        const MFC2: u32 = 0x4808_0000; // mfc2 $8, $0
+
+        let (mut cpu, mut bus) = setup(&[RTPS, MFC2]);
+        assert_eq!(
+            step_cycles(&mut cpu, &mut bus),
+            1,
+            "the command itself issues in one"
+        );
+        assert_eq!(step_cycles(&mut cpu, &mut bus), 15, "reading it back waits");
+
+        // With enough unrelated work in between, the wait is already over.
+        let mut program = vec![RTPS];
+        program.extend([0; 15]); // nops
+        program.push(MFC2);
+        let (mut cpu, mut bus) = setup(&program);
+        for _ in 0..16 {
+            step_cycles(&mut cpu, &mut bus);
+        }
+        assert_eq!(
+            step_cycles(&mut cpu, &mut bus),
+            1,
+            "nothing left to wait for"
+        );
     }
 
     #[test]

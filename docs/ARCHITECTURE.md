@@ -126,8 +126,10 @@ slightly earlier than on real hardware (observed with SLPS-01770).
   guesses — hardware figures for those have not been published.
 - GPU draw commands complete instantly. GPUSTAT's ready flags are pinned to
   ready and there is no FIFO depth, so nothing ever sees the GPU busy.
-- GTE operations complete in zero cycles, so COP2 result latency is invisible
-  to the program.
+- GTE commands take their documented time, and the CPU runs on until an
+  instruction touches the GTE, as on hardware. Not modeled: the shorter
+  delay before a written COP2 register is readable, and the LZCS/LZCR
+  timing, which is undocumented.
 
 Component coverage.
 
