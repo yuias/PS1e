@@ -7,8 +7,9 @@
 //! - COP0 exception handling, including BD/EPC fix-up for delay slots
 //! - data-cache isolation (stores swallowed while SR.IsC is set)
 //!
-//! Timing is currently 1 cycle per instruction; memory wait states, I-cache
-//! and multiplier/divider latency are modeled at the system level later.
+//! Timing is one pipeline cycle per instruction plus the read wait states
+//! the bus accumulates (`Bus::penalty`, drained by the system). Cache-line
+//! behaviour and multiplier/divider latency are not modeled.
 
 mod cop0;
 mod gte;

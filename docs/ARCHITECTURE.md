@@ -100,7 +100,11 @@ logging (MMIO trace, TTY, PC history) is the primary bring-up tool for it.
 Timing. These are one cluster: together they let control reach the game
 slightly earlier than on real hardware (observed with SLPS-01770).
 
-- The CPU runs one cycle per instruction — no memory wait states, no I-cache.
+- CPU wait states are a coarse per-region approximation (`bus::read_penalty`):
+  one figure per address range, stores treated as free because the write
+  queue is not modeled, and the I-cache modeled as an unconditional hit for
+  cached segments — there are no cache lines and so no misses.
+- The multiplier and divider retire instantly; nothing stalls on HI/LO.
 - DMA transfers complete instantly on the CHCR start bit; no per-word bus
   timing, no CPU stalling.
 - The CD-ROM applies one flat acknowledge latency to every command. Mechanical
