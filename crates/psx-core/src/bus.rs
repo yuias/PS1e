@@ -534,17 +534,24 @@ impl Bus {
 
     // --- DMA execution -------------------------------------------------
 
-    /// Run a whole transfer for `ch` immediately (no bus timing yet).
+    /// Run a whole transfer for `ch` at once, then charge the time it would
+    /// have taken. Hardware lets the CPU carry on out of cache, scratchpad,
+    /// COP0 and GTE, so a cache-resident loop running alongside a transfer
+    /// is charged more here than it costs on the console.
     fn run_dma(&mut self, ch: usize) {
-        match ch {
+        let words = match ch {
             0 => self.dma_mdec_in(),
             1 => self.dma_mdec_out(),
             2 => self.dma_gpu(),
             3 => self.dma_cdrom(),
             4 => self.dma_spu(),
             6 => self.dma_otc(),
-            _ => warn!(target: "psx_core::dma", "DMA{ch} not implemented"),
-        }
+            _ => {
+                warn!(target: "psx_core::dma", "DMA{ch} not implemented");
+                0
+            }
+        };
+        self.penalty += self.dma_cycles(ch, words);
         // Always mark finished so nothing spins on the busy bit
         self.dma.ch[ch].finish();
         if self.dma.complete(ch) {
@@ -552,8 +559,25 @@ impl Bus {
         }
     }
 
+    /// How long a transfer takes, from the clocks-per-100h-words figures
+    /// measured on hardware. The channels that just stream to or from RAM
+    /// land a little above one clock per word: DRAM hyper-page mode still
+    /// has to reload the row address every 16 words.
+    fn dma_cycles(&self, ch: usize, words: u32) -> u64 {
+        let per_256: u64 = match ch {
+            // The BIOS leaves the drive at 24 clocks per word; most games
+            // enable the recovery period, which brings it to 40.
+            3 if self.mem_ctrl[6] & (1 << 8) != 0 => 0x2800,
+            3 => 0x1800,
+            4 => 0x420,
+            5 => 0x1400,
+            _ => 0x110,
+        };
+        (words as u64 * per_256).div_ceil(0x100)
+    }
+
     /// Channel 3: CD-ROM sector data into RAM.
-    fn dma_cdrom(&mut self) {
+    fn dma_cdrom(&mut self) -> u32 {
         let c = self.dma.ch[3];
         let words = match c.bcr & 0xffff {
             0 => 0x10000u32,
@@ -566,10 +590,11 @@ impl Bus {
             self.write_ram32(addr, w);
             addr = addr.wrapping_add(4);
         }
+        words
     }
 
     /// Channel 0: compressed data into the MDEC.
-    fn dma_mdec_in(&mut self) {
+    fn dma_mdec_in(&mut self) -> u32 {
         let c = self.dma.ch[0];
         let words = dma_block_words(c.bcr);
         trace!(target: "psx_core::dma", "MDEC-in {words} words");
@@ -579,10 +604,11 @@ impl Bus {
             self.mdec.write_data(w);
             addr = addr.wrapping_add(4);
         }
+        words
     }
 
     /// Channel 1: decoded pixels out of the MDEC.
-    fn dma_mdec_out(&mut self) {
+    fn dma_mdec_out(&mut self) -> u32 {
         let c = self.dma.ch[1];
         let words = dma_block_words(c.bcr);
         trace!(target: "psx_core::dma", "MDEC-out {words} words");
@@ -592,10 +618,11 @@ impl Bus {
             self.write_ram32(addr, w);
             addr = addr.wrapping_add(4);
         }
+        words
     }
 
     /// Channel 4: SPU RAM transfers through the data port.
-    fn dma_spu(&mut self) {
+    fn dma_spu(&mut self) -> u32 {
         let c = self.dma.ch[4];
         let unit = match c.bcr & 0xffff {
             0 => 0x10000u32,
@@ -620,10 +647,11 @@ impl Bus {
             }
             addr = addr.wrapping_add(4);
         }
+        words
     }
 
     /// Channel 6: build the GPU ordering table, walking backwards.
-    fn dma_otc(&mut self) {
+    fn dma_otc(&mut self) -> u32 {
         let c = self.dma.ch[6];
         let count = match c.bcr & 0xffff {
             0 => 0x10000,
@@ -640,10 +668,11 @@ impl Bus {
             self.write_ram32(addr, val);
             addr = addr.wrapping_sub(4);
         }
+        count
     }
 
     /// Channel 2: GPU command lists and image data.
-    fn dma_gpu(&mut self) {
+    fn dma_gpu(&mut self) -> u32 {
         let c = self.dma.ch[2];
         match c.sync_mode() {
             // Manual / request mode: linear block of words
@@ -679,14 +708,18 @@ impl Bus {
                         addr.wrapping_add(4)
                     };
                 }
+                words
             }
             // Linked list of GP0 packets
             2 => {
                 let mut addr = c.madr & 0x001f_fffc;
                 let mut guard = 0u32;
+                // Every node costs its header word as well as its payload.
+                let mut words = 0u32;
                 loop {
                     let header = self.read_ram32(addr);
                     let count = header >> 24;
+                    words += 1 + count;
                     let mut a = addr;
                     for _ in 0..count {
                         a = a.wrapping_add(4) & 0x001f_fffc;
@@ -703,8 +736,12 @@ impl Bus {
                         break;
                     }
                 }
+                words
             }
-            _ => warn!(target: "psx_core::dma", "GPU dma sync mode 3 invalid"),
+            _ => {
+                warn!(target: "psx_core::dma", "GPU dma sync mode 3 invalid");
+                0
+            }
         }
     }
 }
@@ -739,6 +776,30 @@ mod tests {
         assert_eq!(eight.cycles(4), eight.first + eight.seq * 3);
         assert_eq!(sixteen.cycles(4), sixteen.first + sixteen.seq);
         assert_eq!(sixteen.cycles(2), sixteen.first);
+    }
+
+    /// Per-channel transfer rates, against the clocks-per-100h-words
+    /// figures measured on hardware.
+    #[test]
+    fn dma_rates_match_hardware() {
+        let mut bus = Bus::new(vec![0; BIOS_SIZE]).unwrap();
+        for streaming in [0, 1, 2, 6] {
+            assert_eq!(
+                bus.dma_cycles(streaming, 0x100),
+                0x110,
+                "channel {streaming}"
+            );
+        }
+        assert_eq!(bus.dma_cycles(4, 0x100), 0x420, "SPU");
+        assert_eq!(bus.dma_cycles(5, 0x100), 0x1400, "PIO");
+
+        assert_eq!(
+            bus.dma_cycles(3, 0x100),
+            0x1800,
+            "CD-ROM, as the BIOS leaves it"
+        );
+        bus.mem_ctrl[6] = 0x0002_0943; // what most games program
+        assert_eq!(bus.dma_cycles(3, 0x100), 0x2800, "CD-ROM with recovery");
     }
 
     /// The regions the CPU reaches without leaving the chip are fixed.

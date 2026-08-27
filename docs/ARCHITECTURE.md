@@ -111,8 +111,13 @@ slightly earlier than on real hardware (observed with SLPS-01770).
 - Stores cost only their issue cycle. The write queue is not modeled, so a
   full queue never stalls the CPU.
 - The multiplier and divider retire instantly; nothing stalls on HI/LO.
-- DMA transfers complete instantly on the CHCR start bit; no per-word bus
-  timing, no CPU stalling.
+- DMA still moves a whole transfer the moment CHCR starts it, but now
+  charges what it would have taken at the measured per-word rates. The
+  interleaving is missing: hardware keeps the CPU running out of cache,
+  scratchpad, COP0 and GTE for the duration, and chopping hands the bus
+  back at intervals, so a cache-resident loop is charged more here than it
+  costs on the console. Channel priority and the chopping windows are not
+  modeled at all.
 - The CD-ROM applies one flat acknowledge latency to every command. Mechanical
   seek latency is modeled; the per-command differences (Init and GetID are far
   slower on hardware) are not.
