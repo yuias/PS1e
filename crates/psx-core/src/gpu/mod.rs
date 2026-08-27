@@ -86,6 +86,9 @@ pub struct Gpu {
     pub log_commands: bool,
     /// Vblank count since reset; tags command-log entries with the frame.
     pub frame_count: u64,
+    /// CPU cycle of the current field's vblank edge, the phase reference
+    /// for the scanline the GPU reports drawing.
+    frame_origin: u64,
 
     /// Buffered VRAM->CPU transfer data, popped via GPUREAD.
     read_queue: VecDeque<u32>,
@@ -207,6 +210,7 @@ impl Gpu {
             odd_frame: false,
             log_commands: false,
             frame_count: 0,
+            frame_origin: 0,
             read_queue: VecDeque::new(),
             frame: Frame::default(),
         }
@@ -299,7 +303,8 @@ impl Gpu {
     }
 
     /// Called by the system once per vblank.
-    pub fn vblank(&mut self) {
+    pub fn vblank(&mut self, now: u64) {
+        self.frame_origin = now;
         self.odd_frame = !self.odd_frame;
         self.frame_count += 1;
         self.capture_frame();
@@ -347,7 +352,7 @@ impl Gpu {
 
     // --- Register interface -------------------------------------------
 
-    pub fn status(&self) -> u32 {
+    pub fn status(&self, now: u64) -> u32 {
         let hr = match self.hres {
             256 => 0u32,
             320 => 1,
@@ -389,12 +394,24 @@ impl Gpu {
             _ => (s >> 27) & 1,
         };
         s |= dreq << 25;
-        // Odd/even flag: toggles per field/frame. Real hardware also clears
-        // it during vblank and toggles per scanline in 240p; line-accurate
-        // GPU timing will refine this. It must keep toggling in interlaced
-        // mode — the shell spins waiting for it to change.
-        s |= (self.odd_frame as u32) << 31;
+        s |= (self.drawing_odd_line(now) as u32) << 31;
         s
+    }
+
+    /// Bit 31: which lines are being drawn. Zero throughout vblank; in
+    /// 480-line mode it names the field and so changes once per frame,
+    /// while in 240-line mode it follows the scanline.
+    fn drawing_odd_line(&self, now: u64) -> bool {
+        let timing = self.video_timing();
+        let phase = now.saturating_sub(self.frame_origin) % timing.cycles_per_frame();
+        let blank = timing.vblank_cycles();
+        if phase < blank {
+            return false;
+        }
+        if self.interlaced && self.vres == 480 {
+            return self.odd_frame;
+        }
+        (phase - blank) / timing.cycles_per_line % 2 == 1
     }
 
     pub fn gpuread(&mut self) -> u32 {
@@ -731,14 +748,16 @@ impl Gpu {
         }
         match op {
             0x00 => {
-                // Full state reset; VRAM contents, the command-log switch and
-                // the frame counter survive a GP1 reset
+                // Full state reset; VRAM contents, the command-log switch,
+                // the frame counter and the scanout phase survive a GP1 reset
                 let vram = std::mem::take(&mut self.vram);
-                let (log, frames) = (self.log_commands, self.frame_count);
+                let (log, frames, origin) =
+                    (self.log_commands, self.frame_count, self.frame_origin);
                 *self = Gpu::new();
                 self.vram = vram;
                 self.log_commands = log;
                 self.frame_count = frames;
+                self.frame_origin = origin;
             }
             0x01 => {
                 self.fifo.clear();
@@ -955,6 +974,55 @@ mod tests {
         }
     }
 
+    /// GPUSTAT bit 31 reports which lines are being drawn: nothing during
+    /// vblank, then the scanline's parity in 240-line mode.
+    #[test]
+    fn drawing_line_bit_follows_the_scanline_in_240_lines() {
+        let mut gpu = Gpu::new();
+        gpu.gp1(0x0300_0000); // display on
+        gpu.gp1(0x0800_0001); // 320x240 progressive
+        gpu.vblank(0);
+
+        let timing = gpu.video_timing();
+        let blank = timing.vblank_cycles();
+        assert!(!gpu.drawing_odd_line(0), "vblank starts the field");
+        assert!(!gpu.drawing_odd_line(blank - 1), "still blanking");
+
+        for line in 0..6u64 {
+            let at = blank + line * timing.cycles_per_line + 1;
+            assert_eq!(gpu.drawing_odd_line(at), line % 2 == 1, "line {line}");
+        }
+
+        // The next field's blanking brings it back down.
+        assert!(!gpu.drawing_odd_line(timing.cycles_per_frame()));
+    }
+
+    /// In 480-line mode the same bit names the field instead, so it only
+    /// changes once per frame.
+    #[test]
+    fn drawing_line_bit_names_the_field_in_480_lines() {
+        let mut gpu = Gpu::new();
+        gpu.gp1(0x0300_0000);
+        gpu.gp1(0x0800_0025); // 320 wide, 480i
+        gpu.vblank(0);
+
+        let timing = gpu.video_timing();
+        let blank = timing.vblank_cycles();
+        let first = gpu.drawing_odd_line(blank + 1);
+        assert_eq!(
+            gpu.drawing_odd_line(blank + timing.cycles_per_line * 3 + 1),
+            first,
+            "constant across the field"
+        );
+
+        gpu.vblank(timing.cycles_per_frame());
+        assert_ne!(
+            gpu.drawing_odd_line(timing.cycles_per_frame() + blank + 1),
+            first,
+            "the next field is the other one"
+        );
+    }
+
     #[test]
     fn interlaced_frame_weaves_fields_across_vblanks() {
         let mut gpu = Gpu::new();
@@ -963,7 +1031,7 @@ mod tests {
         assert_eq!(gpu.display_resolution(), (320, 480));
 
         paint(&mut gpu, 0);
-        gpu.vblank(); // first capture after a mode change is full
+        gpu.vblank(0); // first capture after a mode change is full
         assert!(
             gpu.frame
                 .pixels
@@ -974,7 +1042,7 @@ mod tests {
 
         // Repaint; the next vblank must refresh only one field
         paint(&mut gpu, 1000);
-        gpu.vblank();
+        gpu.vblank(0);
         let stride = gpu.frame.stride as usize;
         let updated: Vec<bool> = (0..gpu.frame.height as usize)
             .map(|y| gpu.frame.pixels[y * stride] >= 1000)
@@ -986,7 +1054,7 @@ mod tests {
         );
 
         // The following vblank fills in the other field
-        gpu.vblank();
+        gpu.vblank(0);
         assert!((0..gpu.frame.height as usize).all(|y| gpu.frame.pixels[y * stride] >= 1000));
     }
 
@@ -996,9 +1064,9 @@ mod tests {
         gpu.gp1(0x0300_0000);
         gpu.gp1(0x0800_0001); // 320x240 progressive
         paint(&mut gpu, 0);
-        gpu.vblank();
+        gpu.vblank(0);
         paint(&mut gpu, 1000);
-        gpu.vblank();
+        gpu.vblank(0);
         let stride = gpu.frame.stride as usize;
         assert!((0..gpu.frame.height as usize).all(|y| gpu.frame.pixels[y * stride] >= 1000));
     }

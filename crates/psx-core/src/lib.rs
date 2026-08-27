@@ -230,7 +230,7 @@ impl PsxSystem {
         if event == EventKind::VBlank {
             let timing = self.bus.gpu.video_timing();
             self.bus.irq.raise(0);
-            self.bus.gpu.vblank();
+            self.bus.gpu.vblank(self.cycles);
             // Keep lazily-synced components from lagging more than a frame,
             // then hand them the field boundary they measure blanking from
             self.bus

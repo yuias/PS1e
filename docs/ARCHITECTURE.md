@@ -124,8 +124,12 @@ slightly earlier than on real hardware (observed with SLPS-01770).
   Seek time is still a coarse distance model rather than the drive's own
   coarse/fine stepping, and the second responses of Init and ReadTOC are
   guesses — hardware figures for those have not been published.
-- GPU draw commands complete instantly. GPUSTAT's ready flags are pinned to
-  ready and there is no FIFO depth, so nothing ever sees the GPU busy.
+- GPU draw commands complete instantly, so GPUSTAT's ready flags stay
+  pinned to ready and the 16-word GP0 FIFO never fills. Modeling this
+  properly is blocked rather than merely unfinished: how long the hardware
+  takes to render a primitive has never been measured, and the ready bits
+  are what games poll, so inventing a figure risks hanging them. The
+  scanline the GPU reports drawing (bit 31) is accurate.
 - GTE commands take their documented time, and the CPU runs on until an
   instruction touches the GTE, as on hardware. Not modeled: the shorter
   delay before a written COP2 register is readable, and the LZCS/LZCR

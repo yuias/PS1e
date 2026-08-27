@@ -386,7 +386,7 @@ impl Bus {
                 timers.read(p, *now, gpu.video_timing(), irq)
             }
             0x1f80_1810 => self.gpu.gpuread(),
-            0x1f80_1814 => self.gpu.status(),
+            0x1f80_1814 => self.gpu.status(self.now),
             0x1f80_1820 => self.mdec.read_data(),
             0x1f80_1824 => self.mdec.status(),
             // SPU registers are 16-bit; a 32-bit read combines two
