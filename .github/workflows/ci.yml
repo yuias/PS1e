@@ -13,8 +13,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # cpal (audio backend of psx-app) links against ALSA on Linux
-      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+      # Linux-only build deps: cpal probes ALSA, gilrs probes libudev.
+      # Everything else (wayland, X11, xkbcommon, Vulkan) is dlopen'd at runtime.
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
