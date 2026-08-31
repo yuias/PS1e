@@ -26,6 +26,10 @@ pub const CPU_CLOCK_HZ: u64 = 33_868_800;
 /// stable "one frame" figure; the running machine follows the display
 /// mode's [`gpu::VideoTiming`], which is longer in PAL.
 pub const CYCLES_PER_FRAME: u64 = gpu::VideoTiming::NTSC.cycles_per_frame();
+/// Where the BIOS shell hands control to the executable it has loaded.
+/// Reaching it means the kernel jump tables are up, so it is the earliest
+/// point at which [`PsxSystem::load_exe`] has something to hand over to.
+pub const SHELL_ENTRY: u32 = 0x8003_0000;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct PsxSystem {
@@ -117,9 +121,10 @@ impl PsxSystem {
     ///
     /// This is the shortcut the BIOS shell would otherwise take after
     /// reading the executable off a disc, so the caller must let the BIOS
-    /// reach the shell entry point (`0x8003_0000`) first — the kernel must
+    /// reach the shell entry point ([`SHELL_ENTRY`]) first — the kernel must
     /// have set up its jump tables, or the loaded program has nothing to
-    /// call. Used to run test executables that never ship as disc images.
+    /// call. [`PsxSystem::run_until_pc`] is the wait to put in front of it.
+    /// Used to run test executables that never ship as disc images.
     pub fn load_exe(&mut self, exe: &[u8]) -> Result<(), String> {
         const HEADER_SIZE: usize = 0x800;
         if exe.len() < HEADER_SIZE || &exe[..8] != b"PS-X EXE" {
@@ -156,6 +161,27 @@ impl PsxSystem {
             self.cpu.regs[30] = sp;
         }
         Ok(())
+    }
+
+    /// Step until the pc reaches `target`, giving up after `max_cycles`.
+    /// Returns whether it arrived.
+    ///
+    /// The pc only passes *through* a given address for one instruction, so
+    /// a caller that advances in chunks cannot catch it with an equality
+    /// test at a chunk boundary; this checks every instruction instead.
+    /// Pair it with [`SHELL_ENTRY`] to park a fresh machine where
+    /// [`PsxSystem::load_exe`] can take over. Note that a machine already
+    /// past the shell entry will never reach it again — the BIOS executes
+    /// it once — so this is for booting, not for re-synchronising.
+    pub fn run_until_pc(&mut self, target: u32, max_cycles: u64) -> bool {
+        let end = self.cycles + max_cycles;
+        while self.cycles < end {
+            if self.cpu.pc == target {
+                return true;
+            }
+            self.step();
+        }
+        self.cpu.pc == target
     }
 
     pub fn insert_disc(&mut self, disc: cdrom::Disc) {

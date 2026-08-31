@@ -168,6 +168,7 @@ psxctl poke 80100000 deadbeef # write RAM
 psxctl disc open              # open the drive lid
 psxctl disc close game.cue    # close it on a new image (or bare: the old one)
 psxctl tty                    # TTY output since the last call
+psxctl loadexe probe.exe      # side-load a PS-X EXE over the running BIOS
 psxctl savestate s.sst        # snapshot; loadstate restores it
 psxctl state                  # pc, cycles, frames, held buttons, display
 psxctl quit
@@ -179,6 +180,13 @@ A typical agent loop: `press`/`run` → `frame`/`peek`/`tty` → decide →
 repeat, with `savestate`/`loadstate` for branching exploration. The
 control port and the debugger can be active simultaneously; execution
 commands are refused while a debugger is attached.
+
+`loadexe` runs a program on the real BIOS without a disc: it boots to the
+shell entry point, where the kernel jump tables are up, then hands the
+machine over to the executable the way the shell would after reading one
+off a disc. Add `now` (`psxctl loadexe probe.exe now`) to skip that wait on
+a machine already run past the shell entry — the BIOS passes through it
+once, so the wait would otherwise time out.
 
 ## Limitations
 

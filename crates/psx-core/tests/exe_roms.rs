@@ -15,8 +15,6 @@ use common::{EXE_RESULT_BASE, Program, T0, run_to_marker};
 use psx_core::PsxSystem;
 use std::path::PathBuf;
 
-/// Where the BIOS hands control to the executable it has loaded.
-const SHELL_ENTRY: u32 = 0x8003_0000;
 /// Cycles allowed for the BIOS to reach the shell. A retail image gets there
 /// in about 80 million; anything far beyond that is not going to arrive.
 const BOOT_CAP: u64 = 200_000_000;
@@ -57,11 +55,8 @@ fn booted() -> Option<PsxSystem> {
     };
 
     let mut sys = PsxSystem::new(image).expect("BIOS image");
-    while sys.cycles() < BOOT_CAP {
-        if sys.cpu.pc == SHELL_ENTRY {
-            return Some(sys);
-        }
-        sys.step();
+    if sys.run_until_pc(psx_core::SHELL_ENTRY, BOOT_CAP) {
+        return Some(sys);
     }
     eprintln!(
         "skipping: {} does not reach the shell (pc {:#010x}, {} cycles); set PS1E_TEST_BIOS to a retail image",

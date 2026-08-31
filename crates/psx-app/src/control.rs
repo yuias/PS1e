@@ -16,7 +16,7 @@
 //! psxctl peek 801ffc38 64   # inspect memory, side-effect-free
 //! ```
 
-use psx_core::{CPU_CLOCK_HZ, CYCLES_PER_FRAME, PsxSystem};
+use psx_core::{CPU_CLOCK_HZ, CYCLES_PER_FRAME, PsxSystem, SHELL_ENTRY};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use tracing::info;
@@ -103,6 +103,11 @@ fn parse_addr(s: &str) -> Result<u32, String> {
     u32::from_str_radix(s.trim_start_matches("0x"), 16).map_err(|_| format!("bad address '{s}'"))
 }
 
+/// Cycles allowed for the BIOS to reach the shell entry on `loadexe`. A
+/// retail image gets there in about 80 million; well past that means the
+/// image is not going to arrive, and the port must not wedge waiting.
+const BOOT_CAP: u64 = 200_000_000;
+
 pub struct Reply {
     pub ok: bool,
     /// Payload lines (without the status line or terminator).
@@ -146,13 +151,47 @@ impl Controller {
         self.frames_run += cycles / CYCLES_PER_FRAME;
     }
 
+    /// Read a PS-X EXE and hand it to the machine, optionally booting the
+    /// BIOS to the shell entry first.
+    fn load_exe(&mut self, sys: &mut PsxSystem, path: &str, wait: bool) -> Reply {
+        let exe = match std::fs::read(path) {
+            Ok(data) => data,
+            Err(e) => return Reply::err(format!("read {path}: {e}")),
+        };
+        let mut waited = 0;
+        if wait {
+            let before = sys.cycles();
+            if !sys.run_until_pc(SHELL_ENTRY, BOOT_CAP) {
+                let pc = sys.cpu.pc;
+                return Reply::err(format!(
+                    "no shell entry in {BOOT_CAP} cycles (pc={pc:#010x}); append `now` if already booted"
+                ));
+            }
+            waited = sys.cycles() - before;
+            self.frames_run += waited / CYCLES_PER_FRAME;
+        }
+        match sys.load_exe(&exe) {
+            Ok(()) => Reply::ok(format!(
+                "loaded {} bytes from {path}, pc={:#010x}{}",
+                exe.len(),
+                sys.cpu.pc,
+                if wait {
+                    format!(", booted in {waited} cycles")
+                } else {
+                    String::new()
+                }
+            )),
+            Err(e) => Reply::err(e),
+        }
+    }
+
     pub fn execute(&mut self, sys: &mut PsxSystem, line: &str, debugger_owns: bool) -> Reply {
         let mut words = line.split_whitespace();
         let cmd = words.next().unwrap_or("");
         let args: Vec<&str> = words.collect();
         // The debugger and the control port must not both drive execution
         // (loadstate mutates it just as much as running does).
-        if debugger_owns && matches!(cmd, "run" | "press" | "loadstate") {
+        if debugger_owns && matches!(cmd, "run" | "press" | "loadstate" | "loadexe") {
             return Reply::err("debugger attached; execution is owned by the debugger");
         }
         match (cmd, args.as_slice()) {
@@ -310,6 +349,11 @@ impl Controller {
                 },
                 Err(e) => Reply::err(format!("read {path}: {e}")),
             },
+            // Side-load a program over the running machine, the shortcut the
+            // shell would take after reading it off a disc. `now` skips the
+            // boot wait for a machine the caller has already run past it.
+            ("loadexe", [path]) => self.load_exe(sys, path, true),
+            ("loadexe", [path, "now"]) => self.load_exe(sys, path, false),
             ("quit", _) => Reply {
                 ok: true,
                 payload: "bye".into(),
@@ -333,6 +377,8 @@ poke <hexaddr> <hex>  write bytes to RAM/scratchpad
 disc open             open the drive lid (stops the drive, flags shell open)
 disc close [path]     close the lid, on a new image if given, else the old one
 tty                   TTY output accumulated since the last `tty`
+loadexe <path> [now]  side-load a PS-X EXE (boots to the shell first unless
+                      `now`, for a machine already run past it)
 savestate <path>      snapshot the full machine state to a file
 loadstate <path>      restore a snapshot (BIOS/disc/memcard carry over)
 quit                  shut the emulator down
@@ -491,6 +537,82 @@ mod tests {
         assert!(!c.execute(&mut sys, "run -5", false).ok);
         assert!(!c.execute(&mut sys, "press NOPE 1", false).ok);
         assert!(!c.execute(&mut sys, "peek xyz 4", false).ok);
+    }
+
+    /// Minimal but valid PS-X EXE: header, one word of body at `dest`.
+    fn exe_image(pc: u32, gp: u32, dest: u32, sp_base: u32, body: &[u8]) -> Vec<u8> {
+        let mut exe = vec![0u8; 0x800];
+        exe[..8].copy_from_slice(b"PS-X EXE");
+        let mut put = |off: usize, v: u32| exe[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        put(0x10, pc);
+        put(0x14, gp);
+        put(0x18, dest);
+        put(0x1c, body.len() as u32);
+        put(0x30, sp_base);
+        exe.extend_from_slice(body);
+        exe
+    }
+
+    fn temp_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("ps1e-ctl-test-{}-{tag}", std::process::id()))
+    }
+
+    #[test]
+    fn loadexe_now_takes_pc_and_registers() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        let path = temp_path("probe.exe");
+        let p = path.to_str().unwrap();
+        let image = exe_image(
+            0x8001_0000,
+            0x8002_0000,
+            0x8001_0000,
+            0x801f_ff00,
+            &[0xef, 0xbe, 0xad, 0xde],
+        );
+        std::fs::write(&path, &image).unwrap();
+
+        // `now` skips the boot wait, which a zero BIOS would never satisfy.
+        let r = c.execute(&mut sys, &format!("loadexe {p} now"), false);
+        assert!(r.ok, "{}", r.payload);
+        assert_eq!(sys.cpu.pc, 0x8001_0000);
+        assert_eq!(sys.cpu.regs[28], 0x8002_0000);
+        assert_eq!(sys.cpu.regs[29], 0x801f_ff00);
+        assert_eq!(sys.cpu.regs[30], 0x801f_ff00);
+        let r = c.execute(&mut sys, "peek 80010000 4", false);
+        assert!(r.payload.contains("ef be ad de"), "{}", r.payload);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn loadexe_rejects_bad_input() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        let path = temp_path("garbage.exe");
+        let p = path.to_str().unwrap();
+        std::fs::write(&path, b"not an executable").unwrap();
+
+        assert!(!c.execute(&mut sys, &format!("loadexe {p} now"), false).ok);
+        assert!(!c.execute(&mut sys, "loadexe /no/such/file now", false).ok);
+        // Loading mutates execution, so the debugger owns it exclusively.
+        assert!(!c.execute(&mut sys, &format!("loadexe {p} now"), true).ok);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn loadexe_reports_a_bios_that_never_reaches_the_shell() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        let path = temp_path("wait.exe");
+        let p = path.to_str().unwrap();
+        std::fs::write(&path, exe_image(0x8001_0000, 0, 0x8001_0000, 0, &[0; 4])).unwrap();
+
+        // The zero BIOS never gets to the shell; the wait must give up and
+        // point at the `now` form rather than wedge the port.
+        let r = c.execute(&mut sys, &format!("loadexe {p}"), false);
+        assert!(!r.ok);
+        assert!(r.payload.contains("now"), "{}", r.payload);
+
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
