@@ -466,7 +466,7 @@ impl Cdrom {
             return;
         }
         let raw = self.disc.as_ref().and_then(|d| d.sector(self.read_lba));
-        for frame in raw.unwrap().chunks_exact(4) {
+        for frame in raw.unwrap().as_chunks::<4>().0 {
             self.xa_out
                 .push_back(i16::from_le_bytes([frame[0], frame[1]]));
             self.xa_out

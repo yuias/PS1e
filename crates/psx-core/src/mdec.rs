@@ -33,10 +33,7 @@ mod flat_blocks {
         if !flat.len().is_multiple_of(64) {
             return Err(D::Error::custom("block data not a multiple of 64"));
         }
-        Ok(flat
-            .chunks_exact(64)
-            .map(|c| c.try_into().unwrap())
-            .collect())
+        Ok(flat.as_chunks::<64>().0.to_vec())
     }
 }
 

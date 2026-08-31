@@ -462,7 +462,7 @@ impl Gpu {
         }
 
         let op = (self.fifo[0] >> 24) as u8;
-        let cmd: Vec<u32> = self.fifo.drain(..).collect();
+        let cmd = std::mem::take(&mut self.fifo);
         self.execute(op, &cmd);
     }
 
