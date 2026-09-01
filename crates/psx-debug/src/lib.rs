@@ -299,8 +299,8 @@ impl DebugServer {
         if let Some(rest) = text.strip_prefix("G") {
             return match packet::from_hex(rest) {
                 Some(bytes) if bytes.len() == registers::NUM_REGS * 4 => {
-                    for (i, w) in bytes.chunks_exact(4).enumerate() {
-                        registers::write(sys, i, u32::from_le_bytes(w.try_into().unwrap()));
+                    for (i, w) in bytes.as_chunks::<4>().0.iter().enumerate() {
+                        registers::write(sys, i, u32::from_le_bytes(*w));
                     }
                     b"OK".to_vec()
                 }
