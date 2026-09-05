@@ -1,8 +1,7 @@
 # Development rules
 
-##  Comment style
+## Comment style
 
-- Use clear, concise words for inline comments.
 - Write concise code comments
   - Focus on the "why" rather than the "what".
   - Avoid stating the obvious; only explain non-trivial logic or edge cases.
