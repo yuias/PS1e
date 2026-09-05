@@ -138,11 +138,11 @@ impl App {
             .add_filter("PlayStation disc image", &["cue", "bin", "img"])
             .pick_file();
         let disc = picked.and_then(|path| match disc::load_disc(&path) {
-            Ok((d, info)) => {
+            Ok(loaded) => {
                 self.disc_error = None;
-                self.disc = Some(info);
+                self.disc = Some(loaded.info.clone());
                 self.title_dirty = true;
-                Some(d)
+                Some(loaded)
             }
             Err(e) => {
                 tracing::error!("{e}");
@@ -307,7 +307,9 @@ impl App {
                 ui.monospace(state);
                 ui.separator();
                 match &self.disc {
-                    Some(d) => ui.monospace(&d.file),
+                    Some(d) => ui
+                        .monospace(&d.file)
+                        .on_hover_text(d.path.display().to_string()),
                     None => ui.weak("no disc"),
                 };
                 ui.separator();

@@ -151,9 +151,9 @@ fn main() -> eframe::Result {
     let mut disc_info = None;
     if let Some(path) = &args.disc {
         match disc::load_disc(std::path::Path::new(path)) {
-            Ok((d, info)) => {
-                sys.insert_disc(d);
-                disc_info = Some(info);
+            Ok(loaded) => {
+                sys.insert_disc(loaded.disc);
+                disc_info = Some(loaded.info);
             }
             Err(e) => {
                 eprintln!("{e}");

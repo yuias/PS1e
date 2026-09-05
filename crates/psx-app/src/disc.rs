@@ -5,11 +5,14 @@
 //! when a pick turns out to be unreadable.
 
 use psx_core::cdrom::Disc;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-/// What the frontend shows about the disc in the drive.
+/// What the frontend knows about the disc in the drive.
 #[derive(Clone, Debug)]
 pub struct DiscInfo {
+    /// Where the image was loaded from; sidecar files (per-disc settings)
+    /// live next to it.
+    pub path: PathBuf,
     /// File name of the image, for the status bar. The full path is too wide
     /// for it, and the directory rarely identifies the disc.
     pub file: String,
@@ -18,10 +21,18 @@ pub struct DiscInfo {
     pub title: String,
 }
 
+/// A disc image plus everything derived from its location, handed around
+/// as one value so every way of opening a disc (command line, picker,
+/// control port) delivers the same bundle to the machine.
+pub struct LoadedDisc {
+    pub disc: Disc,
+    pub info: DiscInfo,
+}
+
 /// Load a disc image: a raw .bin (single data track), or a .cue sheet
 /// (multi-track, multi-file), together with the [`DiscInfo`] the UI names it
 /// by. The core never looks at that info.
-pub fn load_disc(path: &Path) -> Result<(Disc, DiscInfo), String> {
+pub fn load_disc(path: &Path) -> Result<LoadedDisc, String> {
     let disc = read_disc(path)?;
     let lossy = |s: &std::ffi::OsStr| s.to_string_lossy().into_owned();
     let file = path
@@ -30,7 +41,12 @@ pub fn load_disc(path: &Path) -> Result<(Disc, DiscInfo), String> {
     let title = volume_label(&disc)
         .or_else(|| path.file_stem().map(lossy))
         .unwrap_or_else(|| file.clone());
-    Ok((disc, DiscInfo { file, title }))
+    let info = DiscInfo {
+        path: path.to_path_buf(),
+        file,
+        title,
+    };
+    Ok(LoadedDisc { disc, info })
 }
 
 /// The ISO9660 volume identifier of the data track, or `None` when the disc

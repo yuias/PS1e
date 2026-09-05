@@ -30,7 +30,7 @@ pub enum Command {
     /// Close the lid, optionally over a new disc (`None` puts the current
     /// one back). A running game sees the swap through the drive status,
     /// so this needs no reset.
-    CloseShell(Option<psx_core::cdrom::Disc>),
+    CloseShell(Option<crate::disc::LoadedDisc>),
     SaveState,
     LoadState,
     SetGpuLog(bool),
@@ -252,7 +252,9 @@ impl Worker {
                     self.sys.bus.sio.memcard = memcard;
                 }
                 Command::OpenShell if !debugger_active => self.sys.open_shell(),
-                Command::CloseShell(disc) if !debugger_active => self.sys.close_shell(disc),
+                Command::CloseShell(disc) if !debugger_active => {
+                    self.sys.close_shell(disc.map(|d| d.disc))
+                }
                 Command::SetRunning(_)
                 | Command::Step
                 | Command::Reset
