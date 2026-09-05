@@ -216,7 +216,9 @@ pub struct Cdrom {
     data: Vec<u8>,
     data_pos: usize,
     /// Decoded XA-ADPCM audio, interleaved stereo at 44.1kHz, drained into
-    /// the SPU by the system.
+    /// the SPU by the system. Pending host audio, not machine state: a
+    /// state load starts with an empty queue.
+    #[serde(skip)]
     pub xa_out: VecDeque<i16>,
     xa_hist: [(i32, i32); 2],
     /// Last-seen XA coding byte, for change logging.
@@ -224,8 +226,11 @@ pub struct Cdrom {
     /// Bring-up statistics: decoded sectors, pushed output frames, and
     /// frames lost to the buffer cap (indicates production outpacing
     /// consumption — heard as fast-forward garble).
+    #[serde(skip)]
     pub xa_sectors: u64,
+    #[serde(skip)]
     pub xa_frames: u64,
+    #[serde(skip)]
     pub xa_dropped: u64,
     /// Resampler state: previous input frame and output phase in [0, 1)
     /// scaled by the source rate.
@@ -272,6 +277,10 @@ impl Cdrom {
             xa_prev: (0, 0),
             xa_phase: 0,
         }
+    }
+
+    pub fn has_disc(&self) -> bool {
+        self.disc.is_some()
     }
 
     /// Remove the disc (save-state plumbing: the image is carried over

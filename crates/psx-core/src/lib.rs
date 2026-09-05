@@ -14,11 +14,13 @@ pub mod scheduler;
 pub mod sio;
 pub mod spu;
 pub mod timers;
+pub mod tty;
 
 use bus::Bus;
 use cpu::Cpu;
 use scheduler::{EventKind, Scheduler};
 use tracing::info;
+use tty::Tty;
 
 /// CPU clock: 33.8688 MHz.
 pub const CPU_CLOCK_HZ: u64 = 33_868_800;
@@ -38,13 +40,30 @@ pub struct PsxSystem {
     scheduler: Scheduler,
     cycles: u64,
     next_sample: u64,
-    tty: String,
+    #[serde(skip)]
+    tty: Tty,
+}
+
+/// Everything the frontend owns and the machine merely holds: the BIOS
+/// image, the disc in the drive, the memory card, the GPU command-log
+/// switch and the TTY capture. None of it is machine state, so none of it
+/// is serialized, and all of it must survive every rebuild of the machine
+/// (state load, reset). [`PsxSystem::take_ambient`] and
+/// [`PsxSystem::set_ambient`] are the single carry path; anything added
+/// here is carried everywhere by construction.
+#[derive(Default)]
+pub struct Ambient {
+    pub bios: Box<[u8]>,
+    pub disc: Option<cdrom::Disc>,
+    pub memcard: memcard::MemCard,
+    pub log_gpu: bool,
+    pub tty: Tty,
 }
 
 /// Save-state file magic + format version. Bump the version on any change
 /// to a serialized struct.
 const STATE_MAGIC: &[u8; 4] = b"PS1E";
-const STATE_VERSION: u16 = 9;
+const STATE_VERSION: u16 = 10;
 
 /// Cheap content fingerprint (FNV-1a) to flag cross-BIOS state loads.
 fn bios_fingerprint(bios: &[u8]) -> u32 {
@@ -55,16 +74,55 @@ fn bios_fingerprint(bios: &[u8]) -> u32 {
 
 impl PsxSystem {
     pub fn new(bios: Vec<u8>) -> Result<Self, String> {
+        Ok(Self::with_bus(Bus::new(bios)?))
+    }
+
+    fn with_bus(bus: Bus) -> Self {
         let mut scheduler = Scheduler::new();
         scheduler.schedule(CYCLES_PER_FRAME, EventKind::VBlank);
-        Ok(Self {
+        Self {
             cpu: Cpu::new(),
-            bus: Bus::new(bios)?,
+            bus,
             scheduler,
             cycles: 0,
             next_sample: spu::CYCLES_PER_SAMPLE,
-            tty: String::new(),
-        })
+            tty: Tty::default(),
+        }
+    }
+
+    /// Detach the frontend-owned assets, leaving defaults behind. Pair with
+    /// [`PsxSystem::set_ambient`] around anything that replaces the machine.
+    pub fn take_ambient(&mut self) -> Ambient {
+        Ambient {
+            bios: std::mem::take(&mut self.bus.bios),
+            disc: self.bus.cdrom.take_disc(),
+            memcard: std::mem::take(&mut self.bus.sio.memcard),
+            log_gpu: self.bus.gpu.log_commands,
+            tty: std::mem::take(&mut self.tty),
+        }
+    }
+
+    /// Install the frontend-owned assets. Any disc already in the drive is
+    /// replaced outright, not swapped through the lid (see
+    /// [`PsxSystem::open_shell`]).
+    pub fn set_ambient(&mut self, ambient: Ambient) {
+        self.bus.bios = ambient.bios;
+        self.bus.cdrom.set_disc(ambient.disc);
+        self.bus.sio.memcard = ambient.memcard;
+        self.bus.gpu.log_commands = ambient.log_gpu;
+        self.tty = ambient.tty;
+    }
+
+    /// Power-cycle the machine, keeping the ambient assets.
+    pub fn reset(&mut self) {
+        let ambient = self.take_ambient();
+        *self = Self::with_bus(Bus::build(Box::default()));
+        self.set_ambient(ambient);
+    }
+
+    /// Switch GP0/GP1 command decoding to the log on or off.
+    pub fn set_gpu_log(&mut self, on: bool) {
+        self.bus.gpu.log_commands = on;
     }
 
     /// Total elapsed CPU cycles since reset.
@@ -72,9 +130,9 @@ impl PsxSystem {
         self.cycles
     }
 
-    /// Serialize the complete machine state. The BIOS image, disc image and
-    /// memory card are *not* included: they are ambient assets the frontend
-    /// owns (and rolling back the memory card would corrupt real saves).
+    /// Serialize the complete machine state. The [`Ambient`] assets are
+    /// *not* included: the frontend owns them, and rolling back the memory
+    /// card would corrupt real saves.
     pub fn save_state(&self) -> Result<Vec<u8>, String> {
         let mut out = Vec::with_capacity(8 * 1024 * 1024);
         out.extend_from_slice(STATE_MAGIC);
@@ -84,7 +142,7 @@ impl PsxSystem {
     }
 
     /// Restore a state produced by [`PsxSystem::save_state`], carrying over
-    /// the current BIOS, disc and memory card.
+    /// the current [`Ambient`] assets.
     pub fn load_state(&mut self, data: &[u8]) -> Result<(), String> {
         let (header, body) = data
             .split_at_checked(10)
@@ -104,17 +162,23 @@ impl PsxSystem {
         }
         let mut new: PsxSystem =
             postcard::from_bytes(body).map_err(|e| format!("deserialize failed: {e}"))?;
-        new.bus.bios = std::mem::take(&mut self.bus.bios);
-        new.bus.cdrom.set_disc(self.bus.cdrom.take_disc());
-        new.bus.sio.memcard = std::mem::take(&mut self.bus.sio.memcard);
-        new.bus.gpu.log_commands = self.bus.gpu.log_commands;
+        // Only after the decode succeeded: a bad file must not eat the disc
+        new.set_ambient(self.take_ambient());
         *self = new;
         Ok(())
     }
 
-    /// TTY output captured so far (kernel `putchar`).
+    /// TTY output retained so far (kernel `putchar`); see [`Tty`] for the
+    /// retention rule.
     pub fn tty_output(&self) -> &str {
-        &self.tty
+        self.tty.text()
+    }
+
+    /// TTY output written after monotonic position `pos`, plus the next
+    /// position. Survives state loads, resets and buffer trimming, unlike
+    /// an index into [`PsxSystem::tty_output`].
+    pub fn tty_since(&self, pos: u64) -> (&str, u64) {
+        self.tty.since(pos)
     }
 
     /// Side-load a PS-X EXE image over the running machine.
@@ -291,12 +355,78 @@ impl PsxSystem {
         let is_putchar = (pc == 0xa0 && call == 0x3c) || (pc == 0xb0 && call == 0x3d);
         if is_putchar {
             let ch = self.cpu.regs[4] as u8 as char; // $a0
-            self.tty.push(ch);
-            if ch == '\n'
-                && let Some(line) = self.tty.lines().last()
-            {
+            if let Some(line) = self.tty.push(ch) {
                 info!(target: "psx_core::tty", "{line}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn system() -> PsxSystem {
+        let mut sys = PsxSystem::new(vec![0; bus::BIOS_SIZE]).unwrap();
+        sys.set_gpu_log(true);
+        sys.insert_disc(cdrom::Disc::new(vec![0; 2352]).unwrap());
+        sys.bus.sio.memcard.data[0] = 0x4d;
+        for c in "boot\n".chars() {
+            sys.tty.push(c);
+        }
+        sys
+    }
+
+    fn assert_ambient_intact(sys: &PsxSystem) {
+        assert!(sys.bus.gpu.log_commands);
+        assert!(sys.bus.cdrom.has_disc());
+        assert_eq!(sys.bus.sio.memcard.data[0], 0x4d);
+        assert_eq!(sys.bus.bios.len(), bus::BIOS_SIZE);
+        assert_eq!(sys.tty_output(), "boot\n");
+    }
+
+    #[test]
+    fn ambient_assets_survive_a_state_load() {
+        let mut sys = system();
+        sys.run_cycles(1000);
+        let saved_at = sys.cycles();
+        let state = sys.save_state().unwrap();
+        sys.run_cycles(1000);
+        sys.load_state(&state).unwrap();
+        assert_ambient_intact(&sys);
+        assert_eq!(sys.cycles(), saved_at);
+    }
+
+    #[test]
+    fn a_bad_state_file_keeps_the_ambient_assets() {
+        let mut sys = system();
+        let mut state = sys.save_state().unwrap();
+        state.truncate(state.len() / 2);
+        assert!(sys.load_state(&state).is_err());
+        assert_ambient_intact(&sys);
+    }
+
+    #[test]
+    fn reset_keeps_the_ambient_assets_and_restarts_the_machine() {
+        let mut sys = system();
+        sys.run_cycles(1000);
+        sys.reset();
+        assert_ambient_intact(&sys);
+        assert_eq!(sys.cycles(), 0);
+        assert_eq!(sys.cpu.pc, 0xbfc0_0000);
+    }
+
+    #[test]
+    fn tty_cursor_survives_load_and_reset() {
+        let mut sys = system();
+        let (first, pos) = sys.tty_since(0);
+        assert_eq!(first, "boot\n");
+        let state = sys.save_state().unwrap();
+        sys.load_state(&state).unwrap();
+        sys.reset();
+        for c in "later\n".chars() {
+            sys.tty.push(c);
+        }
+        assert_eq!(sys.tty_since(pos).0, "later\n");
     }
 }

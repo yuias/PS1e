@@ -96,13 +96,11 @@ pub struct Shared {
 
 /// Everything the worker owns besides the system itself.
 pub struct WorkerConfig {
-    pub bios: Vec<u8>,
     pub memcard_path: PathBuf,
     pub state_path: PathBuf,
     pub debugger: Option<psx_debug::DebugServer>,
     pub wait_debugger: bool,
     pub volume: f32,
-    pub log_gpu: bool,
 }
 
 pub struct Emu {
@@ -155,7 +153,8 @@ struct Worker {
     debugger_seen: bool,
     scratch: Vec<i16>,
     published_frame: u64,
-    tty_len: usize,
+    /// Monotonic TTY position already copied to `shared.tty`.
+    tty_pos: u64,
     /// Wall-clock pacer (only used when no audio device exists).
     clock: Instant,
     deficit: f64,
@@ -184,7 +183,7 @@ impl Worker {
             debugger_seen: false,
             scratch: Vec::new(),
             published_frame: 0,
-            tty_len: 0,
+            tty_pos: 0,
             clock: Instant::now(),
             deficit: 0.0,
         }
@@ -197,7 +196,6 @@ impl Worker {
 
     fn run(mut self) {
         self.audio = Audio::new();
-        self.sys.bus.gpu.log_commands = self.cfg.log_gpu;
         loop {
             if !self.handle_commands() {
                 break;
@@ -240,17 +238,7 @@ impl Worker {
                     self.running = false;
                     self.sys.step();
                 }
-                Command::Reset if !debugger_active => {
-                    // Ambient assets survive a reset: disc, memory card
-                    // (mid-write contents included) and the log switch
-                    let log = self.sys.bus.gpu.log_commands;
-                    let disc = self.sys.bus.cdrom.take_disc();
-                    let memcard = std::mem::take(&mut self.sys.bus.sio.memcard);
-                    self.sys = PsxSystem::new(self.cfg.bios.clone()).expect("reset failed");
-                    self.sys.bus.gpu.log_commands = log;
-                    self.sys.bus.cdrom.set_disc(disc);
-                    self.sys.bus.sio.memcard = memcard;
-                }
+                Command::Reset if !debugger_active => self.sys.reset(),
                 Command::OpenShell if !debugger_active => self.sys.open_shell(),
                 Command::CloseShell(disc) if !debugger_active => {
                     self.sys.close_shell(disc.map(|d| d.disc))
@@ -289,7 +277,7 @@ impl Worker {
                         ),
                     }
                 }
-                Command::SetGpuLog(v) => self.sys.bus.gpu.log_commands = v,
+                Command::SetGpuLog(v) => self.sys.set_gpu_log(v),
                 Command::Quit => return false,
             }
         }
@@ -382,15 +370,11 @@ impl Worker {
             }
         }
 
-        let tty = self.sys.tty_output();
-        if tty.len() > self.tty_len {
-            self.shared
-                .tty
-                .lock()
-                .unwrap()
-                .push_str(&tty[self.tty_len..]);
-            self.tty_len = tty.len();
+        let (new, pos) = self.sys.tty_since(self.tty_pos);
+        if !new.is_empty() {
+            self.shared.tty.lock().unwrap().push_str(new);
         }
+        self.tty_pos = pos;
     }
 
     fn flush_memcard(&mut self) {

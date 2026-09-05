@@ -82,7 +82,9 @@ pub struct Gpu {
     pub odd_frame: bool,
 
     /// When set, every executed GP0/GP1 command is decoded to the
-    /// `psx_core::gpu::cmd` tracing target at debug level.
+    /// `psx_core::gpu::cmd` tracing target at debug level. A frontend
+    /// switch, not machine state: kept out of save states.
+    #[serde(skip)]
     pub log_commands: bool,
     /// Vblank count since reset; tags command-log entries with the frame.
     pub frame_count: u64,

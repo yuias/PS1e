@@ -166,6 +166,12 @@ impl Bus {
                 bios.len()
             ));
         }
+        Ok(Self::build(bios.into_boxed_slice()))
+    }
+
+    /// Power-on state around a BIOS image that is already validated, or
+    /// empty and installed afterwards (see `PsxSystem::reset`).
+    pub(crate) fn build(bios: Box<[u8]>) -> Self {
         let mut mem_ctrl = [0; 9];
         for reg in ACCESS_REGS {
             mem_ctrl[reg] = DELAY_RESET;
@@ -173,7 +179,7 @@ impl Bus {
         let mut bus = Self {
             ram: vec![0; RAM_SIZE].into_boxed_slice(),
             scratchpad: vec![0; SCRATCHPAD_SIZE].into_boxed_slice(),
-            bios: bios.into_boxed_slice(),
+            bios,
             irq: Irq::default(),
             gpu: Gpu::new(),
             dma: Dma::new(),
@@ -191,7 +197,7 @@ impl Bus {
             access: [AccessCost::default(); 5],
         };
         bus.refresh_access();
-        Ok(bus)
+        bus
     }
 
     /// Strip the virtual-memory segment, yielding a physical address.

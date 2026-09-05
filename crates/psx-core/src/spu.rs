@@ -84,11 +84,14 @@ pub struct Spu {
     endx: u32,
     xfer_addr: u32,
     irq_flag: bool,
-    /// Interleaved stereo output, drained by the frontend.
+    /// Interleaved stereo output, drained by the frontend. Pending host
+    /// audio, not machine state: a state load starts with an empty queue.
+    #[serde(skip)]
     output: VecDeque<i16>,
     /// CD/XA audio input frames, mixed in at 44.1kHz.
     cd_in: VecDeque<(i16, i16)>,
     /// Frames lost to the input cap (drift diagnostics).
+    #[serde(skip)]
     pub cd_dropped: u64,
     /// Reverb work-area cursor (bytes, relative to mBASE) and held output;
     /// the reverb core runs at 22050 Hz (every other sample).

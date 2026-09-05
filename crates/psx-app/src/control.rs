@@ -138,8 +138,8 @@ impl Reply {
 pub struct Controller {
     /// Buttons held across `run` commands (`input set`).
     held: u16,
-    /// Byte offset into the TTY buffer already returned by `tty`.
-    tty_read: usize,
+    /// Monotonic TTY position already returned by `tty`.
+    tty_read: u64,
     frames_run: u64,
 }
 
@@ -309,9 +309,9 @@ impl Controller {
                 Err(e) => Reply::err(e),
             },
             ("tty", _) => {
-                let all = sys.tty_output();
-                let new = all[self.tty_read.min(all.len())..].to_string();
-                self.tty_read = all.len();
+                let (new, pos) = sys.tty_since(self.tty_read);
+                let new = new.to_string();
+                self.tty_read = pos;
                 Reply::ok(new)
             }
             ("frame", [path]) => {

@@ -146,8 +146,8 @@ fn main() -> eframe::Result {
         });
     let bios = std::fs::read(&bios_path)
         .unwrap_or_else(|e| panic!("failed to read BIOS '{}': {e}", bios_path.display()));
-    let mut sys = PsxSystem::new(bios.clone()).expect("failed to create system");
-    sys.bus.gpu.log_commands = args.log_gpu;
+    let mut sys = PsxSystem::new(bios).expect("failed to create system");
+    sys.set_gpu_log(args.log_gpu);
     let mut disc_info = None;
     if let Some(path) = &args.disc {
         match disc::load_disc(std::path::Path::new(path)) {
@@ -219,13 +219,11 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             let worker_cfg = emu::WorkerConfig {
-                bios,
                 state_path: memcard_path.with_file_name("state0.sst"),
                 memcard_path,
                 debugger,
                 wait_debugger: args.wait_debugger,
                 volume: cfg.volume,
-                log_gpu: args.log_gpu,
             };
             let emu = emu::spawn(sys, worker_cfg, cc.egui_ctx.clone());
             Ok(Box::new(ui::App::new(
