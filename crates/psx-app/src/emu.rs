@@ -52,6 +52,8 @@ pub enum Command {
     SaveState,
     LoadState,
     SetGpuLog(bool),
+    /// Run one scanner pass and leave the result in [`Shared::scan`].
+    Scan(crate::scan::Request),
     Quit,
 }
 
@@ -112,6 +114,10 @@ pub struct Shared {
     /// and the window read back from it.
     pub view_base: AtomicU32,
     pub memory: Mutex<MemoryView>,
+    /// Last scanner pass. The candidate list itself stays on the worker,
+    /// so it survives the page being switched away from -- the whole
+    /// point of the loop is to go back to the game and come back.
+    pub scan: Mutex<Option<crate::scan::Outcome>>,
     /// Which UI panels are on screen, as [`PANEL_REGS`] and friends. What a
     /// hidden panel would show costs nothing to leave unpublished, so the
     /// worker skips the copy rather than the UI skipping the draw.
@@ -186,6 +192,9 @@ struct Worker {
     /// Wall-clock pacer (only used when no audio device exists).
     clock: Instant,
     deficit: f64,
+    /// Scanner candidates, kept across passes and across the UI showing
+    /// some other page.
+    scan: Option<crate::scan::Scan>,
 }
 
 impl Worker {
@@ -214,6 +223,7 @@ impl Worker {
             tty_pos: 0,
             clock: Instant::now(),
             deficit: 0.0,
+            scan: None,
         }
     }
 
@@ -306,6 +316,13 @@ impl Worker {
                     }
                 }
                 Command::SetGpuLog(v) => self.sys.set_gpu_log(v),
+                Command::Scan(req) => {
+                    let (scan, outcome) =
+                        crate::scan::Scan::pass(self.scan.take(), req, &self.sys.bus.ram);
+                    self.scan = Some(scan);
+                    *self.shared.scan.lock().unwrap() = Some(outcome);
+                    self.ctx.request_repaint();
+                }
                 Command::Quit => return false,
             }
         }

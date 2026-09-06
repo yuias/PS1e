@@ -11,6 +11,7 @@ use crate::disc::DiscInfo;
 use crate::emu;
 use crate::emu::{Command, DebuggerState, Emu, FrameSnapshot, Status};
 use crate::gamepad::Gamepad;
+use crate::scan;
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -120,6 +121,10 @@ pub struct App {
     /// Memory page: the address as typed, kept separate from the offset
     /// sent to the worker so a half-typed address does not move the view.
     mem_addr: String,
+    /// Scanner controls. The candidate list itself lives on the worker.
+    scan_width: u8,
+    scan_value: String,
+    scan_started: bool,
     gpu_log: bool,
     /// Master volume applied on top of the SPU output (0..=1).
     volume: f32,
@@ -189,6 +194,9 @@ impl App {
             shown_vram: None,
             vram_scratch: Vec::new(),
             mem_addr: format!("{:08x}", KSEG0),
+            scan_width: 4,
+            scan_value: String::new(),
+            scan_started: false,
             gpu_log: log_gpu,
             volume,
             config,
@@ -333,6 +341,106 @@ impl App {
                 ui.monospace(format!("{addr:08x}  {hex} {ascii}"));
             }
         });
+        ui.separator();
+        self.scanner(ui);
+    }
+
+    /// Scanner controls and the last pass's hits. Every pass is asked for
+    /// explicitly -- nothing here runs per frame.
+    fn scanner(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Scan");
+        ui.horizontal(|ui| {
+            for w in [1u8, 2, 4] {
+                ui.selectable_value(&mut self.scan_width, w, format!("{}", w * 8));
+            }
+            ui.label("bit");
+        });
+        ui.horizontal(|ui| {
+            ui.label("value");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.scan_value)
+                    .font(egui::TextStyle::Monospace)
+                    .desired_width(80.0),
+            );
+        });
+        let value = self.scan_value.trim();
+        let parsed = match value.strip_prefix("0x") {
+            Some(hex) => u32::from_str_radix(hex, 16).ok(),
+            None => value.parse::<u32>().ok(),
+        };
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(parsed.is_some(), egui::Button::new("First scan"))
+                .on_disabled_hover_text("decimal, or 0x-prefixed hex")
+                .clicked()
+                && let Some(v) = parsed
+            {
+                self.send_scan(scan::Filter::Exact(v), true);
+            }
+            if ui
+                .button("Unknown")
+                .on_hover_text("start with every address, then narrow by what moves")
+                .clicked()
+            {
+                self.send_scan(scan::Filter::Unknown, true);
+            }
+        });
+        ui.add_enabled_ui(self.scan_started, |ui| {
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(parsed.is_some(), egui::Button::new("= value"))
+                    .clicked()
+                    && let Some(v) = parsed
+                {
+                    self.send_scan(scan::Filter::Exact(v), false);
+                }
+                for (label, filter) in [
+                    ("changed", scan::Filter::Changed),
+                    ("same", scan::Filter::Unchanged),
+                    ("up", scan::Filter::Increased),
+                    ("down", scan::Filter::Decreased),
+                ] {
+                    if ui.button(label).clicked() {
+                        self.send_scan(filter, false);
+                    }
+                }
+            });
+        });
+
+        let outcome = self.emu.shared.scan.lock().unwrap().clone();
+        let Some(outcome) = outcome else { return };
+        ui.separator();
+        let shown = outcome.hits.len();
+        if outcome.count > shown {
+            ui.label(format!("{} hits, first {shown}", outcome.count));
+        } else {
+            ui.label(format!("{} hits", outcome.count));
+        }
+        egui::ScrollArea::vertical()
+            .max_height(240.0)
+            .show(ui, |ui| {
+                for (addr, value) in &outcome.hits {
+                    let digits = 2 * outcome.width as usize;
+                    let row = format!("{:08x}  {value:0digits$x}", KSEG0 + addr);
+                    // Clicking a hit walks the viewer over to it.
+                    if ui
+                        .selectable_label(false, egui::RichText::new(row).monospace())
+                        .clicked()
+                    {
+                        self.mem_addr = format!("{:08x}", KSEG0 + addr);
+                        self.emu.shared.view_base.store(*addr, Ordering::Relaxed);
+                    }
+                }
+            });
+    }
+
+    fn send_scan(&mut self, filter: scan::Filter, restart: bool) {
+        self.emu.send(Command::Scan(scan::Request {
+            width: self.scan_width,
+            filter,
+            restart,
+        }));
+        self.scan_started = true;
     }
 
     /// VRAM page: the whole 1024x512 grid, either as the 15-bit words the

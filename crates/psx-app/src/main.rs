@@ -23,6 +23,7 @@ mod control;
 mod disc;
 mod emu;
 mod gamepad;
+mod scan;
 mod ui;
 
 use psx_core::PsxSystem;
