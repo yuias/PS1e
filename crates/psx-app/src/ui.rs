@@ -285,6 +285,19 @@ impl App {
         }
     }
 
+    /// VRAM page: the whole 1024x512 grid, either as the 15-bit words the
+    /// GPU stores or reinterpreted as packed 24-bit colour.
+    ///
+    /// Written to the same rule as the pane's pages -- it draws into the
+    /// `Ui` it is handed and never builds its own container -- but it is
+    /// not in [`Page::ALL`]: 1024 px does not fit a side pane, so the
+    /// caller currently hands it a window. Putting it on a tab is adding
+    /// the variant, nothing here.
+    fn vram_page(&mut self, ui: &mut egui::Ui, tex: &egui::TextureHandle) {
+        ui.checkbox(&mut self.vram_as_24bit, "interpret as 24-bit RGB");
+        ui.add(egui::Image::new(tex));
+    }
+
     /// Menu bar: every command the shell offers, grouped by what it acts on.
     fn menu_bar(&mut self, ctx: &egui::Context, running: bool, debugger_active: bool) {
         egui::TopBottomPanel::top("menu").show(ctx, |ui| {
@@ -784,10 +797,7 @@ impl eframe::App for App {
                 egui::Window::new("VRAM (1024x512)")
                     .default_width(1024.0)
                     .open(&mut open)
-                    .show(ctx, |ui| {
-                        ui.checkbox(&mut self.vram_as_24bit, "interpret as 24-bit RGB");
-                        ui.add(egui::Image::new(&tex));
-                    });
+                    .show(ctx, |ui| self.vram_page(ui, &tex));
                 self.show_vram = open;
             }
         }
