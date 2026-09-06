@@ -361,18 +361,6 @@ impl App {
                     }
                     ui.separator();
                     ui.checkbox(&mut self.show_pane, "Side pane");
-                    // Opening the pane on the page you asked for; picking a
-                    // page while it is hidden would otherwise take two trips
-                    // through the menu.
-                    for page in Page::ALL {
-                        let shown = self.show_pane && self.page == page;
-                        if ui.selectable_label(shown, format!("    {}", page.label())).clicked() {
-                            self.show_pane = true;
-                            self.page = page;
-                            ui.close();
-                        }
-                    }
-                    ui.separator();
                     ui.checkbox(&mut self.show_tty, "TTY panel");
                     ui.checkbox(&mut self.show_vram, "VRAM viewer");
                     ui.separator();
