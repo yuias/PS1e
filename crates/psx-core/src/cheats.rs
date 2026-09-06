@@ -17,13 +17,83 @@
 
 use crate::bus::Bus;
 
-/// One code line.
+/// How a conditional compares. psx-spx words every one of them with the
+/// code's own operand on the left: `D2` is "If dddd<[aaaaaa]". It also
+/// says outright that the direction is unconfirmed, so this is the
+/// documented reading rather than a measured one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cmp {
+    Eq,
+    Ne,
+    /// operand < memory
+    Lt,
+    /// operand > memory
+    Gt,
+}
+
+impl Cmp {
+    fn holds(self, operand: u32, memory: u32) -> bool {
+        match self {
+            Cmp::Eq => operand == memory,
+            Cmp::Ne => operand != memory,
+            Cmp::Lt => operand < memory,
+            Cmp::Gt => operand > memory,
+        }
+    }
+
+    /// The low two bits of a `Dx` / `Ex` type byte.
+    fn from_low_nibble(n: u8) -> Cmp {
+        match n {
+            0 => Cmp::Eq,
+            1 => Cmp::Ne,
+            2 => Cmp::Lt,
+            _ => Cmp::Gt,
+        }
+    }
+
+    fn low_nibble(self) -> u8 {
+        match self {
+            Cmp::Eq => 0,
+            Cmp::Ne => 1,
+            Cmp::Lt => 2,
+            Cmp::Gt => 3,
+        }
+    }
+}
+
+/// One code. Most are one line; [`Code::Slide`] is the one type that eats
+/// the line after it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Code {
     /// `30aaaaaa 00dd`
     Write8 { addr: u32, value: u8 },
     /// `80aaaaaa dddd`
     Write16 { addr: u32, value: u16 },
+    /// `20aaaaaa 00dd` / `21aaaaaa 00dd`, wrapping at 8 bits.
+    Add8 { addr: u32, delta: i16 },
+    /// `10aaaaaa dddd` / `11aaaaaa dddd`, wrapping at 16 bits.
+    Add16 { addr: u32, delta: i32 },
+    /// `E0aaaaaa 00dd`..`E3`: run the next code only if this holds.
+    If8 { addr: u32, cmp: Cmp, value: u8 },
+    /// `D0aaaaaa dddd`..`D3`.
+    If16 { addr: u32, cmp: Cmp, value: u16 },
+    /// `D4000000 dddd`: run the next code while exactly these buttons are
+    /// held. The operand is the raw pad halfword, so it is active low —
+    /// nothing held is `FFFF`, Cross alone is `BFFF`.
+    IfButtons { value: u16 },
+    /// ```text
+    /// 5000nnbb dddd
+    /// aaaaaaaa ??ee   for i in 0..nn: [addr + i*bb] = value + i*step
+    /// ```
+    /// psx-spx does not say what width the writes are; `dddd` is 16 bits,
+    /// so they are taken as 16-bit.
+    Slide {
+        addr: u32,
+        count: u8,
+        stride: u8,
+        value: u16,
+        step: u16,
+    },
     /// A well-formed line of a type that is not implemented. Kept so the
     /// rest of the cheat still works and the UI can say what was skipped.
     Unsupported { kind: u8, addr: u32, value: u16 },
@@ -50,26 +120,139 @@ impl Code {
                 value: value as u8,
             },
             0x80 => Code::Write16 { addr, value },
+            0x10 => Code::Add16 {
+                addr,
+                delta: i32::from(value),
+            },
+            0x11 => Code::Add16 {
+                addr,
+                delta: -i32::from(value),
+            },
+            0x20 => Code::Add8 {
+                addr,
+                delta: i16::from(value as u8),
+            },
+            0x21 => Code::Add8 {
+                addr,
+                delta: -i16::from(value as u8),
+            },
+            0xd4 => Code::IfButtons { value },
+            0xd0..=0xd3 => Code::If16 {
+                addr,
+                cmp: Cmp::from_low_nibble(kind & 3),
+                value,
+            },
+            0xe0..=0xe3 => Code::If8 {
+                addr,
+                cmp: Cmp::from_low_nibble(kind & 3),
+                value: value as u8,
+            },
+            // 0x50 needs the line after it; the caller assembles it.
             _ => Code::Unsupported { kind, addr, value },
         })
     }
 
-    /// Apply this code. Returns false when the line was not applied, so a
-    /// future conditional type can gate the line after it.
-    fn apply(self, bus: &mut Bus) -> bool {
-        match self {
-            Code::Write8 { addr, value } => bus.poke8(addr, value),
-            // Little-endian, byte at a time: poke8 already resolves the
-            // region, and a 16-bit code straddling the end of a region is
-            // not worth a second address decode.
-            Code::Write16 { addr, value } => {
-                let lo = bus.poke8(addr, value as u8);
-                let hi = bus.poke8(addr.wrapping_add(1), (value >> 8) as u8);
-                lo && hi
+    /// Assemble a slide out of its two lines. The second is a bare 32-bit
+    /// address and a 16-bit value step — not a typed code line, the same
+    /// shape the `C2` copy code uses for its continuation.
+    fn parse_slide(head: &str, tail: &str) -> Result<Code, ParseError> {
+        let words = |line: &str| -> Result<(u32, u16), ParseError> {
+            let mut w = line.split_whitespace();
+            let (Some(hi), Some(lo), None) = (w.next(), w.next(), w.next()) else {
+                return Err(ParseError::Shape);
+            };
+            if hi.len() != 8 || lo.len() != 4 {
+                return Err(ParseError::Shape);
             }
-            Code::Unsupported { .. } => false,
+            Ok((
+                u32::from_str_radix(hi, 16).map_err(|_| ParseError::Hex)?,
+                u16::from_str_radix(lo, 16).map_err(|_| ParseError::Hex)?,
+            ))
+        };
+        let (head_hi, value) = words(head)?;
+        let (addr, step) = words(tail)?;
+        Ok(Code::Slide {
+            addr: addr & 0x00ff_ffff,
+            count: (head_hi >> 8) as u8,
+            stride: head_hi as u8,
+            value,
+            step,
+        })
+    }
+
+    /// Run this code. Returns how many of the codes after it to skip,
+    /// which is 1 for a conditional that does not hold and 0 otherwise.
+    /// A GameShark conditional gates exactly the line after it, so there
+    /// is no nesting to track — a chain of them nests by construction.
+    fn run(self, bus: &mut Bus) -> usize {
+        match self {
+            Code::Write8 { addr, value } => {
+                bus.poke8(addr, value);
+                0
+            }
+            Code::Write16 { addr, value } => {
+                write16(bus, addr, value);
+                0
+            }
+            Code::Add8 { addr, delta } => {
+                if let Some(cur) = bus.peek8(addr) {
+                    bus.poke8(addr, (i16::from(cur).wrapping_add(delta)) as u8);
+                }
+                0
+            }
+            Code::Add16 { addr, delta } => {
+                if let Some(cur) = read16(bus, addr) {
+                    write16(bus, addr, (i32::from(cur).wrapping_add(delta)) as u16);
+                }
+                0
+            }
+            // An address that cannot be read makes the condition false:
+            // the alternative is running a write against state nobody
+            // could observe.
+            Code::If8 { addr, cmp, value } => {
+                let held = bus
+                    .peek8(addr)
+                    .is_some_and(|m| cmp.holds(u32::from(value), u32::from(m)));
+                usize::from(!held)
+            }
+            Code::If16 { addr, cmp, value } => {
+                let held =
+                    read16(bus, addr).is_some_and(|m| cmp.holds(u32::from(value), u32::from(m)));
+                usize::from(!held)
+            }
+            // The pad halfword is active low on the wire; the core keeps
+            // it set-means-pressed, so invert before comparing.
+            Code::IfButtons { value } => usize::from(value != !bus.sio.buttons),
+            Code::Slide {
+                addr,
+                count,
+                stride,
+                value,
+                step,
+            } => {
+                for i in 0..u32::from(count) {
+                    let at = addr.wrapping_add(i.wrapping_mul(u32::from(stride)));
+                    let v = value.wrapping_add((i as u16).wrapping_mul(step));
+                    write16(bus, at, v);
+                }
+                0
+            }
+            Code::Unsupported { .. } => 0,
         }
     }
+}
+
+/// Little-endian halfword through the debugger accessors: `poke8` already
+/// resolves the region, so a second address decode buys nothing.
+fn write16(bus: &mut Bus, addr: u32, value: u16) {
+    bus.poke8(addr, value as u8);
+    bus.poke8(addr.wrapping_add(1), (value >> 8) as u8);
+}
+
+fn read16(bus: &Bus, addr: u32) -> Option<u16> {
+    let lo = bus.peek8(addr)?;
+    let hi = bus.peek8(addr.wrapping_add(1))?;
+    Some(u16::from(lo) | u16::from(hi) << 8)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,11 +301,13 @@ impl CheatList {
     /// every other cheat in it.
     pub fn parse(text: &str) -> CheatList {
         let mut cheats: Vec<Cheat> = Vec::new();
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
-                continue;
-            }
+        // Filtered up front so a slide can reach its continuation line
+        // without tripping over a comment or a blank line between them.
+        let mut lines = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !(l.is_empty() || l.starts_with('#') || l.starts_with(';')));
+        while let Some(line) = lines.next() {
             if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
                 let (enabled, name) = match name.strip_prefix('*') {
                     Some(rest) => (true, rest),
@@ -139,7 +324,16 @@ impl CheatList {
                 tracing::warn!("cheat line before any [section]: {line}");
                 continue;
             };
-            match Code::parse(line) {
+            // A slide is the one type spread over two lines.
+            let parsed = if line.starts_with("50") {
+                match lines.next() {
+                    Some(tail) => Code::parse_slide(line, tail),
+                    None => Err(ParseError::Shape),
+                }
+            } else {
+                Code::parse(line)
+            };
+            match parsed {
                 Ok(code) => cheat.codes.push(code),
                 Err(e) => tracing::warn!("ignoring cheat line {line:?} in {}: {e:?}", cheat.name),
             }
@@ -158,6 +352,28 @@ impl CheatList {
                 let line = match *code {
                     Code::Write8 { addr, value } => format!("30{addr:06X} 00{value:02X}"),
                     Code::Write16 { addr, value } => format!("80{addr:06X} {value:04X}"),
+                    Code::Add8 { addr, delta } => {
+                        let kind = if delta < 0 { 0x21 } else { 0x20 };
+                        format!("{kind:02X}{addr:06X} 00{:02X}", delta.unsigned_abs())
+                    }
+                    Code::Add16 { addr, delta } => {
+                        let kind = if delta < 0 { 0x11 } else { 0x10 };
+                        format!("{kind:02X}{addr:06X} {:04X}", delta.unsigned_abs())
+                    }
+                    Code::If8 { addr, cmp, value } => {
+                        format!("E{}{addr:06X} 00{value:02X}", cmp.low_nibble())
+                    }
+                    Code::If16 { addr, cmp, value } => {
+                        format!("D{}{addr:06X} {value:04X}", cmp.low_nibble())
+                    }
+                    Code::IfButtons { value } => format!("D4000000 {value:04X}"),
+                    Code::Slide {
+                        addr,
+                        count,
+                        stride,
+                        value,
+                        step,
+                    } => format!("5000{count:02X}{stride:02X} {value:04X}\n{addr:08X} {step:04X}"),
                     Code::Unsupported { kind, addr, value } => {
                         format!("{kind:02X}{addr:06X} {value:04X}")
                     }
@@ -174,11 +390,14 @@ impl CheatList {
         self.cheats.is_empty()
     }
 
-    /// Apply every enabled cheat, in file order.
+    /// Apply every enabled cheat, in file order. Within a cheat the codes
+    /// run as a little program: a conditional that does not hold skips the
+    /// code after it, which is the whole of GameShark's control flow.
     pub fn apply(&self, bus: &mut Bus) {
         for cheat in self.cheats.iter().filter(|c| c.enabled) {
-            for code in &cheat.codes {
-                code.apply(bus);
+            let mut i = 0;
+            while let Some(code) = cheat.codes.get(i) {
+                i += 1 + code.run(bus);
             }
         }
     }
@@ -234,7 +453,7 @@ mod tests {
     #[test]
     fn an_unknown_type_is_kept_and_the_rest_still_applies() {
         let mut bus = bus();
-        let list = CheatList::parse("[*t]\nD0000100 0001\n30000100 00AB\n");
+        let list = CheatList::parse("[*t]\nC1000000 4000\n30000100 00AB\n");
         assert!(list.cheats[0].has_unsupported());
         assert_eq!(list.cheats[0].codes.len(), 2);
         list.apply(&mut bus);
@@ -279,8 +498,177 @@ mod tests {
     }
 
     #[test]
+    fn increments_wrap_at_their_own_width() {
+        let mut bus = bus();
+        // 8-bit: FF + 2 wraps to 01. 16-bit: 0001 - 2 wraps to FFFF.
+        assert!(bus.poke8(RAM, 0xFF));
+        write16(&mut bus, RAM + 2, 0x0001);
+        CheatList::parse(
+            "[*t]
+20000100 0002
+11000102 0002
+",
+        )
+        .apply(&mut bus);
+        assert_eq!(bus.peek8(RAM), Some(0x01));
+        assert_eq!(read16(&bus, RAM + 2), Some(0xFFFF));
+    }
+
+    /// psx-spx writes every comparison with the code's operand on the
+    /// left: `D2` is "If dddd<[aaaaaa]". It also says the direction is
+    /// unconfirmed, so this test is what pins the reading we chose.
+    #[test]
+    fn a_conditional_gates_exactly_the_code_after_it() {
+        let mut bus = bus();
+        write16(&mut bus, RAM, 0x0064); // 100
+
+        // 100 == 100 -> the write runs. 5 < 100 -> the write runs.
+        CheatList::parse(
+            "[*t]
+D0000100 0064
+80000110 1111
+D2000100 0005
+80000112 2222
+",
+        )
+        .apply(&mut bus);
+        assert_eq!(read16(&bus, RAM + 0x10), Some(0x1111));
+        assert_eq!(read16(&bus, RAM + 0x12), Some(0x2222));
+
+        // 200 < 100 is false, so the write after it is skipped and the
+        // one after that still runs.
+        CheatList::parse(
+            "[*t]
+D2000100 00C8
+80000114 3333
+80000116 4444
+",
+        )
+        .apply(&mut bus);
+        assert_eq!(read16(&bus, RAM + 0x14), Some(0x0000));
+        assert_eq!(read16(&bus, RAM + 0x16), Some(0x4444));
+    }
+
+    #[test]
+    fn a_conditional_with_nothing_after_it_just_ends_the_cheat() {
+        let mut bus = bus();
+        CheatList::parse(
+            "[*t]
+D1000100 0000
+",
+        )
+        .apply(&mut bus);
+    }
+
+    #[test]
+    fn an_eight_bit_conditional_reads_one_byte() {
+        let mut bus = bus();
+        assert!(bus.poke8(RAM, 0x07));
+        // E1 is not-equal: 07 != 07 is false, so the write is skipped.
+        CheatList::parse(
+            "[*t]
+E1000100 0007
+30000120 00FF
+",
+        )
+        .apply(&mut bus);
+        assert_eq!(bus.peek8(RAM + 0x20), Some(0x00));
+        CheatList::parse(
+            "[*t]
+E0000100 0007
+30000120 00FF
+",
+        )
+        .apply(&mut bus);
+        assert_eq!(bus.peek8(RAM + 0x20), Some(0xFF));
+    }
+
+    /// The operand is the pad halfword as the hardware presents it, so it
+    /// is active low: nothing held is FFFF, Cross alone is BFFF.
+    #[test]
+    fn the_button_conditional_compares_the_active_low_halfword() {
+        let mut bus = bus();
+        CheatList::parse(
+            "[*t]
+D4000000 FFFF
+30000100 0011
+",
+        )
+        .apply(&mut bus);
+        assert_eq!(bus.peek8(RAM), Some(0x11));
+
+        bus.sio.buttons = crate::sio::button::CROSS;
+        CheatList::parse(
+            "[*t]
+D4000000 FFFF
+30000100 0022
+",
+        )
+        .apply(&mut bus);
+        assert_eq!(
+            bus.peek8(RAM),
+            Some(0x11),
+            "released-only code must not fire"
+        );
+        CheatList::parse(
+            "[*t]
+D4000000 BFFF
+30000100 0022
+",
+        )
+        .apply(&mut bus);
+        assert_eq!(bus.peek8(RAM), Some(0x22));
+    }
+
+    /// `5000nnbb dddd` / `aaaaaaaa ??ee`: nn writes, address stepping by
+    /// bb bytes and value by ee each time.
+    #[test]
+    fn a_slide_writes_its_whole_run() {
+        let mut bus = bus();
+        CheatList::parse(
+            "[*t]
+50000304 0010
+80000100 0001
+",
+        )
+        .apply(&mut bus);
+        assert_eq!(read16(&bus, RAM), Some(0x0010));
+        assert_eq!(read16(&bus, RAM + 4), Some(0x0011));
+        assert_eq!(read16(&bus, RAM + 8), Some(0x0012));
+        assert_eq!(
+            read16(&bus, RAM + 12),
+            Some(0x0000),
+            "count of 3 stops at 3"
+        );
+    }
+
+    #[test]
+    fn a_slide_without_its_second_line_is_dropped() {
+        let list = CheatList::parse(
+            "[*t]
+50000304 0010
+",
+        );
+        assert!(list.cheats[0].codes.is_empty());
+    }
+
+    /// A comment between the two halves of a slide must not break it: the
+    /// parser filters comments before it pairs the lines up.
+    #[test]
+    fn a_slide_survives_a_comment_between_its_lines() {
+        let list = CheatList::parse(
+            "[*t]
+50000304 0010
+; here
+80000100 0001
+",
+        );
+        assert_eq!(list.cheats[0].codes.len(), 1);
+    }
+
+    #[test]
     fn text_round_trips_including_the_enable_marker() {
-        let text = "[*On]\n30000100 00AB\n80000102 1234\n\n[Off]\nD0000100 0001\n\n";
+        let text = "[*On]\n30000100 00AB\n80000102 1234\n\n[Off]\nC1000000 4000\n\n";
         let list = CheatList::parse(text);
         assert_eq!(CheatList::parse(&list.to_text()), list);
         assert_eq!(list.to_text(), text);
