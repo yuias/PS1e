@@ -130,6 +130,9 @@ pub struct App {
     /// worker gets a copy through `Command::SetCheats`.
     cheats: psx_core::cheats::CheatList,
     cheat_file: Option<PathBuf>,
+    /// Master switch, persisted in `Config`. Off by default so a `.cht`
+    /// found beside an image cannot change a run on its own.
+    cheats_on: bool,
     /// Scanner controls. The candidate list itself lives on the worker.
     scan_width: u8,
     scan_value: String,
@@ -213,6 +216,7 @@ impl App {
             mem_addr: format!("{:08x}", KSEG0),
             cheats,
             cheat_file,
+            cheats_on: config.cheats,
             scan_width: 4,
             scan_value: String::new(),
             scan_started: false,
@@ -328,6 +332,16 @@ impl App {
     /// Cheats page: one checkbox per cheat in the disc's `.cht`.
     /// Enable/disable only — the file stays the place codes are written.
     fn cheats_page(&mut self, ui: &mut egui::Ui) {
+        if ui
+            .checkbox(&mut self.cheats_on, "Apply cheats")
+            .on_hover_text(
+                "off by default, so a .cht left beside an image does nothing until you say so",
+            )
+            .changed()
+        {
+            self.emu.send(Command::SetCheatsEnabled(self.cheats_on));
+        }
+        ui.separator();
         let Some(path) = self.cheat_file.clone() else {
             ui.label("No disc in the drive.");
             return;
@@ -341,6 +355,9 @@ impl App {
             return;
         }
         let mut changed = false;
+        // The per-cheat boxes stay usable while the master switch is off:
+        // setting up which ones you want before turning them on is the
+        // normal order.
         for cheat in &mut self.cheats.cheats {
             let row = ui.checkbox(&mut cheat.enabled, &cheat.name);
             changed |= row.changed();
@@ -679,6 +696,7 @@ impl Drop for App {
         };
         let mut cfg = self.config.clone();
         cfg.volume = self.volume;
+        cfg.cheats = self.cheats_on;
         cfg.pane = self.show_pane;
         cfg.page = self.page;
         cfg.pane_width = self.pane_width;

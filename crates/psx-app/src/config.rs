@@ -225,6 +225,10 @@ pub struct Config {
     pub bios: Option<PathBuf>,
     pub volume: f32,
     pub memcard: Option<PathBuf>,
+    /// Apply the cheats found in the `.cht` beside the disc image. Off by
+    /// default: a file dropped next to an image should not change how a
+    /// game runs until it is asked for.
+    pub cheats: bool,
     /// Side pane: shown at startup, the page it opens on, and the width it
     /// opens at. egui's own persistence is not compiled in, so the geometry
     /// lives here.
@@ -246,6 +250,7 @@ impl Default for Config {
             bios: None,
             volume: 0.5,
             memcard: None,
+            cheats: false,
             pane: true,
             page: crate::ui::Page::default(),
             pane_width: 260.0,
@@ -367,6 +372,13 @@ mod tests {
         assert_eq!(back.window_width, cfg.window_width);
         assert_eq!(back.window_height, cfg.window_height);
         assert_eq!(back.keys.cross, cfg.keys.cross);
+    }
+
+    #[test]
+    fn cheats_are_off_until_asked_for() {
+        assert!(!Config::default().cheats);
+        let on: Config = toml::from_str("cheats = true").expect("deserialize");
+        assert!(on.cheats);
     }
 
     /// The pane state is scalars as well, so the same ordering rule applies.

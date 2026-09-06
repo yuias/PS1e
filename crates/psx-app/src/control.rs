@@ -338,8 +338,16 @@ impl Controller {
                 }
                 Err(e) => Reply::err(e),
             },
+            ("cheat", ["apply", state @ ("on" | "off")]) => {
+                sys.set_cheats_enabled(*state == "on");
+                Reply::ok(format!("cheats {state}"))
+            }
             ("cheat", ["list"]) => {
-                let mut out = String::new();
+                let mut out = format!(
+                    "apply: {}
+",
+                    if sys.cheats_enabled() { "on" } else { "off" }
+                );
                 for (i, cheat) in sys.cheats().cheats.iter().enumerate() {
                     let mark = if cheat.enabled { "on " } else { "off" };
                     let partial = if cheat.has_unsupported() {
@@ -448,6 +456,7 @@ poke <hexaddr> <hex>  write bytes to RAM/scratchpad
 disc open             open the drive lid (stops the drive, flags shell open)
 disc close [path]     close the lid, on a new image if given, else the old one
 cheat list            cheats from the disc's .cht, with their enable state
+cheat apply on|off    master switch (off unless `cheats = true` in the config)
 cheat on|off <n>      toggle cheat n and write the marker back to the file
 cheat reload          re-read the .cht for the disc in the drive
 tty                   TTY output accumulated since the last `tty`
@@ -601,6 +610,7 @@ mod tests {
         ));
 
         let r = c.execute(&mut sys, "cheat list", false);
+        assert!(r.payload.contains("apply: on"), "{}", r.payload);
         assert!(r.payload.contains("on "), "{}", r.payload);
         assert!(r.payload.contains("Health"), "{}", r.payload);
 
@@ -615,6 +625,14 @@ mod tests {
         assert!(c.execute(&mut sys, "run 1", false).ok);
         let r = c.execute(&mut sys, "peek 80100004 1", false);
         assert!(r.payload.contains("09"), "{}", r.payload);
+
+        // The master switch stops everything without touching the list.
+        assert!(c.execute(&mut sys, "cheat apply off", false).ok);
+        assert!(c.execute(&mut sys, "poke 80100000 00", false).ok);
+        assert!(c.execute(&mut sys, "run 1", false).ok);
+        let r = c.execute(&mut sys, "peek 80100000 1", false);
+        assert!(r.payload.contains("00"), "{}", r.payload);
+        assert!(c.execute(&mut sys, "cheat apply on", false).ok);
 
         // And off again stops it: poke over the value, run, still ours.
         assert!(c.execute(&mut sys, "cheat off 1", false).ok);

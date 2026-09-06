@@ -149,6 +149,7 @@ fn main() -> eframe::Result {
         .unwrap_or_else(|e| panic!("failed to read BIOS '{}': {e}", bios_path.display()));
     let mut sys = PsxSystem::new(bios).expect("failed to create system");
     sys.set_gpu_log(args.log_gpu);
+    sys.set_cheats_enabled(cfg.cheats);
     let mut disc_info = None;
     if let Some(path) = &args.disc {
         match disc::load_disc(std::path::Path::new(path)) {

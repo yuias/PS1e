@@ -54,6 +54,8 @@ pub enum Command {
     SetGpuLog(bool),
     /// Replace the cheat table, e.g. after an enable toggle or a reload.
     SetCheats(psx_core::cheats::CheatList),
+    /// Master switch over the cheat table.
+    SetCheatsEnabled(bool),
     /// Run one scanner pass and leave the result in [`Shared::scan`].
     Scan(crate::scan::Request),
     Quit,
@@ -326,6 +328,7 @@ impl Worker {
                 }
                 Command::SetGpuLog(v) => self.sys.set_gpu_log(v),
                 Command::SetCheats(list) => self.sys.set_cheats(list),
+                Command::SetCheatsEnabled(on) => self.sys.set_cheats_enabled(on),
                 Command::Scan(req) => {
                     let (scan, outcome) =
                         crate::scan::Scan::pass(self.scan.take(), req, &self.sys.bus.ram);

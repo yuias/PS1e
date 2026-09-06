@@ -47,6 +47,11 @@ pub struct PsxSystem {
     /// not serialized; it rides in [`Ambient`] instead.
     #[serde(skip)]
     cheats: cheats::CheatList,
+    /// Master switch over the table above. The core defaults to applying
+    /// what it was handed; it is the frontend that defaults to off, so
+    /// that a file dropped beside an image cannot change a run on its own.
+    #[serde(skip)]
+    cheats_enabled: bool,
 }
 
 /// Everything the frontend owns and the machine merely holds: the BIOS
@@ -64,6 +69,7 @@ pub struct Ambient {
     pub log_gpu: bool,
     pub tty: Tty,
     pub cheats: cheats::CheatList,
+    pub cheats_enabled: bool,
 }
 
 /// Save-state file magic + format version. Bump the version on any change
@@ -94,6 +100,7 @@ impl PsxSystem {
             next_sample: spu::CYCLES_PER_SAMPLE,
             tty: Tty::default(),
             cheats: cheats::CheatList::default(),
+            cheats_enabled: true,
         }
     }
 
@@ -107,6 +114,7 @@ impl PsxSystem {
             log_gpu: self.bus.gpu.log_commands,
             tty: std::mem::take(&mut self.tty),
             cheats: std::mem::take(&mut self.cheats),
+            cheats_enabled: self.cheats_enabled,
         }
     }
 
@@ -120,6 +128,7 @@ impl PsxSystem {
         self.bus.gpu.log_commands = ambient.log_gpu;
         self.tty = ambient.tty;
         self.cheats = ambient.cheats;
+        self.cheats_enabled = ambient.cheats_enabled;
     }
 
     /// Power-cycle the machine, keeping the ambient assets.
@@ -137,6 +146,15 @@ impl PsxSystem {
 
     pub fn cheats(&self) -> &cheats::CheatList {
         &self.cheats
+    }
+
+    /// Master switch over the cheat table.
+    pub fn set_cheats_enabled(&mut self, on: bool) {
+        self.cheats_enabled = on;
+    }
+
+    pub fn cheats_enabled(&self) -> bool {
+        self.cheats_enabled
     }
 
     /// Switch GP0/GP1 command decoding to the log on or off.
@@ -345,7 +363,9 @@ impl PsxSystem {
             // worker loop: the gdb server drives `step()` directly, so a
             // frontend-side hook would quietly stop applying under the
             // debugger.
-            self.cheats.apply(&mut self.bus);
+            if self.cheats_enabled {
+                self.cheats.apply(&mut self.bus);
+            }
             // Keep lazily-synced components from lagging more than a frame,
             // then hand them the field boundary they measure blanking from
             self.bus
