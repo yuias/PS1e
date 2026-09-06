@@ -8,9 +8,11 @@ use crate::config;
 use crate::config::Config;
 use crate::disc;
 use crate::disc::DiscInfo;
+use crate::emu;
 use crate::emu::{Command, DebuggerState, Emu, FrameSnapshot, Status};
 use crate::gamepad::Gamepad;
 use eframe::egui;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
@@ -47,11 +49,47 @@ const BUTTON_NAMES: [&str; 14] = [
     "start", "select",
 ];
 
+/// One tab of the side pane. Adding a page means an arm in each of
+/// [`Page::ALL`], [`Page::label`], [`Page::panels`] and the dispatch in
+/// `update`; the pane itself needs no other bookkeeping.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Page {
+    #[default]
+    Settings,
+    Registers,
+}
+
+impl Page {
+    const ALL: [Page; 2] = [Page::Settings, Page::Registers];
+
+    fn label(self) -> &'static str {
+        match self {
+            Page::Settings => "Settings",
+            Page::Registers => "CPU",
+        }
+    }
+
+    /// What the worker has to publish for this page to have anything to
+    /// show. A page not on screen asks for nothing.
+    fn panels(self) -> u8 {
+        match self {
+            Page::Settings => 0,
+            Page::Registers => emu::PANEL_REGS,
+        }
+    }
+}
+
 pub struct App {
     emu: Emu,
     show_vram: bool,
     vram_as_24bit: bool,
-    show_regs: bool,
+    /// Side pane visibility, the page it is showing, and the width it was
+    /// last dragged to. egui's own persistence is not compiled in, so the
+    /// width lives in `Config`.
+    show_pane: bool,
+    page: Page,
+    pane_width: f32,
     show_tty: bool,
     fullscreen: bool,
     display_tex: Option<egui::TextureHandle>,
@@ -109,7 +147,9 @@ impl App {
             emu,
             show_vram: false,
             vram_as_24bit: false,
-            show_regs: false,
+            show_pane: config.pane,
+            page: config.page,
+            pane_width: config.pane_width,
             show_tty: false,
             fullscreen: false,
             display_tex: None,
@@ -200,6 +240,26 @@ impl App {
         }
     }
 
+    /// Settings page: everything the shell can change while it runs, which
+    /// is what used to be spread across the View and Audio menus.
+    fn settings_page(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Audio");
+        ui.add(
+            egui::Slider::new(&mut self.volume, 0.0..=1.0)
+                .text("volume")
+                .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+        );
+        ui.separator();
+        ui.heading("Debug");
+        if ui
+            .checkbox(&mut self.gpu_log, "GPU cmd log")
+            .on_hover_text("decode every GP0/GP1 command to the log (debug level)")
+            .changed()
+        {
+            self.emu.send(Command::SetGpuLog(self.gpu_log));
+        }
+    }
+
     /// Menu bar: every command the shell offers, grouped by what it acts on.
     fn menu_bar(&mut self, ctx: &egui::Context, running: bool, debugger_active: bool) {
         egui::TopBottomPanel::top("menu").show(ctx, |ui| {
@@ -262,24 +322,21 @@ impl App {
                         ui.close();
                     }
                     ui.separator();
-                    ui.checkbox(&mut self.show_regs, "Registers panel");
+                    ui.checkbox(&mut self.show_pane, "Side pane");
+                    // Opening the pane on the page you asked for; picking a
+                    // page while it is hidden would otherwise take two trips
+                    // through the menu.
+                    for page in Page::ALL {
+                        let shown = self.show_pane && self.page == page;
+                        if ui.selectable_label(shown, format!("    {}", page.label())).clicked() {
+                            self.show_pane = true;
+                            self.page = page;
+                            ui.close();
+                        }
+                    }
+                    ui.separator();
                     ui.checkbox(&mut self.show_tty, "TTY panel");
                     ui.checkbox(&mut self.show_vram, "VRAM viewer");
-                    ui.separator();
-                    if ui
-                        .checkbox(&mut self.gpu_log, "GPU cmd log")
-                        .on_hover_text("decode every GP0/GP1 command to the log (debug level)")
-                        .changed()
-                    {
-                        self.emu.send(Command::SetGpuLog(self.gpu_log));
-                    }
-                });
-                ui.menu_button("Audio", |ui| {
-                    ui.add(
-                        egui::Slider::new(&mut self.volume, 0.0..=1.0)
-                            .text("volume")
-                            .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
-                    );
                 });
                 ui.menu_button("Help", |ui| {
                     ui.label("Pad, as bound in the config file:");
@@ -353,6 +410,9 @@ impl Drop for App {
         };
         let mut cfg = self.config.clone();
         cfg.volume = self.volume;
+        cfg.pane = self.show_pane;
+        cfg.page = self.page;
+        cfg.pane_width = self.pane_width;
         // Rounded: `screen_rect` is physical pixels over `pixels_per_point`,
         // so at fractional scaling it lands a hair off the size that was
         // requested, and an exact compare would rewrite the file on every
@@ -363,6 +423,25 @@ impl Drop for App {
             cfg.save(path);
         }
     }
+}
+
+/// Registers page: the CPU register file as last published. Nothing here
+/// touches `App`, so it stays a free function.
+fn registers_page(ui: &mut egui::Ui, status: &Status) {
+    egui::Grid::new("regs").striped(true).show(ui, |ui| {
+        for (i, name) in REG_NAMES.iter().enumerate() {
+            ui.monospace(format!("{name:>4}"));
+            ui.monospace(format!("{:08x}", status.regs[i]));
+            if i % 2 == 1 {
+                ui.end_row();
+            }
+        }
+        ui.monospace("  hi");
+        ui.monospace(format!("{:08x}", status.hi));
+        ui.monospace("  lo");
+        ui.monospace(format!("{:08x}", status.lo));
+        ui.end_row();
+    });
 }
 
 /// Convert a frame snapshot (15-bit or packed RGB888 rows) to an egui image.
@@ -475,6 +554,23 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
         }
         let chrome = !self.fullscreen;
+        // What the worker has to publish this frame. Sampled before the
+        // panels draw, so switching page reaches the worker one frame late
+        // and the new page shows the previous snapshot until then.
+        // Fullscreen hides every panel, so it asks for nothing.
+        let panels = if chrome {
+            let pane = if self.show_pane {
+                self.page.panels()
+            } else {
+                0
+            };
+            let vram = if self.show_vram { emu::PANEL_VRAM } else { 0 };
+            pane | vram
+        } else {
+            0
+        };
+        self.emu.shared.panels.store(panels, Ordering::Relaxed);
+
         // Fullscreen reports the screen, not the window the user chose.
         if chrome {
             self.window_size = ctx.screen_rect().size();
@@ -488,26 +584,27 @@ impl eframe::App for App {
             self.status_bar(ctx, &status);
         }
 
-        if chrome && self.show_regs {
-            egui::SidePanel::right("registers")
-                .default_width(220.0)
+        // Declared before the TTY panel so the pane runs full height and
+        // the TTY sits beside it, not under it.
+        if chrome && self.show_pane {
+            let pane = egui::SidePanel::right("pane")
+                .resizable(true)
+                .min_width(220.0)
+                .default_width(self.pane_width)
                 .show(ctx, |ui| {
-                    ui.heading("CPU");
-                    egui::Grid::new("regs").striped(true).show(ui, |ui| {
-                        for (i, name) in REG_NAMES.iter().enumerate() {
-                            ui.monospace(format!("{name:>4}"));
-                            ui.monospace(format!("{:08x}", status.regs[i]));
-                            if i % 2 == 1 {
-                                ui.end_row();
-                            }
+                    ui.horizontal(|ui| {
+                        for page in Page::ALL {
+                            ui.selectable_value(&mut self.page, page, page.label());
                         }
-                        ui.monospace("  hi");
-                        ui.monospace(format!("{:08x}", status.hi));
-                        ui.monospace("  lo");
-                        ui.monospace(format!("{:08x}", status.lo));
-                        ui.end_row();
+                    });
+                    ui.separator();
+                    egui::ScrollArea::vertical().show(ui, |ui| match self.page {
+                        Page::Settings => self.settings_page(ui),
+                        Page::Registers => registers_page(ui, &status),
                     });
                 });
+            // Follow the drag rather than tracking the events behind it.
+            self.pane_width = pane.response.rect.width();
         }
 
         if chrome && self.show_tty {
@@ -593,13 +690,7 @@ impl eframe::App for App {
             });
         });
 
-        // Fullscreen shows the display alone, so stop paying for VRAM copies.
-        let want_vram = chrome && self.show_vram;
-        self.emu
-            .shared
-            .vram_requested
-            .store(want_vram, Ordering::Relaxed);
-        if want_vram {
+        if panels & emu::PANEL_VRAM != 0 {
             let vram = self.emu.shared.vram.lock().unwrap();
             if vram.len() == 1024 * 512 {
                 let image = vram_image(&vram, self.vram_as_24bit);

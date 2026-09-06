@@ -225,6 +225,12 @@ pub struct Config {
     pub bios: Option<PathBuf>,
     pub volume: f32,
     pub memcard: Option<PathBuf>,
+    /// Side pane: shown at startup, the page it opens on, and the width it
+    /// opens at. egui's own persistence is not compiled in, so the geometry
+    /// lives here.
+    pub pane: bool,
+    pub page: crate::ui::Page,
+    pub pane_width: f32,
     /// Window size at the last exit, in egui points.
     pub window_width: f32,
     pub window_height: f32,
@@ -240,6 +246,9 @@ impl Default for Config {
             bios: None,
             volume: 0.5,
             memcard: None,
+            pane: true,
+            page: crate::ui::Page::default(),
+            pane_width: 260.0,
             window_width: 1100.0,
             window_height: 720.0,
             keys: KeyBindings::default(),
@@ -358,6 +367,20 @@ mod tests {
         assert_eq!(back.window_width, cfg.window_width);
         assert_eq!(back.window_height, cfg.window_height);
         assert_eq!(back.keys.cross, cfg.keys.cross);
+    }
+
+    /// The pane state is scalars as well, so the same ordering rule applies.
+    #[test]
+    fn pane_state_round_trips_and_defaults_to_open() {
+        let cfg = Config::default();
+        assert!(cfg.pane);
+        let text = toml::to_string_pretty(&cfg).expect("serialize");
+        let back: Config = toml::from_str(&text).expect("deserialize");
+        assert_eq!(back.pane, cfg.pane);
+        assert_eq!(back.page, cfg.page);
+        assert_eq!(back.pane_width, cfg.pane_width);
+        let closed: Config = toml::from_str("pane = false").expect("deserialize");
+        assert!(!closed.pane);
     }
 
     #[test]

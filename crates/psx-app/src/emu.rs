@@ -10,7 +10,7 @@
 use crate::audio::Audio;
 use psx_core::{CPU_CLOCK_HZ, PsxSystem};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
@@ -19,6 +19,11 @@ const SLICE: u64 = CPU_CLOCK_HZ / 200;
 /// Audio cushion the pacer keeps buffered (frames; ~80ms). Doubles as the
 /// output latency, and absorbs host-side load spikes of the same length.
 const AUDIO_TARGET: usize = 3_528;
+
+/// The register file is copied into [`Status`] only for this bit.
+pub const PANEL_REGS: u8 = 1 << 0;
+/// The 1 MiB VRAM copy runs only for this bit.
+pub const PANEL_VRAM: u8 = 1 << 1;
 
 pub enum Command {
     SetRunning(bool),
@@ -85,9 +90,12 @@ pub struct Shared {
     pub status: Mutex<Status>,
     /// Full TTY text, appended incrementally.
     pub tty: Mutex<String>,
-    /// VRAM copy, refreshed per frame while `vram_requested`.
+    /// VRAM copy, refreshed per frame while [`PANEL_VRAM`] is set.
     pub vram: Mutex<Vec<u16>>,
-    pub vram_requested: AtomicBool,
+    /// Which UI panels are on screen, as [`PANEL_REGS`] and friends. What a
+    /// hidden panel would show costs nothing to leave unpublished, so the
+    /// worker skips the copy rather than the UI skipping the draw.
+    pub panels: AtomicU8,
     /// Digital pad bits (UI -> worker).
     pub buttons: AtomicU16,
     /// Master volume as f32 bits (UI -> worker).
@@ -327,6 +335,7 @@ impl Worker {
     }
 
     fn publish(&mut self) {
+        let panels = self.shared.panels.load(Ordering::Relaxed);
         let gpu = &self.sys.bus.gpu;
         if gpu.frame_count != self.published_frame {
             self.published_frame = gpu.frame_count;
@@ -341,7 +350,7 @@ impl Worker {
                 f.enabled = gpu.frame.enabled;
                 f.count = gpu.frame_count;
             }
-            if self.shared.vram_requested.load(Ordering::Relaxed) {
+            if panels & PANEL_VRAM != 0 {
                 let mut v = self.shared.vram.lock().unwrap();
                 v.clear();
                 v.extend_from_slice(&gpu.vram);
@@ -353,9 +362,11 @@ impl Worker {
             let mut st = self.shared.status.lock().unwrap();
             st.pc = self.sys.cpu.pc;
             st.cycles = self.sys.cycles();
-            st.regs = self.sys.cpu.regs;
-            st.hi = self.sys.cpu.hi;
-            st.lo = self.sys.cpu.lo;
+            if panels & PANEL_REGS != 0 {
+                st.regs = self.sys.cpu.regs;
+                st.hi = self.sys.cpu.hi;
+                st.lo = self.sys.cpu.lo;
+            }
             st.running = self.running;
             st.debugger = match &self.cfg.debugger {
                 None => DebuggerState::None,
