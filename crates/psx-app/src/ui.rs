@@ -59,18 +59,18 @@ const BUTTON_NAMES: [&str; 14] = [
 pub enum Page {
     #[default]
     Settings,
-    Registers,
     Memory,
+    Registers,
 }
 
 impl Page {
-    const ALL: [Page; 3] = [Page::Settings, Page::Registers, Page::Memory];
+    const ALL: [Page; 3] = [Page::Settings, Page::Memory, Page::Registers];
 
     fn label(self) -> &'static str {
         match self {
             Page::Settings => "Settings",
-            Page::Registers => "CPU",
             Page::Memory => "Memory",
+            Page::Registers => "Registers",
         }
     }
 
@@ -79,8 +79,8 @@ impl Page {
     fn panels(self) -> u8 {
         match self {
             Page::Settings => 0,
-            Page::Registers => emu::PANEL_REGS,
             Page::Memory => emu::PANEL_MEMORY,
+            Page::Registers => emu::PANEL_REGS,
         }
     }
 }
@@ -815,26 +815,27 @@ impl eframe::App for App {
                 .min_width(220.0)
                 .default_width(self.pane_width)
                 .show(ctx, |ui| {
+                    // Registered before anything else so every widget sits
+                    // on top of it: egui gives a click to the last widget
+                    // added at that spot, so a hit here is a click on empty
+                    // pane, which drops text focus and gives the keyboard
+                    // back to the pad.
+                    let background =
+                        ui.interact(ui.max_rect(), ui.id().with("bg"), egui::Sense::click());
                     ui.horizontal(|ui| {
                         for page in Page::ALL {
                             ui.selectable_value(&mut self.page, page, page.label());
                         }
                     });
                     ui.separator();
-                    // Clicking the empty part of the pane drops text focus,
-                    // which is the way back to driving the pad.
-                    let bg = ui.max_rect();
-                    if ui
-                        .interact(bg, ui.id().with("bg"), egui::Sense::click())
-                        .clicked()
-                    {
-                        ui.ctx().memory_mut(|m| m.stop_text_input());
-                    }
                     egui::ScrollArea::vertical().show(ui, |ui| match self.page {
                         Page::Settings => self.settings_page(ui),
-                        Page::Registers => registers_page(ui, &status),
                         Page::Memory => self.memory_page(ui),
+                        Page::Registers => registers_page(ui, &status),
                     });
+                    if background.clicked() {
+                        ui.memory_mut(|m| m.stop_text_input());
+                    }
                 });
             // Follow the drag rather than tracking the events behind it.
             self.pane_width = pane.response.rect.width();
