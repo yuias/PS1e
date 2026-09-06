@@ -339,13 +339,17 @@ impl App {
 
 impl Drop for App {
     /// Persist settings changed from the UI. (The worker flushes the memory
-    /// card itself when it stops.)
+    /// card itself when it stops.) Comparing whole configs rather than
+    /// field by field means a new setting only has to be copied in here,
+    /// not also added to a condition that is easy to forget.
     fn drop(&mut self) {
-        if let Some(path) = &self.config_path
-            && (self.config.volume - self.volume).abs() > f32::EPSILON
-        {
-            self.config.volume = self.volume;
-            self.config.save(path);
+        let Some(path) = &self.config_path else {
+            return;
+        };
+        let mut cfg = self.config.clone();
+        cfg.volume = self.volume;
+        if cfg != self.config {
+            cfg.save(path);
         }
     }
 }

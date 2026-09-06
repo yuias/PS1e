@@ -75,7 +75,7 @@ volume = 0.5
 ///
 /// Names are what `egui::Key::name` produces ("Up", "X", "1", ...);
 /// parsing accepts the wider set `egui::Key::from_name` understands.
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 #[serde(default)]
 pub struct KeyBindings {
     pub up: String,
@@ -140,7 +140,7 @@ impl KeyBindings {
 /// One gamepad button name per digital-pad button.
 ///
 /// Names are the `gilrs::Button` variants ("South", "DPadUp", ...).
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 #[serde(default)]
 pub struct PadBindings {
     pub up: String,
@@ -203,7 +203,7 @@ impl PadBindings {
 }
 
 /// Frontend hotkeys. These drive the emulator shell, not the emulated pad.
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 #[serde(default)]
 pub struct Hotkeys {
     pub save_state: String,
@@ -219,7 +219,7 @@ impl Default for Hotkeys {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 #[serde(default)]
 pub struct Config {
     pub bios: Option<PathBuf>,
