@@ -154,6 +154,7 @@ fn main() -> eframe::Result {
         match disc::load_disc(std::path::Path::new(path)) {
             Ok(loaded) => {
                 sys.insert_disc(loaded.disc);
+                sys.set_cheats(loaded.cheats);
                 disc_info = Some(loaded.info);
             }
             Err(e) => {
@@ -307,6 +308,10 @@ fn run_headless(
         // Lockstep control mode: the emulator advances only on `run`/`press`
         // commands, so --cycles and input scripts do not apply.
         let mut ctl = control::ControlServer::bind(port).expect("failed to bind control port");
+        if let Some(disc) = &args.disc {
+            ctl.controller
+                .set_cheat_file(disc::cheat_path(std::path::Path::new(disc)));
+        }
         tracing::info!("lockstep control mode; drive with: psxctl --port {port} help");
         loop {
             let debugger_owns = debugger.as_ref().is_some_and(|d| d.attached());

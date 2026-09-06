@@ -5,6 +5,7 @@
 //! when a pick turns out to be unreadable.
 
 use psx_core::cdrom::Disc;
+use psx_core::cheats::CheatList;
 use std::path::{Path, PathBuf};
 
 /// What the frontend knows about the disc in the drive.
@@ -27,6 +28,8 @@ pub struct DiscInfo {
 pub struct LoadedDisc {
     pub disc: Disc,
     pub info: DiscInfo,
+    /// Cheats from the `.cht` beside the image, empty when there is none.
+    pub cheats: CheatList,
 }
 
 /// Load a disc image: a raw .bin (single data track), or a .cue sheet
@@ -46,7 +49,35 @@ pub fn load_disc(path: &Path) -> Result<LoadedDisc, String> {
         file,
         title,
     };
-    Ok(LoadedDisc { disc, info })
+    let cheats = load_cheats(&cheat_path(path));
+    Ok(LoadedDisc { disc, info, cheats })
+}
+
+/// Where the cheats for an image live: `<image stem>.cht` beside it.
+pub fn cheat_path(image: &Path) -> PathBuf {
+    image.with_extension("cht")
+}
+
+/// Read a `.cht`. A missing file is the normal case and gives an empty
+/// list; an unreadable one is logged and treated the same, because a disc
+/// that boots without cheats beats a disc that will not open.
+pub fn load_cheats(path: &Path) -> CheatList {
+    match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let list = CheatList::parse(&text);
+            tracing::info!(
+                "loaded {} cheats from {}",
+                list.cheats.len(),
+                path.display()
+            );
+            list
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => CheatList::default(),
+        Err(e) => {
+            tracing::warn!("could not read {}: {e}", path.display());
+            CheatList::default()
+        }
+    }
 }
 
 /// The ISO9660 volume identifier of the data track, or `None` when the disc

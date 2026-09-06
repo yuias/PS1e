@@ -19,6 +19,7 @@
 use psx_core::{CPU_CLOCK_HZ, CYCLES_PER_FRAME, PsxSystem, SHELL_ENTRY};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
 use tracing::info;
 
 /// Digital pad button by script/protocol name.
@@ -141,9 +142,32 @@ pub struct Controller {
     /// Monotonic TTY position already returned by `tty`.
     tty_read: u64,
     frames_run: u64,
+    /// The `.cht` the current cheats came from, so `cheat on|off` can
+    /// write the enable marker back and `cheat reload` can re-read it.
+    /// `None` when no disc with a cheat file has been opened.
+    cheat_file: Option<PathBuf>,
 }
 
 impl Controller {
+    /// Point `cheat on|off|reload` at the sidecar for a disc that was
+    /// opened before the server started, i.e. from `--disc`.
+    pub fn set_cheat_file(&mut self, path: PathBuf) {
+        self.cheat_file = Some(path);
+    }
+
+    /// Write the enable markers back to the `.cht`. The file is the only
+    /// record of what is on, so a toggle that cannot be saved has to say
+    /// so rather than look like it stuck.
+    fn save_cheats(&self, sys: &PsxSystem) -> String {
+        let Some(path) = &self.cheat_file else {
+            return " (in memory only: no cheat file)".into();
+        };
+        match std::fs::write(path, sys.cheats().to_text()) {
+            Ok(()) => String::new(),
+            Err(e) => format!(" (not saved: {e})"),
+        }
+    }
+
     /// Advance emulation, keeping the held-button state applied.
     fn advance(&mut self, sys: &mut PsxSystem, cycles: u64) {
         sys.set_buttons(self.held);
@@ -303,11 +327,58 @@ impl Controller {
             }
             ("disc", ["close", path]) => match crate::disc::load_disc(std::path::Path::new(path)) {
                 Ok(loaded) => {
+                    let cheats = loaded.cheats.cheats.len();
+                    self.cheat_file = Some(crate::disc::cheat_path(std::path::Path::new(path)));
+                    sys.set_cheats(loaded.cheats);
                     sys.close_shell(Some(loaded.disc));
-                    Reply::ok(format!("drive closed on {} ({path})", loaded.info.title))
+                    Reply::ok(format!(
+                        "drive closed on {} ({path}); {cheats} cheats",
+                        loaded.info.title
+                    ))
                 }
                 Err(e) => Reply::err(e),
             },
+            ("cheat", ["list"]) => {
+                let mut out = String::new();
+                for (i, cheat) in sys.cheats().cheats.iter().enumerate() {
+                    let mark = if cheat.enabled { "on " } else { "off" };
+                    let partial = if cheat.has_unsupported() {
+                        " (partial)"
+                    } else {
+                        ""
+                    };
+                    out.push_str(&format!(
+                        "{i:>3}  {mark}  {} [{} codes]{partial}
+",
+                        cheat.name,
+                        cheat.codes.len()
+                    ));
+                }
+                Reply::ok(out.trim_end())
+            }
+            ("cheat", [state @ ("on" | "off"), index]) => {
+                let Ok(i) = index.parse::<usize>() else {
+                    return Reply::err(format!("bad cheat index '{index}'"));
+                };
+                let mut list = sys.cheats().clone();
+                let Some(cheat) = list.cheats.get_mut(i) else {
+                    return Reply::err(format!("no cheat {i} (see `cheat list`)"));
+                };
+                cheat.enabled = *state == "on";
+                let name = cheat.name.clone();
+                sys.set_cheats(list);
+                let saved = self.save_cheats(sys);
+                Reply::ok(format!("cheat {i} '{name}' {state}{saved}"))
+            }
+            ("cheat", ["reload"]) => {
+                let Some(path) = self.cheat_file.clone() else {
+                    return Reply::err("no cheat file (open a disc first)");
+                };
+                let list = crate::disc::load_cheats(&path);
+                let n = list.cheats.len();
+                sys.set_cheats(list);
+                Reply::ok(format!("{n} cheats from {}", path.display()))
+            }
             ("tty", _) => {
                 let (new, pos) = sys.tty_since(self.tty_read);
                 let new = new.to_string();
@@ -376,6 +447,9 @@ peek <hexaddr> <len>  hex dump memory (side-effect-free, MMIO shows --)
 poke <hexaddr> <hex>  write bytes to RAM/scratchpad
 disc open             open the drive lid (stops the drive, flags shell open)
 disc close [path]     close the lid, on a new image if given, else the old one
+cheat list            cheats from the disc's .cht, with their enable state
+cheat on|off <n>      toggle cheat n and write the marker back to the file
+cheat reload          re-read the .cht for the disc in the drive
 tty                   TTY output accumulated since the last `tty`
 loadexe <path> [now]  side-load a PS-X EXE (boots to the shell first unless
                       `now`, for a machine already run past it)
@@ -511,6 +585,52 @@ mod tests {
         assert!(r.payload.contains("--"), "{}", r.payload);
         // ROM is not writable.
         assert!(!c.execute(&mut sys, "poke bfc00000 ff", false).ok);
+    }
+
+    /// The whole cheat feature, end to end without a game: load a code,
+    /// run a frame, and see the write land where `peek` can read it.
+    #[test]
+    fn a_cheat_applies_once_the_machine_reaches_a_vblank() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        sys.set_cheats(psx_core::cheats::CheatList::parse(
+            "[*Health]
+80100000 0063
+[Lives]
+30100004 0009
+",
+        ));
+
+        let r = c.execute(&mut sys, "cheat list", false);
+        assert!(r.payload.contains("on "), "{}", r.payload);
+        assert!(r.payload.contains("Health"), "{}", r.payload);
+
+        // Only the enabled one fires.
+        assert!(c.execute(&mut sys, "run 1", false).ok);
+        let r = c.execute(&mut sys, "peek 80100000 8", false);
+        assert!(r.payload.contains("63 00"), "{}", r.payload);
+        assert!(r.payload.contains("00 00 00 00"), "{}", r.payload);
+
+        // Turning the second one on makes it fire on the next frame.
+        assert!(c.execute(&mut sys, "cheat on 1", false).ok);
+        assert!(c.execute(&mut sys, "run 1", false).ok);
+        let r = c.execute(&mut sys, "peek 80100004 1", false);
+        assert!(r.payload.contains("09"), "{}", r.payload);
+
+        // And off again stops it: poke over the value, run, still ours.
+        assert!(c.execute(&mut sys, "cheat off 1", false).ok);
+        assert!(c.execute(&mut sys, "poke 80100004 00", false).ok);
+        assert!(c.execute(&mut sys, "run 1", false).ok);
+        let r = c.execute(&mut sys, "peek 80100004 1", false);
+        assert!(r.payload.contains("00"), "{}", r.payload);
+    }
+
+    #[test]
+    fn cheat_commands_reject_what_they_cannot_do() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        assert!(!c.execute(&mut sys, "cheat on 0", false).ok);
+        assert!(!c.execute(&mut sys, "cheat on nope", false).ok);
+        // No disc has been opened, so there is nothing to reload from.
+        assert!(!c.execute(&mut sys, "cheat reload", false).ok);
     }
 
     #[test]
