@@ -225,6 +225,9 @@ pub struct Config {
     pub bios: Option<PathBuf>,
     pub volume: f32,
     pub memcard: Option<PathBuf>,
+    /// Window size at the last exit, in egui points.
+    pub window_width: f32,
+    pub window_height: f32,
     // Tables must stay last: TOML cannot emit a scalar after a table.
     pub keys: KeyBindings,
     pub pad: PadBindings,
@@ -237,6 +240,8 @@ impl Default for Config {
             bios: None,
             volume: 0.5,
             memcard: None,
+            window_width: 1100.0,
+            window_height: 720.0,
             keys: KeyBindings::default(),
             pad: PadBindings::default(),
             hotkeys: Hotkeys::default(),
@@ -341,6 +346,18 @@ mod tests {
         assert_eq!(back.keys.cross, "Z");
         assert_eq!(back.pad.cross, "South");
         assert_eq!(back.hotkeys.save_state, "F5");
+    }
+
+    /// The window size is a scalar pair, so it has to sit ahead of the
+    /// `[keys]`/`[pad]`/`[hotkeys]` tables for `Config::save` to emit it.
+    #[test]
+    fn window_size_round_trips_ahead_of_the_tables() {
+        let cfg = Config::default();
+        let text = toml::to_string_pretty(&cfg).expect("serialize");
+        let back: Config = toml::from_str(&text).expect("deserialize");
+        assert_eq!(back.window_width, cfg.window_width);
+        assert_eq!(back.window_height, cfg.window_height);
+        assert_eq!(back.keys.cross, cfg.keys.cross);
     }
 
     #[test]

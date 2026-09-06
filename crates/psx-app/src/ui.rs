@@ -78,6 +78,9 @@ pub struct App {
     disc_error: Option<String>,
     /// Path of the most recent screenshot, shown in the status bar.
     last_screenshot: Option<String>,
+    /// Window size in egui points, sampled every non-fullscreen frame so
+    /// the size at exit is the one that gets saved.
+    window_size: egui::Vec2,
 }
 
 impl App {
@@ -89,6 +92,7 @@ impl App {
         disc: Option<DiscInfo>,
     ) -> Self {
         let volume = config.volume.clamp(0.0, 1.0);
+        let window_size = egui::vec2(config.window_width, config.window_height);
         let keymap = resolve_keymap(&config.keys);
         let gamepad = Gamepad::new(&config.pad);
         let hotkey_save = egui::Key::from_name(&config.hotkeys.save_state);
@@ -123,6 +127,7 @@ impl App {
             title_dirty: true,
             disc_error: None,
             last_screenshot: None,
+            window_size,
         }
     }
 
@@ -348,6 +353,12 @@ impl Drop for App {
         };
         let mut cfg = self.config.clone();
         cfg.volume = self.volume;
+        // Rounded: `screen_rect` is physical pixels over `pixels_per_point`,
+        // so at fractional scaling it lands a hair off the size that was
+        // requested, and an exact compare would rewrite the file on every
+        // exit even when nothing was touched.
+        cfg.window_width = self.window_size.x.round();
+        cfg.window_height = self.window_size.y.round();
         if cfg != self.config {
             cfg.save(path);
         }
@@ -464,6 +475,10 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
         }
         let chrome = !self.fullscreen;
+        // Fullscreen reports the screen, not the window the user chose.
+        if chrome {
+            self.window_size = ctx.screen_rect().size();
+        }
         if self.title_dirty {
             self.apply_window_title(ctx);
         }

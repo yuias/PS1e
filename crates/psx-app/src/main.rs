@@ -210,7 +210,7 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([1100.0, 720.0])
+            .with_inner_size([cfg.window_width, cfg.window_height])
             .with_title("PS1e"),
         ..Default::default()
     };
