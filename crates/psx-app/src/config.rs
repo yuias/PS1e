@@ -24,6 +24,12 @@ volume = 0.5
 # Defaults to memcard0.mcr next to this file.
 #memcard = "memcard0.mcr"
 
+# Apply the cheats in the .cht file beside the disc image. Off by default:
+# a file left next to an image should not change how a game runs until it
+# is asked for. Which cheats in it are on is recorded in that file, not
+# here. See docs/CHEATS.md.
+cheats = false
+
 # Keyboard bindings for the digital pad. Values are egui key names:
 # letters and digits as themselves ("X", "1"), arrows as "Up"/"Down"/
 # "Left"/"Right", plus "Enter", "Backspace", "Space", "F1".."F20" and so

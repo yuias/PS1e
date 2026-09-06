@@ -80,6 +80,7 @@ run. CLI flags override the file.
 bios = "path/to/bios.bin"   # required to run
 volume = 0.5                # master volume, 0.0..1.0
 memcard = "memcard0.mcr"    # created and formatted automatically
+cheats = false              # apply the .cht beside the disc image
 
 [keys]                      # digital pad; egui key names
 cross = "Z"
@@ -168,6 +169,9 @@ psxctl poke 80100000 deadbeef # write RAM
 psxctl disc open              # open the drive lid
 psxctl disc close game.cue    # close it on a new image (or bare: the old one)
 psxctl tty                    # TTY output since the last call
+psxctl cheat list             # cheats from the disc's .cht, and the master switch
+psxctl cheat apply on         # nothing applies until this is on
+psxctl cheat on 0             # toggle one cheat; the marker goes back to the file
 psxctl loadexe probe.exe      # side-load a PS-X EXE over the running BIOS
 psxctl savestate s.sst        # snapshot; loadstate restores it
 psxctl state                  # pc, cycles, frames, held buttons, display
@@ -199,6 +203,14 @@ once, so the wait would otherwise time out.
   scanline the way the hardware does.
 - The controller is a digital pad, so a gamepad's analog sticks are not
   read. Memory cards respond on slot 1 only; slot 2 is empty.
+- Four GameShark code types are parsed but not applied, because what they
+  do is documented too loosely to guess at. See
+  [docs/CHEATS.md](docs/CHEATS.md).
+
+## Cheats
+
+GameShark codes from a `.cht` beside the disc image, off until switched
+on. See [docs/CHEATS.md](docs/CHEATS.md).
 
 ## Architecture
 
