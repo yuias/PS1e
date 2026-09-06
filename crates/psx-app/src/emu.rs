@@ -10,7 +10,7 @@
 use crate::audio::Audio;
 use psx_core::{CPU_CLOCK_HZ, PsxSystem};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
@@ -90,8 +90,11 @@ pub struct Shared {
     pub status: Mutex<Status>,
     /// Full TTY text, appended incrementally.
     pub tty: Mutex<String>,
-    /// VRAM copy, refreshed per frame while [`PANEL_VRAM`] is set.
+    /// VRAM copy, refreshed per frame while [`PANEL_VRAM`] is set, and the
+    /// vblank count it was taken at so the UI can tell a fresh copy from
+    /// the one it already turned into a texture.
     pub vram: Mutex<Vec<u16>>,
+    pub vram_count: AtomicU64,
     /// Which UI panels are on screen, as [`PANEL_REGS`] and friends. What a
     /// hidden panel would show costs nothing to leave unpublished, so the
     /// worker skips the copy rather than the UI skipping the draw.
@@ -354,6 +357,9 @@ impl Worker {
                 let mut v = self.shared.vram.lock().unwrap();
                 v.clear();
                 v.extend_from_slice(&gpu.vram);
+                self.shared
+                    .vram_count
+                    .store(gpu.frame_count, Ordering::Relaxed);
             }
             self.ctx.request_repaint();
         }

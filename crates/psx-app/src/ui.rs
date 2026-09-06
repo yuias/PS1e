@@ -86,6 +86,9 @@ impl Page {
 /// choice.
 const DISPLAY_HEIGHTS: [u32; 3] = [480, 720, 1080];
 
+/// VRAM is a fixed 1024x512 grid of 16-bit words.
+const VRAM_LEN: usize = 1024 * 512;
+
 pub struct App {
     emu: Emu,
     show_vram: bool,
@@ -102,6 +105,11 @@ pub struct App {
     vram_tex: Option<egui::TextureHandle>,
     /// Vblank count of the frame currently uploaded to `display_tex`.
     shown_frame: u64,
+    /// Vblank count and colour interpretation behind `vram_tex`, so the
+    /// 1 MiB expansion runs on a new copy rather than on every repaint.
+    shown_vram: Option<(u64, bool)>,
+    /// VRAM copied out from under the worker's mutex, reused each time.
+    vram_scratch: Vec<u16>,
     gpu_log: bool,
     /// Master volume applied on top of the SPU output (0..=1).
     volume: f32,
@@ -168,6 +176,8 @@ impl App {
             display_tex: None,
             vram_tex: None,
             shown_frame: 0,
+            shown_vram: None,
+            vram_scratch: Vec::new(),
             gpu_log: log_gpu,
             volume,
             config,
@@ -741,28 +751,44 @@ impl eframe::App for App {
         });
 
         if panels & emu::PANEL_VRAM != 0 {
-            let vram = self.emu.shared.vram.lock().unwrap();
-            if vram.len() == 1024 * 512 {
-                let image = vram_image(&vram, self.vram_as_24bit);
-                drop(vram);
-                let tex = match &mut self.vram_tex {
-                    Some(t) => {
-                        t.set(image, egui::TextureOptions::NEAREST);
-                        t.clone()
+            let want = (
+                self.emu.shared.vram_count.load(Ordering::Relaxed),
+                self.vram_as_24bit,
+            );
+            if self.shown_vram != Some(want) || self.vram_tex.is_none() {
+                // Copy out under the lock, expand outside it: the worker's
+                // publish() blocks on this mutex, and turning 1024x512
+                // 16-bit words into Color32 costs far more than the memcpy.
+                {
+                    let vram = self.emu.shared.vram.lock().unwrap();
+                    if vram.len() == VRAM_LEN {
+                        self.vram_scratch.clear();
+                        self.vram_scratch.extend_from_slice(&vram);
                     }
-                    None => {
-                        let t = ctx.load_texture("vram", image, egui::TextureOptions::NEAREST);
-                        self.vram_tex = Some(t.clone());
-                        t
+                }
+                if self.vram_scratch.len() == VRAM_LEN {
+                    let image = vram_image(&self.vram_scratch, self.vram_as_24bit);
+                    match &mut self.vram_tex {
+                        Some(t) => t.set(image, egui::TextureOptions::NEAREST),
+                        None => {
+                            self.vram_tex =
+                                Some(ctx.load_texture("vram", image, egui::TextureOptions::NEAREST))
+                        }
                     }
-                };
+                    self.shown_vram = Some(want);
+                }
+            }
+            if let Some(tex) = self.vram_tex.clone() {
+                // `open` takes its own bool so the body can still borrow self.
+                let mut open = self.show_vram;
                 egui::Window::new("VRAM (1024x512)")
                     .default_width(1024.0)
-                    .open(&mut self.show_vram)
+                    .open(&mut open)
                     .show(ctx, |ui| {
                         ui.checkbox(&mut self.vram_as_24bit, "interpret as 24-bit RGB");
                         ui.add(egui::Image::new(&tex));
                     });
+                self.show_vram = open;
             }
         }
     }
