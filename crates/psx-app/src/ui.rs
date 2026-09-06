@@ -15,6 +15,7 @@ use eframe::egui;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 /// Resolve configured key names to egui keys, paired with the pad bit each
 /// one drives. An unrecognized name falls back to the built-in default.
@@ -570,6 +571,13 @@ impl eframe::App for App {
             0
         };
         self.emu.shared.panels.store(panels, Ordering::Relaxed);
+        // The worker only asks for a repaint when it publishes a frame, so
+        // a page reading live state would freeze the moment emulation
+        // pauses -- which is exactly when it is being read. Drive it here
+        // instead, slow enough to stay legible.
+        if panels != 0 {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
 
         // Fullscreen reports the screen, not the window the user chose.
         if chrome {
