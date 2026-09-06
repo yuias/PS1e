@@ -81,6 +81,11 @@ impl Page {
     }
 }
 
+/// Display heights the View menu can size the window to, in physical
+/// pixels. Every PS1 mode is presented 4:3, so the height is the whole
+/// choice.
+const DISPLAY_HEIGHTS: [u32; 3] = [480, 720, 1080];
+
 pub struct App {
     emu: Emu,
     show_vram: bool,
@@ -120,6 +125,13 @@ pub struct App {
     /// Window size in egui points, sampled every non-fullscreen frame so
     /// the size at exit is the one that gets saved.
     window_size: egui::Vec2,
+    /// Space the display got last frame, in points. The difference against
+    /// the window is everything else on screen, which is what lets a
+    /// display-size pick leave the pane and the TTY the size they are.
+    central_size: egui::Vec2,
+    /// Display height requested from the View menu, in physical pixels,
+    /// applied on the next frame.
+    resize_to: Option<u32>,
 }
 
 impl App {
@@ -169,6 +181,8 @@ impl App {
             disc_error: None,
             last_screenshot: None,
             window_size,
+            central_size: egui::Vec2::ZERO,
+            resize_to: None,
         }
     }
 
@@ -338,6 +352,16 @@ impl App {
                     ui.separator();
                     ui.checkbox(&mut self.show_tty, "TTY panel");
                     ui.checkbox(&mut self.show_vram, "VRAM viewer");
+                    ui.separator();
+                    ui.menu_button("Display size", |ui| {
+                        for height in DISPLAY_HEIGHTS {
+                            let label = format!("{height}p ({}x{height})", height * 4 / 3);
+                            if ui.button(label).clicked() {
+                                self.resize_to = Some(height);
+                                ui.close();
+                            }
+                        }
+                    });
                 });
                 ui.menu_button("Help", |ui| {
                     ui.label("Pad, as bound in the config file:");
@@ -587,6 +611,23 @@ impl eframe::App for App {
             self.apply_window_title(ctx);
         }
 
+        // Resize the window so the display comes out exactly this tall.
+        // The chrome is measured, not assumed: whatever the window has that
+        // the display does not is the pane, the TTY and the bars, and they
+        // keep their size while the difference lands on the display. Only
+        // taken once a frame has been laid out, or the request would be
+        // consumed with nothing to measure against.
+        if self.central_size.x > 0.0
+            && let Some(height) = self.resize_to.take()
+        {
+            let display =
+                egui::vec2(height as f32 * 4.0 / 3.0, height as f32) / ctx.pixels_per_point();
+            let window_chrome = ctx.screen_rect().size() - self.central_size;
+            // A maximized window ignores InnerSize.
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(window_chrome + display));
+        }
+
         if chrome {
             self.menu_bar(ctx, status.running, debugger_active);
             self.status_bar(ctx, &status);
@@ -646,6 +687,7 @@ impl eframe::App for App {
             egui::CentralPanel::default()
         };
         central.show(ctx, |ui| {
+            self.central_size = ui.max_rect().size();
             let (enabled, image) = {
                 let frame = self.emu.shared.frame.lock().unwrap();
                 // Convert only when the worker published a new frame
