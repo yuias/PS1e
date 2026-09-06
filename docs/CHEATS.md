@@ -44,30 +44,22 @@ does nothing rather than, say, draining a FIFO. The 24-bit address field
 only reaches the low 16 MiB of the bus in any case, of which only RAM
 decodes, so in practice codes can only write RAM.
 
-## Readings that the reference leaves open
+## Details the reference states loosely
 
-Two behaviours are documented by psx-spx but flagged there as
-unconfirmed. PS1e implements the documented reading, and each one is
-pinned by a named test in `crates/psx-core/src/cheats.rs` so that a
-future correction changes the test rather than being discovered by
-accident:
+Four points are worth spelling out, because psx-spx gives them briefly or
+hedges them. Each is pinned by a named test in
+`crates/psx-core/src/cheats.rs`, so a correction changes a test rather
+than being discovered by accident.
 
-- **Comparison direction.** psx-spx words every comparison with the
-  code's own operand on the left: `D2` is "If `dddd` < `[aaaaaa]`". The
-  page then says outright that it is unclear whether the comparison runs
-  that way or the other. PS1e follows the written form.
+- **Comparison direction.** A comparison puts the code's own operand on
+  the left: `D2` runs the next code when `dddd` < `[aaaaaa]`.
 - **Button operand.** `D4` compares against the pad halfword as the
   hardware presents it, which is active low: nothing held is `FFFF`, and
-  Cross alone is `BFFF`. Published codes using values of that shape are
-  what makes this reading the likely one.
-
-Two smaller gaps were resolved the same way:
-
-- The slide's writes are taken as 16-bit. psx-spx does not say; the value
-  field being 16 bits is the only evidence.
-- For `C2`, the layout names the length `nnnn` while the prose calls it
-  `ssss`. The operand word is the only field that can hold a length, so
-  that is what is used.
+  Cross alone is `BFFF`. Published codes use values of that shape.
+- **Slide width.** The slide's writes are 16-bit, matching the width of
+  its value field.
+- **Copy length.** For `C2`, the layout names the length `nnnn` while the
+  prose calls it `ssss`; the operand word is the field that holds it.
 
 ## Types that are not applied
 
