@@ -5,6 +5,7 @@
 
 pub mod bus;
 pub mod cdrom;
+pub mod cheats;
 pub mod cpu;
 pub mod dma;
 pub mod gpu;
@@ -42,6 +43,10 @@ pub struct PsxSystem {
     next_sample: u64,
     #[serde(skip)]
     tty: Tty,
+    /// Frontend-owned, applied at the vblank edge. Not machine state, so
+    /// not serialized; it rides in [`Ambient`] instead.
+    #[serde(skip)]
+    cheats: cheats::CheatList,
 }
 
 /// Everything the frontend owns and the machine merely holds: the BIOS
@@ -58,6 +63,7 @@ pub struct Ambient {
     pub memcard: memcard::MemCard,
     pub log_gpu: bool,
     pub tty: Tty,
+    pub cheats: cheats::CheatList,
 }
 
 /// Save-state file magic + format version. Bump the version on any change
@@ -87,6 +93,7 @@ impl PsxSystem {
             cycles: 0,
             next_sample: spu::CYCLES_PER_SAMPLE,
             tty: Tty::default(),
+            cheats: cheats::CheatList::default(),
         }
     }
 
@@ -99,6 +106,7 @@ impl PsxSystem {
             memcard: std::mem::take(&mut self.bus.sio.memcard),
             log_gpu: self.bus.gpu.log_commands,
             tty: std::mem::take(&mut self.tty),
+            cheats: std::mem::take(&mut self.cheats),
         }
     }
 
@@ -111,6 +119,7 @@ impl PsxSystem {
         self.bus.sio.memcard = ambient.memcard;
         self.bus.gpu.log_commands = ambient.log_gpu;
         self.tty = ambient.tty;
+        self.cheats = ambient.cheats;
     }
 
     /// Power-cycle the machine, keeping the ambient assets.
@@ -118,6 +127,16 @@ impl PsxSystem {
         let ambient = self.take_ambient();
         *self = Self::with_bus(Bus::build(Box::default()));
         self.set_ambient(ambient);
+    }
+
+    /// Replace the cheat table. Survives state loads and resets through
+    /// [`Ambient`], so the frontend sets it once per disc.
+    pub fn set_cheats(&mut self, cheats: cheats::CheatList) {
+        self.cheats = cheats;
+    }
+
+    pub fn cheats(&self) -> &cheats::CheatList {
+        &self.cheats
     }
 
     /// Switch GP0/GP1 command decoding to the log on or off.
@@ -321,6 +340,12 @@ impl PsxSystem {
             let timing = self.bus.gpu.video_timing();
             self.bus.irq.raise(0);
             self.bus.gpu.vblank(self.cycles);
+            // The cartridge got control once a frame, and this is the only
+            // vblank edge in the tree. It has to be here rather than in the
+            // worker loop: the gdb server drives `step()` directly, so a
+            // frontend-side hook would quietly stop applying under the
+            // debugger.
+            self.cheats.apply(&mut self.bus);
             // Keep lazily-synced components from lagging more than a frame,
             // then hand them the field boundary they measure blanking from
             self.bus

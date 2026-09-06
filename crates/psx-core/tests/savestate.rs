@@ -66,3 +66,25 @@ fn rejects_garbage_and_wrong_versions() {
     state[4] = 0xff; // corrupt the version field
     assert!(sys.load_state(&state).is_err());
 }
+
+/// Cheats are frontend-owned: they ride in `Ambient`, so neither a state
+/// load nor a reset may drop them, and they must keep firing afterwards.
+#[test]
+fn cheats_survive_a_state_load_and_a_reset() {
+    use psx_core::cheats::CheatList;
+
+    let mut sys = fresh();
+    sys.set_cheats(CheatList::parse("[*t]\n80000100 BEEF\n"));
+    let state = sys.save_state().unwrap();
+
+    sys.load_state(&state).unwrap();
+    assert_eq!(sys.cheats().cheats.len(), 1);
+
+    sys.reset();
+    assert_eq!(sys.cheats().cheats.len(), 1);
+
+    // One frame is enough to reach a vblank, which is where they apply.
+    sys.run_cycles(psx_core::CPU_CLOCK_HZ / 50);
+    assert_eq!(sys.bus.peek8(0x8000_0100), Some(0xEF));
+    assert_eq!(sys.bus.peek8(0x8000_0101), Some(0xBE));
+}
