@@ -24,6 +24,19 @@ const AUDIO_TARGET: usize = 3_528;
 pub const PANEL_REGS: u8 = 1 << 0;
 /// The 1 MiB VRAM copy runs only for this bit.
 pub const PANEL_VRAM: u8 = 1 << 1;
+/// The memory viewer's window is copied only for this bit.
+pub const PANEL_MEMORY: u8 = 1 << 2;
+
+/// Bytes the memory viewer shows at once.
+pub const VIEW_BYTES: usize = 256;
+
+/// One window of RAM for the viewer, refreshed per frame while the page
+/// is open. `base` is a RAM offset, not a bus address.
+#[derive(Clone, Default)]
+pub struct MemoryView {
+    pub base: u32,
+    pub bytes: Vec<u8>,
+}
 
 pub enum Command {
     SetRunning(bool),
@@ -95,6 +108,10 @@ pub struct Shared {
     /// the one it already turned into a texture.
     pub vram: Mutex<Vec<u16>>,
     pub vram_count: AtomicU64,
+    /// Memory viewer: the RAM offset the UI is looking at (UI -> worker)
+    /// and the window read back from it.
+    pub view_base: AtomicU32,
+    pub memory: Mutex<MemoryView>,
     /// Which UI panels are on screen, as [`PANEL_REGS`] and friends. What a
     /// hidden panel would show costs nothing to leave unpublished, so the
     /// worker skips the copy rather than the UI skipping the draw.
@@ -337,6 +354,19 @@ impl Worker {
         }
     }
 
+    /// Copy the window the viewer is looking at. Clamped and 16-aligned
+    /// here rather than in the UI so a typo cannot ask for an out-of-range
+    /// slice, and so the page always has a full row to draw.
+    fn publish_memory(&mut self) {
+        let ram = &self.sys.bus.ram;
+        let base = (self.shared.view_base.load(Ordering::Relaxed) as usize & !0xF)
+            .min(ram.len() - VIEW_BYTES);
+        let mut m = self.shared.memory.lock().unwrap();
+        m.base = base as u32;
+        m.bytes.clear();
+        m.bytes.extend_from_slice(&ram[base..base + VIEW_BYTES]);
+    }
+
     fn publish(&mut self) {
         let panels = self.shared.panels.load(Ordering::Relaxed);
         let gpu = &self.sys.bus.gpu;
@@ -385,6 +415,10 @@ impl Worker {
                 st.audio_buffered = audio.buffered_frames();
                 st.audio_underruns = audio.underruns();
             }
+        }
+
+        if panels & PANEL_MEMORY != 0 {
+            self.publish_memory();
         }
 
         let (new, pos) = self.sys.tty_since(self.tty_pos);

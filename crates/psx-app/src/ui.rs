@@ -59,15 +59,17 @@ pub enum Page {
     #[default]
     Settings,
     Registers,
+    Memory,
 }
 
 impl Page {
-    const ALL: [Page; 2] = [Page::Settings, Page::Registers];
+    const ALL: [Page; 3] = [Page::Settings, Page::Registers, Page::Memory];
 
     fn label(self) -> &'static str {
         match self {
             Page::Settings => "Settings",
             Page::Registers => "CPU",
+            Page::Memory => "Memory",
         }
     }
 
@@ -77,6 +79,7 @@ impl Page {
         match self {
             Page::Settings => 0,
             Page::Registers => emu::PANEL_REGS,
+            Page::Memory => emu::PANEL_MEMORY,
         }
     }
 }
@@ -85,6 +88,10 @@ impl Page {
 /// pixels. Every PS1 mode is presented 4:3, so the height is the whole
 /// choice.
 const DISPLAY_HEIGHTS: [u32; 3] = [480, 720, 1080];
+
+/// RAM shows as KSEG0 addresses: what the BIOS, gdb and cheat codes all
+/// use, and what makes an address recognizable at a glance.
+const KSEG0: u32 = 0x8000_0000;
 
 /// VRAM is a fixed 1024x512 grid of 16-bit words.
 const VRAM_LEN: usize = 1024 * 512;
@@ -110,6 +117,9 @@ pub struct App {
     shown_vram: Option<(u64, bool)>,
     /// VRAM copied out from under the worker's mutex, reused each time.
     vram_scratch: Vec<u16>,
+    /// Memory page: the address as typed, kept separate from the offset
+    /// sent to the worker so a half-typed address does not move the view.
+    mem_addr: String,
     gpu_log: bool,
     /// Master volume applied on top of the SPU output (0..=1).
     volume: f32,
@@ -178,6 +188,7 @@ impl App {
             shown_frame: 0,
             shown_vram: None,
             vram_scratch: Vec::new(),
+            mem_addr: format!("{:08x}", KSEG0),
             gpu_log: log_gpu,
             volume,
             config,
@@ -283,6 +294,45 @@ impl App {
         {
             self.emu.send(Command::SetGpuLog(self.gpu_log));
         }
+    }
+
+    /// Memory page: a window of RAM as hex and ASCII.
+    fn memory_page(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("addr");
+            let edit = egui::TextEdit::singleline(&mut self.mem_addr)
+                .font(egui::TextStyle::Monospace)
+                .desired_width(80.0);
+            if ui.add(edit).changed()
+                && let Ok(addr) = u32::from_str_radix(self.mem_addr.trim_start_matches("0x"), 16)
+            {
+                // Any of the three RAM mirrors is accepted; the worker
+                // wants an offset.
+                self.emu.shared.view_base.store(
+                    addr & (psx_core::bus::RAM_SIZE as u32 - 1),
+                    Ordering::Relaxed,
+                );
+            }
+        });
+        ui.separator();
+        let view = self.emu.shared.memory.lock().unwrap().clone();
+        if view.bytes.len() < emu::VIEW_BYTES {
+            ui.label("waiting for the worker");
+            return;
+        }
+        // One row per 16 bytes, wide enough that the pane usually scrolls
+        // sideways; the alternative is a narrower row that reads worse.
+        egui::ScrollArea::horizontal().show(ui, |ui| {
+            for (i, row) in view.bytes.chunks(16).enumerate() {
+                let addr = KSEG0 + view.base + (i * 16) as u32;
+                let hex: String = row.iter().map(|b| format!("{b:02x} ")).collect();
+                let ascii: String = row
+                    .iter()
+                    .map(|&b| if b.is_ascii_graphic() { b as char } else { '.' })
+                    .collect();
+                ui.monospace(format!("{addr:08x}  {hex} {ascii}"));
+            }
+        });
     }
 
     /// VRAM page: the whole 1024x512 grid, either as the 15-bit words the
@@ -545,10 +595,15 @@ fn vram_image(vram: &[u16], as_24bit: bool) -> egui::ColorImage {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // A focused text field in the pane would otherwise type into the
+        // pad as well. Only the pad is gated: the function-key shortcuts
+        // below stay live, and Esc needs no handling because egui drops
+        // focus in its own begin_pass before this runs.
+        let typing = ctx.wants_keyboard_input();
         let buttons = ctx.input(|i| {
             self.keymap
                 .iter()
-                .filter(|(k, _)| i.key_down(*k))
+                .filter(|(k, _)| !typing && i.key_down(*k))
                 .fold(0u16, |acc, (_, b)| acc | b)
         });
         let buttons = buttons | self.gamepad.as_mut().map_or(0, Gamepad::poll);
@@ -658,9 +713,19 @@ impl eframe::App for App {
                         }
                     });
                     ui.separator();
+                    // Clicking the empty part of the pane drops text focus,
+                    // which is the way back to driving the pad.
+                    let bg = ui.max_rect();
+                    if ui
+                        .interact(bg, ui.id().with("bg"), egui::Sense::click())
+                        .clicked()
+                    {
+                        ui.ctx().memory_mut(|m| m.stop_text_input());
+                    }
                     egui::ScrollArea::vertical().show(ui, |ui| match self.page {
                         Page::Settings => self.settings_page(ui),
                         Page::Registers => registers_page(ui, &status),
+                        Page::Memory => self.memory_page(ui),
                     });
                 });
             // Follow the drag rather than tracking the events behind it.
