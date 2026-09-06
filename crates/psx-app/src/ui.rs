@@ -59,16 +59,18 @@ const BUTTON_NAMES: [&str; 14] = [
 pub enum Page {
     #[default]
     Settings,
+    Cheats,
     Memory,
     Registers,
 }
 
 impl Page {
-    const ALL: [Page; 3] = [Page::Settings, Page::Memory, Page::Registers];
+    const ALL: [Page; 4] = [Page::Settings, Page::Cheats, Page::Memory, Page::Registers];
 
     fn label(self) -> &'static str {
         match self {
             Page::Settings => "Settings",
+            Page::Cheats => "Cheats",
             Page::Memory => "Memory",
             Page::Registers => "Registers",
         }
@@ -78,7 +80,9 @@ impl Page {
     /// show. A page not on screen asks for nothing.
     fn panels(self) -> u8 {
         match self {
-            Page::Settings => 0,
+            // The cheat list is held by the UI, so the worker owes it
+            // nothing.
+            Page::Settings | Page::Cheats => 0,
             Page::Memory => emu::PANEL_MEMORY,
             Page::Registers => emu::PANEL_REGS,
         }
@@ -121,6 +125,11 @@ pub struct App {
     /// Memory page: the address as typed, kept separate from the offset
     /// sent to the worker so a half-typed address does not move the view.
     mem_addr: String,
+    /// Cheats for the disc in the drive, and the `.cht` they came from.
+    /// The UI holds the list because it is what the checkboxes edit; the
+    /// worker gets a copy through `Command::SetCheats`.
+    cheats: psx_core::cheats::CheatList,
+    cheat_file: Option<PathBuf>,
     /// Scanner controls. The candidate list itself lives on the worker.
     scan_width: u8,
     scan_value: String,
@@ -165,6 +174,14 @@ impl App {
         log_gpu: bool,
         disc: Option<DiscInfo>,
     ) -> Self {
+        // Re-read the sidecar rather than threading the already-parsed
+        // list down from main: the CLI and the picker then show the same
+        // list by construction, and it is one small file at startup.
+        let cheat_file = disc.as_ref().map(|d| disc::cheat_path(&d.path));
+        let cheats = cheat_file
+            .as_deref()
+            .map(disc::load_cheats)
+            .unwrap_or_default();
         let volume = config.volume.clamp(0.0, 1.0);
         let window_size = egui::vec2(config.window_width, config.window_height);
         let keymap = resolve_keymap(&config.keys);
@@ -194,6 +211,8 @@ impl App {
             shown_vram: None,
             vram_scratch: Vec::new(),
             mem_addr: format!("{:08x}", KSEG0),
+            cheats,
+            cheat_file,
             scan_width: 4,
             scan_value: String::new(),
             scan_started: false,
@@ -229,6 +248,8 @@ impl App {
         let disc = picked.and_then(|path| match disc::load_disc(&path) {
             Ok(loaded) => {
                 self.disc_error = None;
+                self.cheat_file = Some(disc::cheat_path(&loaded.info.path));
+                self.cheats = loaded.cheats.clone();
                 self.disc = Some(loaded.info.clone());
                 self.title_dirty = true;
                 Some(loaded)
@@ -301,6 +322,60 @@ impl App {
             .changed()
         {
             self.emu.send(Command::SetGpuLog(self.gpu_log));
+        }
+    }
+
+    /// Cheats page: one checkbox per cheat in the disc's `.cht`.
+    /// Enable/disable only — the file stays the place codes are written.
+    fn cheats_page(&mut self, ui: &mut egui::Ui) {
+        let Some(path) = self.cheat_file.clone() else {
+            ui.label("No disc in the drive.");
+            return;
+        };
+        if self.cheats.is_empty() {
+            ui.label("No cheats for this disc.");
+            ui.monospace(path.display().to_string());
+            if ui.button("Reload").clicked() {
+                self.reload_cheats();
+            }
+            return;
+        }
+        let mut changed = false;
+        for cheat in &mut self.cheats.cheats {
+            let row = ui.checkbox(&mut cheat.enabled, &cheat.name);
+            changed |= row.changed();
+            if cheat.has_unsupported() {
+                row.on_hover_text("contains code types this build does not apply");
+            }
+        }
+        ui.separator();
+        if ui
+            .button("Reload")
+            .on_hover_text(path.display().to_string())
+            .clicked()
+        {
+            self.reload_cheats();
+        }
+        if changed {
+            self.emu.send(Command::SetCheats(self.cheats.clone()));
+            self.save_cheats();
+        }
+    }
+
+    /// Re-read the `.cht` and hand the result to the worker. Used after
+    /// editing the file by hand, which is how codes get added at all.
+    fn reload_cheats(&mut self) {
+        let Some(path) = &self.cheat_file else { return };
+        self.cheats = disc::load_cheats(path);
+        self.emu.send(Command::SetCheats(self.cheats.clone()));
+    }
+
+    /// The `.cht` is the only record of what is enabled, so a toggle
+    /// writes it straight back.
+    fn save_cheats(&mut self) {
+        let Some(path) = &self.cheat_file else { return };
+        if let Err(e) = std::fs::write(path, self.cheats.to_text()) {
+            tracing::error!("could not save {}: {e}", path.display());
         }
     }
 
@@ -830,6 +905,7 @@ impl eframe::App for App {
                     ui.separator();
                     egui::ScrollArea::vertical().show(ui, |ui| match self.page {
                         Page::Settings => self.settings_page(ui),
+                        Page::Cheats => self.cheats_page(ui),
                         Page::Memory => self.memory_page(ui),
                         Page::Registers => registers_page(ui, &status),
                     });

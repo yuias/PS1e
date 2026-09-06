@@ -52,6 +52,8 @@ pub enum Command {
     SaveState,
     LoadState,
     SetGpuLog(bool),
+    /// Replace the cheat table, e.g. after an enable toggle or a reload.
+    SetCheats(psx_core::cheats::CheatList),
     /// Run one scanner pass and leave the result in [`Shared::scan`].
     Scan(crate::scan::Request),
     Quit,
@@ -279,7 +281,14 @@ impl Worker {
                 Command::Reset if !debugger_active => self.sys.reset(),
                 Command::OpenShell if !debugger_active => self.sys.open_shell(),
                 Command::CloseShell(disc) if !debugger_active => {
-                    self.sys.close_shell(disc.map(|d| d.disc))
+                    // A new disc brings its own cheats; putting the same
+                    // one back (`None`) leaves the table alone.
+                    if let Some(loaded) = disc {
+                        self.sys.set_cheats(loaded.cheats);
+                        self.sys.close_shell(Some(loaded.disc));
+                    } else {
+                        self.sys.close_shell(None);
+                    }
                 }
                 Command::SetRunning(_)
                 | Command::Step
@@ -316,6 +325,7 @@ impl Worker {
                     }
                 }
                 Command::SetGpuLog(v) => self.sys.set_gpu_log(v),
+                Command::SetCheats(list) => self.sys.set_cheats(list),
                 Command::Scan(req) => {
                     let (scan, outcome) =
                         crate::scan::Scan::pass(self.scan.take(), req, &self.sys.bus.ram);
