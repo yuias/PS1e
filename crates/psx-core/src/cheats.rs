@@ -17,6 +17,10 @@
 
 use crate::bus::Bus;
 
+/// Codes name a 24-bit address; published lists write the continuation
+/// lines of the two-line types in KSEG0 form, and so does `to_text`.
+const KSEG0: u32 = 0x8000_0000;
+
 /// How a conditional compares. psx-spx words every one of them with the
 /// code's own operand on the left: `D2` is "If dddd<[aaaaaa]". It also
 /// says outright that the direction is unconfirmed, so this is the
@@ -61,8 +65,8 @@ impl Cmp {
     }
 }
 
-/// One code. Most are one line; [`Code::Slide`] is the one type that eats
-/// the line after it.
+/// One code. Most are one line; [`Code::Slide`] and [`Code::Copy`] are
+/// the two that eat the line after them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Code {
     /// `30aaaaaa 00dd`
@@ -94,6 +98,13 @@ pub enum Code {
         value: u16,
         step: u16,
     },
+    /// ```text
+    /// C2ssssss nnnn
+    /// 80tttttt 0000   copy nnnn bytes from ssssss to tttttt
+    /// ```
+    /// psx-spx names the length `nnnn` in the layout but calls it `ssss`
+    /// in the prose; the operand word is the only field that can hold it.
+    Copy { src: u32, dst: u32, len: u16 },
     /// A well-formed line of a type that is not implemented. Kept so the
     /// rest of the cheat still works and the UI can say what was skipped.
     Unsupported { kind: u8, addr: u32, value: u16 },
@@ -147,37 +158,46 @@ impl Code {
                 cmp: Cmp::from_low_nibble(kind & 3),
                 value: value as u8,
             },
-            // 0x50 needs the line after it; the caller assembles it.
+            // 0x50 and 0xc2 need the line after them; the caller pairs
+            // them up and calls `parse_pair`.
             _ => Code::Unsupported { kind, addr, value },
         })
     }
 
-    /// Assemble a slide out of its two lines. The second is a bare 32-bit
-    /// address and a 16-bit value step — not a typed code line, the same
-    /// shape the `C2` copy code uses for its continuation.
-    fn parse_slide(head: &str, tail: &str) -> Result<Code, ParseError> {
-        let words = |line: &str| -> Result<(u32, u16), ParseError> {
-            let mut w = line.split_whitespace();
-            let (Some(hi), Some(lo), None) = (w.next(), w.next(), w.next()) else {
-                return Err(ParseError::Shape);
-            };
-            if hi.len() != 8 || lo.len() != 4 {
-                return Err(ParseError::Shape);
-            }
-            Ok((
-                u32::from_str_radix(hi, 16).map_err(|_| ParseError::Hex)?,
-                u16::from_str_radix(lo, 16).map_err(|_| ParseError::Hex)?,
-            ))
-        };
-        let (head_hi, value) = words(head)?;
-        let (addr, step) = words(tail)?;
-        Ok(Code::Slide {
-            addr: addr & 0x00ff_ffff,
-            count: (head_hi >> 8) as u8,
-            stride: head_hi as u8,
-            value,
-            step,
-        })
+    /// The type byte of a line, without committing to parsing it. Tells
+    /// the reader whether a continuation line has to be pulled in.
+    fn kind_of(line: &str) -> Option<u8> {
+        let word = line.split_whitespace().next()?;
+        (word.len() == 8).then(|| u8::from_str_radix(&word[..2], 16).ok())?
+    }
+
+    /// True for the two types that are written across two lines.
+    fn takes_a_continuation(kind: u8) -> bool {
+        matches!(kind, 0x50 | 0xc2)
+    }
+
+    /// Assemble one of the two-line codes. Their second line is a bare
+    /// 32-bit address plus a 16-bit word, not a typed code line, so it is
+    /// split here rather than run through [`Code::parse`].
+    fn parse_pair(head: &str, tail: &str) -> Result<Code, ParseError> {
+        let (head_hi, head_lo) = words(head)?;
+        let (tail_hi, tail_lo) = words(tail)?;
+        match (head_hi >> 24) as u8 {
+            0x50 => Ok(Code::Slide {
+                addr: tail_hi & 0x00ff_ffff,
+                count: (head_hi >> 8) as u8,
+                stride: head_hi as u8,
+                value: head_lo,
+                step: tail_lo,
+            }),
+            // The second word of the destination line is documented as
+            // 0000 and carries nothing, so it is not kept.
+            _ => Ok(Code::Copy {
+                src: head_hi & 0x00ff_ffff,
+                dst: tail_hi & 0x00ff_ffff,
+                len: head_lo,
+            }),
+        }
     }
 
     /// Run this code. Returns how many of the codes after it to skip,
@@ -237,9 +257,38 @@ impl Code {
                 }
                 0
             }
+            // Byte at a time so the region check happens per address:
+            // a copy that runs off the end of RAM stops writing rather
+            // than wrapping into something else.
+            Code::Copy { src, dst, len } => {
+                for i in 0..u32::from(len) {
+                    let Some(b) = bus.peek8(src.wrapping_add(i)) else {
+                        break;
+                    };
+                    if !bus.poke8(dst.wrapping_add(i), b) {
+                        break;
+                    }
+                }
+                0
+            }
             Code::Unsupported { .. } => 0,
         }
     }
+}
+
+/// Split a `xxxxxxxx yyyy` line into its two words.
+fn words(line: &str) -> Result<(u32, u16), ParseError> {
+    let mut w = line.split_whitespace();
+    let (Some(hi), Some(lo), None) = (w.next(), w.next(), w.next()) else {
+        return Err(ParseError::Shape);
+    };
+    if hi.len() != 8 || lo.len() != 4 {
+        return Err(ParseError::Shape);
+    }
+    Ok((
+        u32::from_str_radix(hi, 16).map_err(|_| ParseError::Hex)?,
+        u16::from_str_radix(lo, 16).map_err(|_| ParseError::Hex)?,
+    ))
 }
 
 /// Little-endian halfword through the debugger accessors: `poke8` already
@@ -324,10 +373,11 @@ impl CheatList {
                 tracing::warn!("cheat line before any [section]: {line}");
                 continue;
             };
-            // A slide is the one type spread over two lines.
-            let parsed = if line.starts_with("50") {
+            // Two types are written across two lines; the rest are one.
+            let paired = Code::kind_of(line).is_some_and(Code::takes_a_continuation);
+            let parsed = if paired {
                 match lines.next() {
-                    Some(tail) => Code::parse_slide(line, tail),
+                    Some(tail) => Code::parse_pair(line, tail),
                     None => Err(ParseError::Shape),
                 }
             } else {
@@ -373,7 +423,16 @@ impl CheatList {
                         stride,
                         value,
                         step,
-                    } => format!("5000{count:02X}{stride:02X} {value:04X}\n{addr:08X} {step:04X}"),
+                    } => format!(
+                        // The continuation address goes out in the KSEG0
+                        // form published codes are written in; parsing
+                        // masks the segment off again.
+                        "5000{count:02X}{stride:02X} {value:04X}\n{:08X} {step:04X}",
+                        KSEG0 | addr
+                    ),
+                    Code::Copy { src, dst, len } => {
+                        format!("C2{src:06X} {len:04X}\n{:08X} 0000", KSEG0 | dst)
+                    }
                     Code::Unsupported { kind, addr, value } => {
                         format!("{kind:02X}{addr:06X} {value:04X}")
                     }
@@ -643,6 +702,43 @@ D4000000 BFFF
     }
 
     #[test]
+    fn a_copy_moves_its_run_of_bytes() {
+        let mut bus = bus();
+        for (i, b) in [1u8, 2, 3, 4].iter().enumerate() {
+            assert!(bus.poke8(RAM + i as u32, *b));
+        }
+        CheatList::parse(
+            "[*t]
+C2000100 0004
+80000200 0000
+",
+        )
+        .apply(&mut bus);
+        for (i, b) in [1u8, 2, 3, 4].iter().enumerate() {
+            assert_eq!(bus.peek8(0x8000_0200 + i as u32), Some(*b));
+        }
+        assert_eq!(bus.peek8(0x8000_0204), Some(0x00), "length of 4 stops at 4");
+    }
+
+    #[test]
+    fn a_copy_stops_where_the_memory_does() {
+        let mut bus = bus();
+        // Source runs off the end of RAM part way through; the code has
+        // to stop rather than wrap around to the start of it.
+        let near_end = (crate::bus::RAM_SIZE as u32) - 2;
+        assert!(bus.poke8(near_end, 0xAA));
+        CheatList::parse(&format!(
+            "[*t]
+C2{near_end:06X} 0010
+80000200 0000
+"
+        ))
+        .apply(&mut bus);
+        assert_eq!(bus.peek8(0x8000_0200), Some(0xAA));
+        assert_eq!(bus.peek8(0x8000_0202), Some(0x00));
+    }
+
+    #[test]
     fn a_slide_without_its_second_line_is_dropped() {
         let list = CheatList::parse(
             "[*t]
@@ -664,6 +760,24 @@ D4000000 BFFF
 ",
         );
         assert_eq!(list.cheats[0].codes.len(), 1);
+    }
+
+    /// The two-line types survive a rewrite of the file, which is what a
+    /// toggle does. Their continuation goes back out in the KSEG0 form
+    /// published codes are written in.
+    #[test]
+    fn the_two_line_codes_round_trip() {
+        let text = "[*Two]
+5000030A 0010
+80000100 0001
+C2000100 0004
+80000200 0000
+
+";
+        let list = CheatList::parse(text);
+        assert_eq!(list.cheats[0].codes.len(), 2);
+        assert_eq!(list.to_text(), text);
+        assert_eq!(CheatList::parse(&list.to_text()), list);
     }
 
     #[test]
