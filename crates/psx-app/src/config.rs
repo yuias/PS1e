@@ -235,11 +235,11 @@ pub struct Config {
     /// default: a file dropped next to an image should not change how a
     /// game runs until it is asked for.
     pub cheats: bool,
-    /// Side pane: shown at startup, the page it opens on, and the width it
-    /// opens at. egui's own persistence is not compiled in, so the geometry
-    /// lives here.
+    /// Side pane: whether it is shown at startup and the width it opens at.
+    /// egui's own persistence is not compiled in, so the geometry lives
+    /// here. Which page it opens on is not remembered -- it always starts
+    /// on the first tab.
     pub pane: bool,
-    pub page: crate::ui::Page,
     pub pane_width: f32,
     /// Window size at the last exit, in egui points. Only sampled while
     /// the window is neither maximized nor fullscreen, so it is the size
@@ -262,7 +262,6 @@ impl Default for Config {
             memcard: None,
             cheats: false,
             pane: true,
-            page: crate::ui::Page::default(),
             // A memory row at the default monospace size, near enough; the
             // pane clamps this to its own measured minimum anyway.
             pane_width: 560.0,
@@ -403,7 +402,6 @@ mod tests {
         let text = toml::to_string_pretty(&cfg).expect("serialize");
         let back: Config = toml::from_str(&text).expect("deserialize");
         assert_eq!(back.pane, cfg.pane);
-        assert_eq!(back.page, cfg.page);
         assert_eq!(back.pane_width, cfg.pane_width);
         let closed: Config = toml::from_str("pane = false").expect("deserialize");
         assert!(!closed.pane);

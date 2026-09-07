@@ -13,7 +13,6 @@ use crate::emu::{Command, DebuggerState, Emu, FrameSnapshot, Status};
 use crate::gamepad::Gamepad;
 use crate::scan;
 use eframe::egui;
-use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -54,9 +53,8 @@ const BUTTON_NAMES: [&str; 14] = [
 /// One tab of the side pane. Adding a page means an arm in each of
 /// [`Page::ALL`], [`Page::label`], [`Page::panels`] and the dispatch in
 /// `update`; the pane itself needs no other bookkeeping.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum Page {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum Page {
     #[default]
     Settings,
     Cheats,
@@ -228,7 +226,10 @@ impl App {
             show_vram: false,
             vram_as_24bit: false,
             show_pane: config.pane,
-            page: config.page,
+            // Deliberately not restored: the pane opens on its first tab
+            // every run, so a session spent on Memory does not decide where
+            // the next one starts.
+            page: Page::default(),
             pane_width: config.pane_width,
             show_tty: false,
             fullscreen: false,
@@ -724,7 +725,6 @@ impl Drop for App {
         cfg.volume = self.volume;
         cfg.cheats = self.cheats_on;
         cfg.pane = self.show_pane;
-        cfg.page = self.page;
         cfg.pane_width = self.pane_width;
         // Rounded: `screen_rect` is physical pixels over `pixels_per_point`,
         // so at fractional scaling it lands a hair off the size that was
