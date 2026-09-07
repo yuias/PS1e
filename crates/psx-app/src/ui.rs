@@ -898,13 +898,22 @@ impl eframe::App for App {
         }
 
         // Neither fullscreen nor maximized reports the window the user
-        // chose. `unwrap_or` keeps the last answer rather than assuming
-        // "not maximized" on the frames the backend has yet to report one.
-        self.maximized = ctx
-            .input(|i| i.viewport().maximized)
-            .unwrap_or(self.maximized);
-        if chrome && !self.maximized {
-            self.window_size = ctx.screen_rect().size();
+        // chose. The size is read from the same `ViewportInfo` as the flag
+        // rather than from `screen_rect`: the backend fills both from the
+        // window in one go, while `screen_rect` follows a resize event that
+        // can land a frame away from the flag -- long enough to record the
+        // maximized size as the ordinary one. `unwrap_or` keeps the last
+        // answer on the frames that report nothing.
+        let (maximized, inner) = ctx.input(|i| {
+            let vp = i.viewport();
+            (vp.maximized, vp.inner_rect)
+        });
+        self.maximized = maximized.unwrap_or(self.maximized);
+        if chrome
+            && !self.maximized
+            && let Some(inner) = inner
+        {
+            self.window_size = inner.size();
         }
         if self.title_dirty {
             self.apply_window_title(ctx);
