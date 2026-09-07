@@ -214,6 +214,9 @@ fn main() -> eframe::Result {
         renderer: eframe::Renderer::Wgpu,
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([cfg.window_width, cfg.window_height])
+            // The inner size is what un-maximizing restores to, so both
+            // are set: the window comes back the way it was left.
+            .with_maximized(cfg.maximized)
             .with_title("PS1e"),
         ..Default::default()
     };

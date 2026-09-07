@@ -175,9 +175,14 @@ pub struct App {
     disc_error: Option<String>,
     /// Path of the most recent screenshot, shown in the status bar.
     last_screenshot: Option<String>,
-    /// Window size in egui points, sampled every non-fullscreen frame so
-    /// the size at exit is the one that gets saved.
+    /// Window size in egui points, sampled on every frame the window is
+    /// showing that size for real -- not while maximized or fullscreen, or
+    /// the saved size would be the screen and the next run would open a
+    /// screen-sized ordinary window.
     window_size: egui::Vec2,
+    /// The window is maximized. Tracked so a maximized exit restores as a
+    /// maximized window rather than as a window of that size.
+    maximized: bool,
     /// Space the display got last frame, in points. The difference against
     /// the window is everything else on screen, which is what lets a
     /// display-size pick leave the pane and the TTY the size they are.
@@ -205,6 +210,7 @@ impl App {
             .unwrap_or_default();
         let volume = config.volume.clamp(0.0, 1.0);
         let window_size = egui::vec2(config.window_width, config.window_height);
+        let maximized = config.maximized;
         let keymap = resolve_keymap(&config.keys);
         let gamepad = Gamepad::new(&config.pad);
         let hotkey_save = egui::Key::from_name(&config.hotkeys.save_state);
@@ -251,6 +257,7 @@ impl App {
             disc_error: None,
             last_screenshot: None,
             window_size,
+            maximized,
             central_size: egui::Vec2::ZERO,
             resize_to: None,
         }
@@ -725,6 +732,7 @@ impl Drop for App {
         // exit even when nothing was touched.
         cfg.window_width = self.window_size.x.round();
         cfg.window_height = self.window_size.y.round();
+        cfg.maximized = self.maximized;
         if cfg != self.config {
             cfg.save(path);
         }
@@ -889,8 +897,13 @@ impl eframe::App for App {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
 
-        // Fullscreen reports the screen, not the window the user chose.
-        if chrome {
+        // Neither fullscreen nor maximized reports the window the user
+        // chose. `unwrap_or` keeps the last answer rather than assuming
+        // "not maximized" on the frames the backend has yet to report one.
+        self.maximized = ctx
+            .input(|i| i.viewport().maximized)
+            .unwrap_or(self.maximized);
+        if chrome && !self.maximized {
             self.window_size = ctx.screen_rect().size();
         }
         if self.title_dirty {

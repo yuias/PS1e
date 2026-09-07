@@ -241,9 +241,13 @@ pub struct Config {
     pub pane: bool,
     pub page: crate::ui::Page,
     pub pane_width: f32,
-    /// Window size at the last exit, in egui points.
+    /// Window size at the last exit, in egui points. Only sampled while
+    /// the window is neither maximized nor fullscreen, so it is the size
+    /// restoring from `maximized` gives back.
     pub window_width: f32,
     pub window_height: f32,
+    /// The window was maximized at the last exit.
+    pub maximized: bool,
     // Tables must stay last: TOML cannot emit a scalar after a table.
     pub keys: KeyBindings,
     pub pad: PadBindings,
@@ -264,6 +268,7 @@ impl Default for Config {
             pane_width: 560.0,
             window_width: 1100.0,
             window_height: 720.0,
+            maximized: false,
             keys: KeyBindings::default(),
             pad: PadBindings::default(),
             hotkeys: Hotkeys::default(),
@@ -379,6 +384,7 @@ mod tests {
         let back: Config = toml::from_str(&text).expect("deserialize");
         assert_eq!(back.window_width, cfg.window_width);
         assert_eq!(back.window_height, cfg.window_height);
+        assert_eq!(back.maximized, cfg.maximized);
         assert_eq!(back.keys.cross, cfg.keys.cross);
     }
 
