@@ -315,10 +315,13 @@ fn run_headless(
         }
         tracing::info!("lockstep control mode; drive with: psxctl --port {port} help");
         loop {
-            let debugger_owns = debugger.as_ref().is_some_and(|d| d.attached());
             if let Some(dbg) = &mut debugger {
                 dbg.pump(&mut sys, CHUNK);
             }
+            // Resolved after the pump, not before: a client that attaches on
+            // this iteration owns execution from here, or the control port
+            // would let one `run` through underneath it.
+            let debugger_owns = debugger.as_ref().is_some_and(|d| d.attached());
             if !ctl.pump(&mut sys, debugger_owns) {
                 break;
             }
