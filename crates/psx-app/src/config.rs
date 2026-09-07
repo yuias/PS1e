@@ -259,7 +259,9 @@ impl Default for Config {
             cheats: false,
             pane: true,
             page: crate::ui::Page::default(),
-            pane_width: 260.0,
+            // A memory row at the default monospace size, near enough; the
+            // pane clamps this to its own measured minimum anyway.
+            pane_width: 560.0,
             window_width: 1100.0,
             window_height: 720.0,
             keys: KeyBindings::default(),

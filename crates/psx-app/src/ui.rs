@@ -89,6 +89,24 @@ impl Page {
     }
 }
 
+/// Characters in one memory-viewer row: `xxxxxxxx`, two spaces, sixteen
+/// `xx ` pairs, a space and sixteen ASCII columns. Kept beside the row's
+/// format string in [`App::memory_page`], which is the widest thing the
+/// side pane lays out and therefore what sets its minimum width.
+const MEM_ROW_CHARS: f32 = 8.0 + 2.0 + 16.0 * 3.0 + 1.0 + 16.0;
+
+/// Narrowest the side pane may be dragged: a whole memory row, plus the
+/// panel's own margins and whatever the vertical scrollbar takes. Measured
+/// rather than assumed so it tracks the monospace size in use.
+fn pane_min_width(ctx: &egui::Context) -> f32 {
+    let style = ctx.style();
+    let font = egui::TextStyle::Monospace.resolve(&style);
+    let row = ctx.fonts(|f| f.glyph_width(&font, '0')) * MEM_ROW_CHARS;
+    // `SidePanel::min_width` is the outer width, and `Frame::side_top_panel`
+    // spends 8 points on each side before the content starts.
+    row + style.spacing.scroll.allocated_width() + 16.0
+}
+
 /// Display heights the View menu can size the window to, in physical
 /// pixels. Every PS1 mode is presented 4:3, so the height is the whole
 /// choice.
@@ -420,8 +438,9 @@ impl App {
             ui.label("waiting for the worker");
             return;
         }
-        // One row per 16 bytes, wide enough that the pane usually scrolls
-        // sideways; the alternative is a narrower row that reads worse.
+        // One row per 16 bytes. The pane's minimum width is derived from
+        // this row (see `pane_min_width`), so it only scrolls sideways when
+        // the window itself is too narrow to give the pane its minimum.
         egui::ScrollArea::horizontal().show(ui, |ui| {
             for (i, row) in view.bytes.chunks(16).enumerate() {
                 let addr = KSEG0 + view.base + (i * 16) as u32;
@@ -903,10 +922,13 @@ impl eframe::App for App {
         // Declared before the TTY panel so the pane runs full height and
         // the TTY sits beside it, not under it.
         if chrome && self.show_pane {
+            // `width_range` last: it clamps the default into the range,
+            // whereas `default_width` after `min_width` would widen the
+            // range downwards to admit a stale narrow width from the config.
             let pane = egui::SidePanel::right("pane")
                 .resizable(true)
-                .min_width(220.0)
                 .default_width(self.pane_width)
+                .width_range(pane_min_width(ctx)..=f32::INFINITY)
                 .show(ctx, |ui| {
                     // Registered before anything else so every widget sits
                     // on top of it: egui gives a click to the last widget
@@ -1057,5 +1079,30 @@ impl eframe::App for App {
                 self.show_vram = open;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `pane_min_width` derives its answer from [`MEM_ROW_CHARS`]; this is
+    /// the row that constant is counting, laid out for real.
+    #[test]
+    fn the_pane_minimum_fits_a_whole_memory_row() {
+        let ctx = egui::Context::default();
+        // Fonts only exist once a pass has begun.
+        let _ = ctx.run(Default::default(), |_| {});
+        let font = egui::TextStyle::Monospace.resolve(&ctx.style());
+        let row = format!("{:08x}  {} {}", 0u32, "00 ".repeat(16), ".".repeat(16));
+        let width = ctx.fonts(|f| f.layout_no_wrap(row, font, egui::Color32::WHITE).size().x);
+        let min = pane_min_width(&ctx);
+        assert!(
+            min >= width,
+            "pane minimum {min} is narrower than a row at {width}"
+        );
+        // Not required for correctness -- the pane clamps -- but a default
+        // below the minimum means the config no longer says what it does.
+        assert!(Config::default().pane_width >= min);
     }
 }
