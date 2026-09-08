@@ -97,10 +97,10 @@ const MEM_ROW_CHARS: f32 = 8.0 + 2.0 + 16.0 * 3.0 + 1.0 + 16.0;
 /// panel's own margins and whatever the vertical scrollbar takes. Measured
 /// rather than assumed so it tracks the monospace size in use.
 fn pane_min_width(ctx: &egui::Context) -> f32 {
-    let style = ctx.style();
+    let style = ctx.style_of(ctx.theme());
     let font = egui::TextStyle::Monospace.resolve(&style);
-    let row = ctx.fonts(|f| f.glyph_width(&font, '0')) * MEM_ROW_CHARS;
-    // `SidePanel::min_width` is the outer width, and `Frame::side_top_panel`
+    let row = ctx.fonts_mut(|f| f.glyph_width(&font, '0')) * MEM_ROW_CHARS;
+    // `Panel::min_size` is the outer width, and `Frame::side_top_panel`
     // spends 8 points on each side before the content starts.
     row + style.spacing.scroll.allocated_width() + 16.0
 }
@@ -602,8 +602,8 @@ impl App {
     }
 
     /// Menu bar: every command the shell offers, grouped by what it acts on.
-    fn menu_bar(&mut self, ctx: &egui::Context, running: bool, debugger_active: bool) {
-        egui::TopBottomPanel::top("menu").show(ctx, |ui| {
+    fn menu_bar(&mut self, ui: &mut egui::Ui, running: bool, debugger_active: bool) {
+        egui::Panel::top("menu").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("Emulation", |ui| {
                     // The debugger owns run control while attached.
@@ -659,7 +659,7 @@ impl App {
                 ui.menu_button("View", |ui| {
                     if ui.button("Fullscreen\tF11").clicked() {
                         self.fullscreen = true;
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
                         ui.close();
                     }
                     ui.separator();
@@ -694,8 +694,8 @@ impl App {
 
     /// Status bar: what the emulator is doing right now, plus the last
     /// one-shot result worth reporting.
-    fn status_bar(&self, ctx: &egui::Context, status: &Status) {
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+    fn status_bar(&self, ui: &mut egui::Ui, status: &Status) {
+        egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal(|ui| {
                 let state = match status.debugger {
                     DebuggerState::Halted => "debugger: halted",
@@ -850,12 +850,17 @@ fn vram_image(vram: &[u16], as_24bit: bool) -> egui::ColorImage {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Panels nest inside the root `Ui` now, but most of this method still
+        // talks to the context; keep one clone rather than re-borrowing `ui`
+        // between the panel calls that need it mutably.
+        let ctx = ui.ctx().clone();
+        let ctx = &ctx;
         // A focused text field in the pane would otherwise type into the
         // pad as well. Only the pad is gated: the function-key shortcuts
         // below stay live, and Esc needs no handling because egui drops
         // focus in its own begin_pass before this runs.
-        let typing = ctx.wants_keyboard_input();
+        let typing = ctx.egui_wants_keyboard_input();
         let buttons = ctx.input(|i| {
             self.keymap
                 .iter()
@@ -955,28 +960,28 @@ impl eframe::App for App {
         {
             let display =
                 egui::vec2(height as f32 * 4.0 / 3.0, height as f32) / ctx.pixels_per_point();
-            let window_chrome = ctx.screen_rect().size() - self.central_size;
+            let window_chrome = ctx.viewport_rect().size() - self.central_size;
             // A maximized window ignores InnerSize.
             ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(window_chrome + display));
         }
 
         if chrome {
-            self.menu_bar(ctx, status.running, debugger_active);
-            self.status_bar(ctx, &status);
+            self.menu_bar(ui, status.running, debugger_active);
+            self.status_bar(ui, &status);
         }
 
         // Declared before the TTY panel so the pane runs full height and
         // the TTY sits beside it, not under it.
         if chrome && self.show_pane {
-            // `width_range` last: it clamps the default into the range,
-            // whereas `default_width` after `min_width` would widen the
+            // `size_range` last: it clamps the default into the range,
+            // whereas `default_size` after `min_size` would widen the
             // range downwards to admit a stale narrow width from the config.
-            let pane = egui::SidePanel::right("pane")
+            let pane = egui::Panel::right("pane")
                 .resizable(true)
-                .default_width(self.pane_width)
-                .width_range(pane_min_width(ctx)..=f32::INFINITY)
-                .show(ctx, |ui| {
+                .default_size(self.pane_width)
+                .size_range(pane_min_width(ctx)..=f32::INFINITY)
+                .show(ui, |ui| {
                     // Registered before anything else so every widget sits
                     // on top of it: egui gives a click to the last widget
                     // added at that spot, so a hit here is a click on empty
@@ -1005,10 +1010,10 @@ impl eframe::App for App {
         }
 
         if chrome && self.show_tty {
-            egui::TopBottomPanel::bottom("tty")
+            egui::Panel::bottom("tty")
                 .resizable(true)
-                .default_height(160.0)
-                .show(ctx, |ui| {
+                .default_size(160.0)
+                .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.heading("TTY");
                         if ui.button("Clear").clicked() {
@@ -1034,7 +1039,7 @@ impl eframe::App for App {
         } else {
             egui::CentralPanel::default()
         };
-        central.show(ctx, |ui| {
+        central.show(ui, |ui| {
             self.central_size = ui.max_rect().size();
             let enabled = {
                 let frame = self.emu.shared.frame.lock().unwrap();
@@ -1125,10 +1130,13 @@ mod tests {
     fn the_pane_minimum_fits_a_whole_memory_row() {
         let ctx = egui::Context::default();
         // Fonts only exist once a pass has begun.
-        let _ = ctx.run(Default::default(), |_| {});
-        let font = egui::TextStyle::Monospace.resolve(&ctx.style());
+        let mut out = ctx.run_ui(Default::default(), |_| {});
+        // Headless: there is no renderer to consume the font atlas upload,
+        // and epaint panics on a delta that is dropped unapplied.
+        out.textures_delta.clear();
+        let font = egui::TextStyle::Monospace.resolve(&ctx.style_of(ctx.theme()));
         let row = format!("{:08x}  {} {}", 0u32, "00 ".repeat(16), ".".repeat(16));
-        let width = ctx.fonts(|f| f.layout_no_wrap(row, font, egui::Color32::WHITE).size().x);
+        let width = ctx.fonts_mut(|f| f.layout_no_wrap(row, font, egui::Color32::WHITE).size().x);
         let min = pane_min_width(&ctx);
         assert!(
             min >= width,

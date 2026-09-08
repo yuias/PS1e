@@ -18,8 +18,11 @@ tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # default features off: drops the glow (OpenGL) renderer and accesskit,
 # and lets us pick wgpu backends explicitly below.
-eframe = { version = "0.32", default-features = false, features = [
-    "wgpu",
+# "wgpu_no_default_features" rather than "wgpu": the latter also enables
+# egui-wgpu/default, which pulls wgpu/default -- every backend on every
+# platform -- and cargo's additive features leave no way to subtract it.
+eframe = { version = "0.36", default-features = false, features = [
+    "wgpu_no_default_features",
     "default_fonts",
     "wayland", # Linux targets only; no cost on Windows
     "x11",     # Linux targets only; no cost on Windows
@@ -33,10 +36,10 @@ rfd = "0.17.2"
 # One native wgpu backend per OS keeps naga's shader translators to a single
 # target language. Excludes gles/webgpu everywhere.
 [target.'cfg(windows)'.dependencies]
-wgpu = { version = "25", default-features = false, features = ["dx12", "wgsl"] }
+wgpu = { version = "30", default-features = false, features = ["dx12", "std", "wgsl"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-wgpu = { version = "25", default-features = false, features = ["vulkan", "wgsl"] }
+wgpu = { version = "30", default-features = false, features = ["vulkan", "std", "wgsl"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-wgpu = { version = "25", default-features = false, features = ["metal", "wgsl"] }
+wgpu = { version = "30", default-features = false, features = ["metal", "std", "wgsl"] }

@@ -270,7 +270,7 @@ impl Default for Config {
             pane: true,
             // A memory row at the default monospace size, near enough; the
             // pane clamps this to its own measured minimum anyway.
-            pane_width: 560.0,
+            pane_width: 610.0,
             window_width: 1100.0,
             window_height: 720.0,
             maximized: false,
