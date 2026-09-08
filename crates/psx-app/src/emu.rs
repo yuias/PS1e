@@ -111,7 +111,7 @@ pub struct FrameSnapshot {
     pub count: u64,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NoticeLevel {
     Info,
     Error,
@@ -552,5 +552,116 @@ impl Worker {
                 tracing::info!("memory card saved");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("ps1e-emu-test-{}-{tag}", std::process::id()))
+    }
+
+    /// A worker with no audio device and no debugger, driven by calling its
+    /// methods directly rather than by `run()`.
+    fn worker(cfg: WorkerConfig) -> (Worker, Arc<Shared>, mpsc::Sender<Command>) {
+        let shared = Arc::new(Shared::default());
+        let (tx, rx) = mpsc::channel();
+        let sys = PsxSystem::new(vec![0; 512 * 1024]).expect("system");
+        let w = Worker::new(sys, cfg, shared.clone(), rx, Box::new(|| {}));
+        (w, shared, tx)
+    }
+
+    fn config(tag: &str) -> WorkerConfig {
+        WorkerConfig {
+            memcard_path: tmp(&format!("{tag}.mcr")),
+            state_path: tmp(&format!("{tag}.sst")),
+            debugger: None,
+            wait_debugger: false,
+            volume: 1.0,
+        }
+    }
+
+    fn notice(shared: &Shared) -> Notice {
+        shared.notice.lock().unwrap().clone().expect("a notice")
+    }
+
+    /// The wall-clock pacer must not bank an unbounded backlog: a long stall
+    /// is worth at most three slices of catch-up, or resuming a stalled
+    /// window would fast-forward the machine by the whole stall.
+    #[test]
+    fn the_wall_clock_pacer_caps_its_backlog_at_three_slices() {
+        let (mut w, _, _) = worker(config("pacer"));
+        assert!(w.audio.is_none(), "the test worker has no audio device");
+        w.clock = Instant::now() - Duration::from_secs(10);
+
+        let granted: Vec<u64> = (0..4).map(|_| w.slice_budget()).collect();
+        assert_eq!(granted, [SLICE, SLICE, SLICE, 0]);
+    }
+
+    #[test]
+    fn quit_stops_the_worker() {
+        let (mut w, _, tx) = worker(config("quit"));
+        tx.send(Command::SetRunning(false)).unwrap();
+        assert!(w.handle_commands());
+        tx.send(Command::Quit).unwrap();
+        assert!(!w.handle_commands());
+    }
+
+    /// Run control belongs to the debugger while it owns execution, so the
+    /// commands that would take it back are dropped rather than queued.
+    #[test]
+    fn run_control_is_dropped_while_the_debugger_owns_execution() {
+        let mut cfg = config("gated");
+        cfg.debugger = Some(psx_debug::DebugServer::bind(0).expect("bind"));
+        cfg.wait_debugger = true;
+        let (mut w, _, tx) = worker(cfg);
+        assert!(w.debugger_active());
+
+        w.running = false;
+        tx.send(Command::SetRunning(true)).unwrap();
+        assert!(w.handle_commands());
+        assert!(
+            !w.running,
+            "SetRunning must not reach a debugger-owned worker"
+        );
+    }
+
+    #[test]
+    fn a_state_round_trip_reports_through_the_notice_slot() {
+        let cfg = config("roundtrip");
+        let path = cfg.state_path.clone();
+        let _ = std::fs::remove_file(&path);
+        let (mut w, shared, tx) = worker(cfg);
+
+        w.sys.run_cycles(10_000);
+        let saved_at = w.sys.cycles();
+        tx.send(Command::SaveState).unwrap();
+        assert!(w.handle_commands());
+        assert_eq!(notice(&shared).level, NoticeLevel::Info);
+
+        w.sys.run_cycles(10_000);
+        assert_ne!(w.sys.cycles(), saved_at);
+        tx.send(Command::LoadState).unwrap();
+        assert!(w.handle_commands());
+        assert_eq!(w.sys.cycles(), saved_at);
+        assert_eq!(notice(&shared).level, NoticeLevel::Info);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The failure that used to reach `tracing` and nothing else.
+    #[test]
+    fn a_failed_state_save_reaches_the_notice_slot() {
+        let mut cfg = config("unwritable");
+        cfg.state_path = tmp("unwritable-dir").join("nested").join("state.sst");
+        let (mut w, shared, tx) = worker(cfg);
+
+        tx.send(Command::SaveState).unwrap();
+        assert!(w.handle_commands());
+        let n = notice(&shared);
+        assert_eq!(n.level, NoticeLevel::Error);
+        assert!(n.text.contains("state save failed"), "{}", n.text);
     }
 }
