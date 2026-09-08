@@ -218,6 +218,101 @@ impl Gpu {
         }
     }
 
+    /// GP1(00): return every register to its power-on value.
+    ///
+    /// Written as an exhaustive destructure of a fresh [`Gpu`] rather than a
+    /// list of fields to carry across `*self = Gpu::new()`: a field added to
+    /// the struct then fails to compile here until it has been classified as
+    /// a register or as state that outlives a reset, instead of silently
+    /// being wiped.
+    fn reset_registers(&mut self) {
+        let Gpu {
+            // Kept. VRAM survives a reset on hardware, the frame counter and
+            // the scanout phase are the vblank edge's bookkeeping, and
+            // `log_commands` belongs to the frontend, not the machine.
+            vram: _,
+            frame_count: _,
+            frame_origin: _,
+            log_commands: _,
+
+            fifo,
+            words_needed,
+            mode,
+            in_polyline,
+            poly_cmd,
+            poly_last_color,
+            poly_last_vertex,
+            tex_page_x,
+            tex_page_y,
+            semi_mode,
+            tex_depth,
+            dither,
+            draw_to_display,
+            tex_disable,
+            tex_win_mask,
+            tex_win_off,
+            rect_tex_flip,
+            draw_min,
+            draw_max,
+            draw_offset,
+            force_mask,
+            check_mask,
+            display_disabled,
+            display_vram_start,
+            display_h_range,
+            display_v_range,
+            hres,
+            vres,
+            pal_mode,
+            color_24bit,
+            interlaced,
+            dma_direction,
+            irq_pending,
+            odd_frame,
+            read_queue,
+            // A reset disables the display, so dropping the last presented
+            // frame with it costs nothing the game can observe.
+            frame,
+        } = Gpu::new();
+
+        self.fifo = fifo;
+        self.words_needed = words_needed;
+        self.mode = mode;
+        self.in_polyline = in_polyline;
+        self.poly_cmd = poly_cmd;
+        self.poly_last_color = poly_last_color;
+        self.poly_last_vertex = poly_last_vertex;
+        self.tex_page_x = tex_page_x;
+        self.tex_page_y = tex_page_y;
+        self.semi_mode = semi_mode;
+        self.tex_depth = tex_depth;
+        self.dither = dither;
+        self.draw_to_display = draw_to_display;
+        self.tex_disable = tex_disable;
+        self.tex_win_mask = tex_win_mask;
+        self.tex_win_off = tex_win_off;
+        self.rect_tex_flip = rect_tex_flip;
+        self.draw_min = draw_min;
+        self.draw_max = draw_max;
+        self.draw_offset = draw_offset;
+        self.force_mask = force_mask;
+        self.check_mask = check_mask;
+        self.display_disabled = display_disabled;
+        self.display_vram_start = display_vram_start;
+        self.display_h_range = display_h_range;
+        self.display_v_range = display_v_range;
+        self.hres = hres;
+        self.vres = vres;
+        self.pal_mode = pal_mode;
+        self.color_24bit = color_24bit;
+        self.interlaced = interlaced;
+        self.dma_direction = dma_direction;
+        self.irq_pending = irq_pending;
+        self.odd_frame = odd_frame;
+        self.read_queue = read_queue;
+        self.frame = frame;
+    }
+
     // --- Frontend accessors -------------------------------------------
 
     pub fn display_enabled(&self) -> bool {
@@ -749,18 +844,7 @@ impl Gpu {
                    "[f{}] GP1({op:02x}) {name} {:06x}", self.frame_count, word & 0xff_ffff);
         }
         match op {
-            0x00 => {
-                // Full state reset; VRAM contents, the command-log switch,
-                // the frame counter and the scanout phase survive a GP1 reset
-                let vram = std::mem::take(&mut self.vram);
-                let (log, frames, origin) =
-                    (self.log_commands, self.frame_count, self.frame_origin);
-                *self = Gpu::new();
-                self.vram = vram;
-                self.log_commands = log;
-                self.frame_count = frames;
-                self.frame_origin = origin;
-            }
+            0x00 => self.reset_registers(),
             0x01 => {
                 self.fifo.clear();
                 self.in_polyline = false;
