@@ -475,17 +475,21 @@ impl App {
         // One row per 16 bytes. The pane's minimum width is derived from
         // this row (see `pane_min_width`), so it only scrolls sideways when
         // the window itself is too narrow to give the pane its minimum.
-        egui::ScrollArea::horizontal().show(ui, |ui| {
-            for (i, row) in view.bytes.chunks(16).enumerate() {
-                let addr = KSEG0 + view.base + (i * 16) as u32;
-                let hex: String = row.iter().map(|b| format!("{b:02x} ")).collect();
-                let ascii: String = row
-                    .iter()
-                    .map(|&b| if b.is_ascii_graphic() { b as char } else { '.' })
-                    .collect();
-                ui.monospace(format!("{addr:08x}  {hex} {ascii}"));
-            }
-        });
+        // Both scroll areas on this page need a salt: they share a parent
+        // `Ui`, so the default id collides and egui drops one of them.
+        egui::ScrollArea::horizontal()
+            .id_salt("mem-hex")
+            .show(ui, |ui| {
+                for (i, row) in view.bytes.chunks(16).enumerate() {
+                    let addr = KSEG0 + view.base + (i * 16) as u32;
+                    let hex: String = row.iter().map(|b| format!("{b:02x} ")).collect();
+                    let ascii: String = row
+                        .iter()
+                        .map(|&b| if b.is_ascii_graphic() { b as char } else { '.' })
+                        .collect();
+                    ui.monospace(format!("{addr:08x}  {hex} {ascii}"));
+                }
+            });
         ui.separator();
         self.scanner(ui);
     }
@@ -562,6 +566,7 @@ impl App {
             ui.label(format!("{} hits", outcome.count));
         }
         egui::ScrollArea::vertical()
+            .id_salt("scan-hits")
             .max_height(240.0)
             .show(ui, |ui| {
                 for (addr, value) in &outcome.hits {
