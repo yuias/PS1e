@@ -203,14 +203,20 @@ impl Drop for Emu {
     }
 }
 
-pub fn spawn(sys: PsxSystem, cfg: WorkerConfig, ctx: eframe::egui::Context) -> Emu {
+/// Wakes the UI so it draws what the worker has just published. Boxed
+/// rather than an `egui::Context` so nothing in this module depends on the
+/// windowing layer — the portability claim in the module doc is only true
+/// if the worker cannot name it.
+pub type Repaint = Box<dyn Fn() + Send>;
+
+pub fn spawn(sys: PsxSystem, cfg: WorkerConfig, repaint: Repaint) -> Emu {
     let shared = Arc::new(Shared::default());
     shared.volume.store(cfg.volume.to_bits(), Ordering::Relaxed);
     let (tx, rx) = mpsc::channel();
     let sh = shared.clone();
     let join = std::thread::Builder::new()
         .name("emu".into())
-        .spawn(move || Worker::new(sys, cfg, sh, rx, ctx).run())
+        .spawn(move || Worker::new(sys, cfg, sh, rx, repaint).run())
         .expect("failed to spawn emulator thread");
     Emu {
         shared,
@@ -224,7 +230,7 @@ struct Worker {
     cfg: WorkerConfig,
     shared: Arc<Shared>,
     rx: mpsc::Receiver<Command>,
-    ctx: eframe::egui::Context,
+    repaint: Repaint,
     /// Created on this thread: cpal streams are not Send everywhere.
     audio: Option<Audio>,
     running: bool,
@@ -247,7 +253,7 @@ impl Worker {
         cfg: WorkerConfig,
         shared: Arc<Shared>,
         rx: mpsc::Receiver<Command>,
-        ctx: eframe::egui::Context,
+        repaint: Repaint,
     ) -> Self {
         let autostart = !cfg.wait_debugger;
         Self {
@@ -255,7 +261,7 @@ impl Worker {
             cfg,
             shared,
             rx,
-            ctx,
+            repaint,
             audio: None,
             // A configured BIOS is enough to boot, so start the machine
             // instead of opening every session on a paused black screen.
@@ -291,7 +297,7 @@ impl Worker {
     /// thread, so unlike the UI's own notices this one needs the repaint.
     fn notify(&self, level: NoticeLevel, text: impl Into<String>) {
         self.shared.notify(level, text);
-        self.ctx.request_repaint();
+        (self.repaint)();
     }
 
     fn run(mut self) {
@@ -417,7 +423,7 @@ impl Worker {
                         crate::scan::Scan::pass(self.scan.take(), req, self.sys.ram());
                     self.scan = Some(scan);
                     *self.shared.scan.lock().unwrap() = Some(outcome);
-                    self.ctx.request_repaint();
+                    (self.repaint)();
                 }
                 Command::Quit => return false,
             }
@@ -506,7 +512,7 @@ impl Worker {
                     .vram_count
                     .store(gpu.frame_count, Ordering::Relaxed);
             }
-            self.ctx.request_repaint();
+            (self.repaint)();
         }
 
         {

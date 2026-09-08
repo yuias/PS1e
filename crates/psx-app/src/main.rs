@@ -239,7 +239,8 @@ fn main() -> eframe::Result {
                 wait_debugger: args.wait_debugger,
                 volume: cfg.volume,
             };
-            let emu = emu::spawn(sys, worker_cfg, cc.egui_ctx.clone());
+            let ctx = cc.egui_ctx.clone();
+            let emu = emu::spawn(sys, worker_cfg, Box::new(move || ctx.request_repaint()));
             Ok(Box::new(ui::App::new(
                 emu,
                 cfg,
