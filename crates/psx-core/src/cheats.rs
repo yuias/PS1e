@@ -320,6 +320,44 @@ pub struct Cheat {
 }
 
 impl Cheat {
+    /// A cheat that holds `value` at `addr` every frame: what a memory
+    /// scanner hit becomes. `addr` is a bus address in any of its forms;
+    /// only the low 24 bits fit a code line, which is all RAM needs.
+    ///
+    /// `width` is 1, 2 or 4 bytes. There is no 32-bit write type on PS1,
+    /// so a word becomes two 16-bit writes, low half first; any other
+    /// width is taken as a word.
+    pub fn constant_write(name: impl Into<String>, addr: u32, value: u32, width: u8) -> Cheat {
+        let addr = addr & 0x00ff_ffff;
+        let codes = match width {
+            1 => vec![Code::Write8 {
+                addr,
+                value: value as u8,
+            }],
+            2 => vec![Code::Write16 {
+                addr,
+                value: value as u16,
+            }],
+            _ => vec![
+                Code::Write16 {
+                    addr,
+                    value: value as u16,
+                },
+                Code::Write16 {
+                    addr: addr.wrapping_add(2),
+                    value: (value >> 16) as u16,
+                },
+            ],
+        };
+        Cheat {
+            name: name.into(),
+            // The press is the intent; the master switch still decides
+            // whether anything runs.
+            enabled: true,
+            codes,
+        }
+    }
+
     /// True when the cheat contains a line this build cannot apply, which
     /// is what the UI greys out or marks.
     pub fn has_unsupported(&self) -> bool {
@@ -777,6 +815,44 @@ C2000100 0004
         let list = CheatList::parse(text);
         assert_eq!(list.cheats[0].codes.len(), 2);
         assert_eq!(list.to_text(), text);
+        assert_eq!(CheatList::parse(&list.to_text()), list);
+    }
+
+    /// A scanner hit names a bare RAM offset, not a KSEG0 address, and
+    /// that has to reach RAM through the same accessors as a code line.
+    #[test]
+    fn a_scanner_hit_becomes_a_cheat_that_holds_the_value() {
+        let mut bus = bus();
+        let list = CheatList {
+            cheats: vec![Cheat::constant_write("Scan", 0x100, 0xDEAD_BEEF, 4)],
+        };
+        list.apply(&mut bus);
+        assert_eq!(bus.peek8(RAM), Some(0xEF));
+        assert_eq!(bus.peek8(RAM + 1), Some(0xBE));
+        assert_eq!(bus.peek8(RAM + 2), Some(0xAD));
+        assert_eq!(bus.peek8(RAM + 3), Some(0xDE));
+    }
+
+    /// The narrower widths use the single write type, and a generated
+    /// cheat is an ordinary one: it survives a trip through the file.
+    #[test]
+    fn a_generated_cheat_uses_one_code_per_narrow_width_and_round_trips() {
+        let list = CheatList {
+            cheats: vec![
+                Cheat::constant_write("Byte", 0x8000_0100, 0xAB, 1),
+                Cheat::constant_write("Half", 0x8000_0102, 0x1234, 2),
+            ],
+        };
+        assert_eq!(
+            list.to_text(),
+            "[*Byte]
+30000100 00AB
+
+[*Half]
+80000102 1234
+
+"
+        );
         assert_eq!(CheatList::parse(&list.to_text()), list);
     }
 

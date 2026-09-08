@@ -10,6 +10,16 @@ and `;` comments, blank lines ignored. A leading `*` on a section name
 means that cheat is enabled, and it is the only record of that — there is
 no per-disc enable map in the config file.
 
+Codes get into that file two ways: by hand, and from the memory scanner
+on the pane's Memory page. A scanner hit has a "+" beside it that appends
+a cheat holding that value at that address — a `30`/`80` line, or a pair
+of `80` lines for a 32-bit hit, since PS1 codes have no 32-bit write. The
+cheat is named after the address and width, so pressing "+" again on the
+same hit updates its value rather than adding a second section. From then
+on it is an ordinary entry in the file, enabled and disabled from the
+Cheats page like any other. The list has no delete: removing one means
+editing the `.cht`.
+
 Nothing applies until cheats are switched on. `cheats` in the config file
 is the master switch and defaults to off, so a `.cht` left beside an
 image does not change how a game runs until it is asked for. In the GUI

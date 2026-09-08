@@ -382,7 +382,8 @@ impl App {
     }
 
     /// Cheats page: one checkbox per cheat in the disc's `.cht`.
-    /// Enable/disable only — the file stays the place codes are written.
+    /// Enable/disable only — codes are written by hand in the file, or
+    /// from a scanner hit on the Memory page.
     fn cheats_page(&mut self, ui: &mut egui::Ui) {
         if ui
             .checkbox(&mut self.cheats_on, "Apply cheats")
@@ -432,7 +433,8 @@ impl App {
     }
 
     /// Re-read the `.cht` and hand the result to the worker. Used after
-    /// editing the file by hand, which is how codes get added at all.
+    /// editing the file by hand, which is one of the two ways codes get
+    /// in — the other is the scanner's "keep this value".
     fn reload_cheats(&mut self) {
         let Some(path) = &self.cheat_file else { return };
         self.cheats = disc::load_cheats(path);
@@ -565,23 +567,71 @@ impl App {
         } else {
             ui.label(format!("{} hits", outcome.count));
         }
+        // The width of the pass, not the radio: the radio can be moved
+        // without rescanning, and the hits are at the width they were
+        // found with.
+        let width = outcome.width;
+        let can_save = self.cheat_file.is_some();
         egui::ScrollArea::vertical()
             .id_salt("scan-hits")
             .max_height(240.0)
             .show(ui, |ui| {
                 for (addr, value) in &outcome.hits {
-                    let digits = 2 * outcome.width as usize;
-                    let row = format!("{:08x}  {value:0digits$x}", KSEG0 + addr);
-                    // Clicking a hit walks the viewer over to it.
-                    if ui
-                        .selectable_label(false, egui::RichText::new(row).monospace())
-                        .clicked()
-                    {
-                        self.mem_addr = format!("{:08x}", KSEG0 + addr);
-                        self.emu.shared.view_base.store(*addr, Ordering::Relaxed);
-                    }
+                    // Every row holds the same two widgets, so they need
+                    // the address to tell their ids apart.
+                    ui.push_id(addr, |ui| {
+                        ui.horizontal(|ui| {
+                            // Leading, not trailing: the scroll bar floats
+                            // over the right edge of the row and would
+                            // swallow the clicks.
+                            if ui
+                                .add_enabled(can_save, egui::Button::new("+").small())
+                                .on_hover_text("keep this value: adds a cheat to the disc's .cht")
+                                .on_disabled_hover_text("no disc, so there is no .cht to write")
+                                .clicked()
+                            {
+                                self.make_cheat(*addr, *value, width);
+                            }
+                            let digits = 2 * width as usize;
+                            let row = format!("{:08x}  {value:0digits$x}", KSEG0 + addr);
+                            // Clicking a hit walks the viewer over to it.
+                            if ui
+                                .selectable_label(false, egui::RichText::new(row).monospace())
+                                .clicked()
+                            {
+                                self.mem_addr = format!("{:08x}", KSEG0 + addr);
+                                self.emu.shared.view_base.store(*addr, Ordering::Relaxed);
+                            }
+                        });
+                    });
                 }
             });
+    }
+
+    /// Turn a scanner hit into a cheat that writes the value back every
+    /// frame. The name is the address and width, and a hit already named
+    /// replaces its codes rather than adding a second section: the list
+    /// has no delete, so pressing again on the same address has to mean
+    /// "now this value".
+    fn make_cheat(&mut self, addr: u32, value: u32, width: u8) {
+        let name = format!("Scan {:08X} ({}-bit)", KSEG0 + addr, width * 8);
+        let cheat = psx_core::cheats::Cheat::constant_write(name.clone(), addr, value, width);
+        match self.cheats.cheats.iter_mut().find(|c| c.name == name) {
+            Some(existing) => *existing = cheat,
+            None => self.cheats.cheats.push(cheat),
+        }
+        self.emu.send(Command::SetCheats(self.cheats.clone()));
+        self.save_cheats();
+        // Saying so matters most when the master switch is off, which is
+        // its default: the cheat is in the file and still does nothing.
+        let note = if self.cheats_on {
+            ""
+        } else {
+            " — 'Apply cheats' is off"
+        };
+        self.emu
+            .shared
+            .notify(NoticeLevel::Info, format!("added '{name}'{note}"));
     }
 
     fn send_scan(&mut self, filter: scan::Filter, restart: bool) {
