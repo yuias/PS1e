@@ -129,10 +129,16 @@ pub struct App {
     pane_width: f32,
     show_tty: bool,
     fullscreen: bool,
-    display_tex: Option<egui::TextureHandle>,
     vram_tex: Option<egui::TextureHandle>,
-    /// Vblank count of the frame currently uploaded to `display_tex`.
+    /// The displayed frame expanded to RGBA8, and its size. Shared with the
+    /// paint callback, which keeps the wgpu texture across frames.
+    display_rgba: std::sync::Arc<Vec<u8>>,
+    display_size: (u32, u32),
+    /// Vblank count behind `display_rgba`; doubles as the callback's upload
+    /// sequence number, so an unchanged frame is not re-uploaded.
     shown_frame: u64,
+    /// How the frame is resampled to the panel, persisted in `Config`.
+    scaler: crate::display::ScaleMode,
     /// Vblank count and colour interpretation behind `vram_tex`, so the
     /// 1 MiB expansion runs on a new copy rather than on every repaint.
     shown_vram: Option<(u64, bool)>,
@@ -231,9 +237,11 @@ impl App {
             pane_width: config.pane_width,
             show_tty: false,
             fullscreen: false,
-            display_tex: None,
             vram_tex: None,
+            display_rgba: std::sync::Arc::default(),
+            display_size: (0, 0),
             shown_frame: 0,
+            scaler: config.scaler,
             shown_vram: None,
             vram_scratch: Vec::new(),
             mem_addr: format!("{:08x}", KSEG0),
@@ -340,6 +348,22 @@ impl App {
     /// Settings page: everything the shell can change while it runs, which
     /// is what used to be spread across the View and Audio menus.
     fn settings_page(&mut self, ui: &mut egui::Ui) {
+        use crate::display::ScaleMode;
+
+        ui.heading("Video");
+        egui::Grid::new("video").num_columns(2).show(ui, |ui| {
+            ui.label("Scaler");
+            egui::ComboBox::from_id_salt("scaler")
+                .selected_text(self.scaler.label())
+                .width(ui.available_width())
+                .show_ui(ui, |ui| {
+                    for mode in ScaleMode::ALL {
+                        ui.selectable_value(&mut self.scaler, mode, mode.label());
+                    }
+                });
+            ui.end_row();
+        });
+        ui.separator();
         ui.heading("Audio");
         ui.add(
             egui::Slider::new(&mut self.volume, 0.0..=1.0)
@@ -738,6 +762,7 @@ impl Drop for App {
         cfg.window_width = self.window_size.x.round();
         cfg.window_height = self.window_size.y.round();
         cfg.maximized = self.maximized;
+        cfg.scaler = self.scaler;
         if cfg != self.config {
             cfg.save(path);
         }
@@ -763,36 +788,34 @@ fn registers_page(ui: &mut egui::Ui, status: &Status) {
     });
 }
 
-/// Convert a frame snapshot (15-bit or packed RGB888 rows) to an egui image.
-fn frame_image(frame: &FrameSnapshot) -> egui::ColorImage {
+/// Expand a frame snapshot (15-bit or packed RGB888 rows) to the opaque
+/// RGBA8 the display shader samples.
+fn frame_rgba(frame: &FrameSnapshot) -> Vec<u8> {
     let (w, h, stride) = (
         frame.width as usize,
         frame.height as usize,
         frame.stride as usize,
     );
     if frame.pixels.len() < stride * h {
-        return egui::ColorImage::default(); // no frame captured yet
+        return Vec::new(); // no frame captured yet
     }
-    let mut pixels = Vec::with_capacity(w * h);
+    let mut rgba = Vec::with_capacity(w * h * 4);
     for y in 0..h {
         let row = &frame.pixels[y * stride..(y + 1) * stride];
         for x in 0..w {
-            pixels.push(if frame.is_24bit {
+            let [r, g, b] = if frame.is_24bit {
                 let byte = x * 3;
                 let read = |b: usize| (row[(byte + b) / 2] >> (((byte + b) & 1) * 8)) as u8;
-                egui::Color32::from_rgb(read(0), read(1), read(2))
+                [read(0), read(1), read(2)]
             } else {
                 let px = row[x];
                 let e = |c: u16| ((c << 3) | (c >> 2)) as u8;
-                egui::Color32::from_rgb(e(px & 0x1f), e((px >> 5) & 0x1f), e((px >> 10) & 0x1f))
-            });
+                [e(px & 0x1f), e((px >> 5) & 0x1f), e((px >> 10) & 0x1f)]
+            };
+            rgba.extend_from_slice(&[r, g, b, 0xff]);
         }
     }
-    egui::ColorImage {
-        size: [w, h],
-        source_size: egui::Vec2::new(w as f32, h as f32),
-        pixels,
-    }
+    rgba
 }
 
 /// Convert a VRAM snapshot to an egui image, either as 15-bit pixels or
@@ -1013,56 +1036,42 @@ impl eframe::App for App {
         };
         central.show(ctx, |ui| {
             self.central_size = ui.max_rect().size();
-            let (enabled, image) = {
+            let enabled = {
                 let frame = self.emu.shared.frame.lock().unwrap();
-                // Convert only when the worker published a new frame
-                let image = if frame.count != self.shown_frame || self.display_tex.is_none() {
+                // Expand only when the worker published a new frame
+                if frame.count != self.shown_frame || self.display_size == (0, 0) {
                     self.shown_frame = frame.count;
-                    Some(frame_image(&frame))
-                } else {
-                    None
-                };
-                (frame.enabled, image)
+                    self.display_rgba = std::sync::Arc::new(frame_rgba(&frame));
+                    self.display_size = (frame.width, frame.height);
+                }
+                frame.enabled
             };
-            let has_frame = image
-                .as_ref()
-                .map(|i| i.size[0] > 0 && i.size[1] > 0)
-                .unwrap_or(self.display_tex.is_some());
-            if !(enabled && has_frame) {
+            let (w, h) = self.display_size;
+            if !(enabled && w > 0 && h > 0) {
                 ui.centered_and_justified(|ui| ui.label("display disabled"));
                 return;
             }
-            let tex = match (&mut self.display_tex, image) {
-                (Some(t), Some(image)) => {
-                    t.set(image, egui::TextureOptions::NEAREST);
-                    t.clone()
-                }
-                (Some(t), None) => t.clone(),
-                (None, Some(image)) => {
-                    // Zero-sized textures are a wgpu validation error; the
-                    // has_frame check above already excluded them
-                    let t = ui
-                        .ctx()
-                        .load_texture("display", image, egui::TextureOptions::NEAREST);
-                    self.display_tex = Some(t.clone());
-                    t
-                }
-                (None, None) => unreachable!(),
-            };
-            // Fit the panel while keeping a 4:3 presentation aspect
+            // Fit the panel while keeping a 4:3 presentation aspect. The
+            // framebuffer's own pixel aspect (e.g. 320x480 interlace,
+            // 512x240) rarely matches it, so the scaler stretches to this
+            // rect rather than letterboxing to the texture aspect.
             let avail = ui.available_size();
             let scale = (avail.x / 4.0).min(avail.y / 3.0);
             let size = egui::Vec2::new(scale * 4.0, scale * 3.0);
-            ui.centered_and_justified(|ui| {
-                // maintain_aspect_ratio(false): the framebuffer's pixel aspect
-                // (e.g. 320x480 interlace, 512x240) rarely matches the 4:3
-                // output; egui would otherwise letterbox to the texture aspect.
-                ui.add(
-                    egui::Image::new(&tex)
-                        .fit_to_exact_size(size)
-                        .maintain_aspect_ratio(false),
-                );
-            });
+            let rect = egui::Rect::from_center_size(ui.available_rect_before_wrap().center(), size);
+            let ppp = ui.ctx().pixels_per_point();
+            ui.painter()
+                .add(eframe::egui_wgpu::Callback::new_paint_callback(
+                    rect,
+                    crate::display::DisplayCallback {
+                        rgba: self.display_rgba.clone(),
+                        width: w,
+                        height: h,
+                        seq: self.shown_frame,
+                        mode: self.scaler,
+                        dst_size: [size.x * ppp, size.y * ppp],
+                    },
+                ));
         });
 
         if panels & emu::PANEL_VRAM != 0 {

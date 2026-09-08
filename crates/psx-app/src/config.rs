@@ -30,6 +30,10 @@ volume = 0.5
 # here. See docs/CHEATS.md.
 cheats = false
 
+# Display scaler: "nearest", "linear", "sharp" (nearest to an integer
+# multiple, then linear) or "lanczos".
+scaler = "sharp"
+
 # Keyboard bindings for the digital pad. Values are egui key names:
 # letters and digits as themselves ("X", "1"), arrows as "Up"/"Down"/
 # "Left"/"Right", plus "Enter", "Backspace", "Space", "F1".."F20" and so
@@ -248,6 +252,8 @@ pub struct Config {
     pub window_height: f32,
     /// The window was maximized at the last exit.
     pub maximized: bool,
+    /// How the frame is resampled to the display panel.
+    pub scaler: crate::display::ScaleMode,
     // Tables must stay last: TOML cannot emit a scalar after a table.
     pub keys: KeyBindings,
     pub pad: PadBindings,
@@ -268,6 +274,7 @@ impl Default for Config {
             window_width: 1100.0,
             window_height: 720.0,
             maximized: false,
+            scaler: crate::display::ScaleMode::default(),
             keys: KeyBindings::default(),
             pad: PadBindings::default(),
             hotkeys: Hotkeys::default(),
@@ -385,6 +392,31 @@ mod tests {
         assert_eq!(back.window_height, cfg.window_height);
         assert_eq!(back.maximized, cfg.maximized);
         assert_eq!(back.keys.cross, cfg.keys.cross);
+    }
+
+    /// The scaler is a scalar too, so the same ordering rule applies; the
+    /// default has to survive a save/load or a fresh install would change
+    /// how the display looks on its second run.
+    #[test]
+    fn scaler_round_trips_ahead_of_the_tables() {
+        let cfg = Config::default();
+        let text = toml::to_string_pretty(&cfg).expect("serialize");
+        let back: Config = toml::from_str(&text).expect("deserialize");
+        assert_eq!(back.scaler, crate::display::ScaleMode::Sharp);
+        assert_eq!(back.keys.cross, cfg.keys.cross);
+    }
+
+    #[test]
+    fn scaler_names_parse_lowercase() {
+        for (name, want) in [
+            ("nearest", crate::display::ScaleMode::Nearest),
+            ("linear", crate::display::ScaleMode::Linear),
+            ("sharp", crate::display::ScaleMode::Sharp),
+            ("lanczos", crate::display::ScaleMode::Lanczos),
+        ] {
+            let cfg: Config = toml::from_str(&format!("scaler = \"{name}\"")).expect("deserialize");
+            assert_eq!(cfg.scaler, want);
+        }
     }
 
     #[test]

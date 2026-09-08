@@ -21,6 +21,7 @@ mod audio;
 mod config;
 mod control;
 mod disc;
+mod display;
 mod emu;
 mod gamepad;
 mod scan;
@@ -239,6 +240,11 @@ fn main() -> eframe::Result {
                 wait_debugger: args.wait_debugger,
                 volume: cfg.volume,
             };
+            let render_state = cc
+                .wgpu_render_state
+                .as_ref()
+                .expect("the wgpu renderer is selected above");
+            display::init(render_state);
             let ctx = cc.egui_ctx.clone();
             let emu = emu::spawn(sys, worker_cfg, Box::new(move || ctx.request_repaint()));
             Ok(Box::new(ui::App::new(
