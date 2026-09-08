@@ -9,7 +9,7 @@ use crate::config::Config;
 use crate::disc;
 use crate::disc::DiscInfo;
 use crate::emu;
-use crate::emu::{Command, DebuggerState, Emu, FrameSnapshot, Status};
+use crate::emu::{Command, DebuggerState, Emu, FrameSnapshot, NoticeLevel, Status};
 use crate::gamepad::Gamepad;
 use crate::scan;
 use eframe::egui;
@@ -170,9 +170,7 @@ pub struct App {
     /// `App::new` has no `Context` yet, which is why this is not immediate.
     title_dirty: bool,
     /// Last failed disc pick, shown until the next one succeeds.
-    disc_error: Option<String>,
     /// Path of the most recent screenshot, shown in the status bar.
-    last_screenshot: Option<String>,
     /// Window size in egui points, sampled on every frame the window is
     /// showing that size for real -- not while maximized or fullscreen, or
     /// the saved size would be the screen and the next run would open a
@@ -255,8 +253,6 @@ impl App {
             gamepad,
             disc,
             title_dirty: true,
-            disc_error: None,
-            last_screenshot: None,
             window_size,
             maximized,
             central_size: egui::Vec2::ZERO,
@@ -277,7 +273,6 @@ impl App {
             .pick_file();
         let disc = picked.and_then(|path| match disc::load_disc(&path) {
             Ok(loaded) => {
-                self.disc_error = None;
                 self.cheat_file = Some(disc::cheat_path(&loaded.info.path));
                 self.cheats = loaded.cheats.clone();
                 self.disc = Some(loaded.info.clone());
@@ -286,7 +281,7 @@ impl App {
             }
             Err(e) => {
                 tracing::error!("{e}");
-                self.disc_error = Some(e);
+                self.emu.shared.notify(NoticeLevel::Error, e);
                 None
             }
         });
@@ -329,9 +324,16 @@ impl App {
         match written {
             Ok(()) => {
                 tracing::info!("screenshot written to {path}");
-                self.last_screenshot = Some(path);
+                self.emu
+                    .shared
+                    .notify(NoticeLevel::Info, format!("saved {path}"));
             }
-            Err(e) => tracing::error!("screenshot failed: {e}"),
+            Err(e) => {
+                tracing::error!("screenshot failed: {e}");
+                self.emu
+                    .shared
+                    .notify(NoticeLevel::Error, format!("screenshot failed: {e}"));
+            }
         }
     }
 
@@ -699,13 +701,16 @@ impl App {
                         String::new()
                     }
                 ));
-                if let Some(path) = &self.last_screenshot {
+                // Cloned out so the worker is not blocked behind a repaint.
+                let notice = self.emu.shared.notice.lock().unwrap().clone();
+                if let Some(notice) = &notice {
                     ui.separator();
-                    ui.monospace(format!("saved {path}"));
-                }
-                if let Some(err) = &self.disc_error {
-                    ui.separator();
-                    ui.colored_label(egui::Color32::LIGHT_RED, err);
+                    match notice.level {
+                        NoticeLevel::Info => ui.monospace(&notice.text),
+                        NoticeLevel::Error => {
+                            ui.colored_label(egui::Color32::LIGHT_RED, &notice.text)
+                        }
+                    };
                 }
             });
         });

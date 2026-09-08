@@ -111,6 +111,21 @@ pub struct FrameSnapshot {
     pub count: u64,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum NoticeLevel {
+    Info,
+    Error,
+}
+
+/// The outcome of something the user asked for that has nowhere else to be
+/// seen. Commands are fire-and-forget, so without this a failed save or a
+/// failed screenshot reaches the log and nothing else.
+#[derive(Clone)]
+pub struct Notice {
+    pub level: NoticeLevel,
+    pub text: String,
+}
+
 /// State published by the worker and inputs fed back by the UI.
 #[derive(Default)]
 pub struct Shared {
@@ -135,10 +150,26 @@ pub struct Shared {
     /// hidden panel would show costs nothing to leave unpublished, so the
     /// worker skips the copy rather than the UI skipping the draw.
     pub panels: AtomicU8,
+    /// Latest notice for the status bar. A slot rather than a queue: the
+    /// bar has room for one line, and the newest outcome is the one the
+    /// user is waiting on. Written by both the worker and the UI.
+    pub notice: Mutex<Option<Notice>>,
     /// Digital pad bits (UI -> worker).
     pub buttons: AtomicU16,
     /// Master volume as f32 bits (UI -> worker).
     pub volume: AtomicU32,
+}
+
+impl Shared {
+    /// Post a notice for the status bar, replacing any earlier one. The
+    /// worker must follow this with a repaint request; the UI is already
+    /// inside a frame when it calls this.
+    pub fn notify(&self, level: NoticeLevel, text: impl Into<String>) {
+        *self.notice.lock().unwrap() = Some(Notice {
+            level,
+            text: text.into(),
+        });
+    }
 }
 
 /// Everything the worker owns besides the system itself.
@@ -256,6 +287,13 @@ impl Worker {
         self.debugger_state().owns_execution()
     }
 
+    /// Post a notice and wake the UI to draw it. The worker is off the UI
+    /// thread, so unlike the UI's own notices this one needs the repaint.
+    fn notify(&self, level: NoticeLevel, text: impl Into<String>) {
+        self.shared.notify(level, text);
+        self.ctx.request_repaint();
+    }
+
     fn run(mut self) {
         self.audio = Audio::new();
         loop {
@@ -326,33 +364,49 @@ impl Worker {
                 | Command::Reset
                 | Command::OpenShell
                 | Command::CloseShell(_) => {}
-                Command::SaveState => match self.sys.save_state() {
-                    Ok(data) => match std::fs::write(&self.cfg.state_path, &data) {
+                Command::SaveState => {
+                    let path = self.cfg.state_path.clone();
+                    match self
+                        .sys
+                        .save_state()
+                        .map_err(|e| e.to_string())
+                        .and_then(|data| std::fs::write(&path, &data).map_err(|e| e.to_string()))
+                    {
                         Ok(()) => {
-                            tracing::info!("state saved to {}", self.cfg.state_path.display())
+                            tracing::info!("state saved to {}", path.display());
+                            self.notify(
+                                NoticeLevel::Info,
+                                format!("state saved to {}", path.display()),
+                            );
                         }
-                        Err(e) => tracing::error!("state save failed: {e}"),
-                    },
-                    Err(e) => tracing::error!("state save failed: {e}"),
-                },
+                        Err(e) => {
+                            tracing::error!("state save failed: {e}");
+                            self.notify(NoticeLevel::Error, format!("state save failed: {e}"));
+                        }
+                    }
+                }
                 // Loading mutates execution state, so it stays with the
                 // debugger while one is attached (same rule as run control)
                 Command::LoadState => {
                     if debugger_active {
                         continue;
                     }
-                    match std::fs::read(&self.cfg.state_path) {
-                        Ok(data) => match self.sys.load_state(&data) {
-                            Ok(()) => tracing::info!(
-                                "state loaded from {}",
-                                self.cfg.state_path.display()
-                            ),
-                            Err(e) => tracing::error!("state load failed: {e}"),
-                        },
-                        Err(e) => tracing::error!(
-                            "state load failed: {e} ({})",
-                            self.cfg.state_path.display()
-                        ),
+                    let path = self.cfg.state_path.clone();
+                    match std::fs::read(&path)
+                        .map_err(|e| format!("{e} ({})", path.display()))
+                        .and_then(|data| self.sys.load_state(&data))
+                    {
+                        Ok(()) => {
+                            tracing::info!("state loaded from {}", path.display());
+                            self.notify(
+                                NoticeLevel::Info,
+                                format!("state loaded from {}", path.display()),
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!("state load failed: {e}");
+                            self.notify(NoticeLevel::Error, format!("state load failed: {e}"));
+                        }
                     }
                 }
                 Command::SetGpuLog(v) => self.sys.set_gpu_log(v),
@@ -487,6 +541,7 @@ impl Worker {
         if self.sys.memcard_mut().take_dirty() {
             if let Err(e) = std::fs::write(&self.cfg.memcard_path, &self.sys.memcard().data) {
                 tracing::error!("failed to save memory card: {e}");
+                self.notify(NoticeLevel::Error, format!("memory card not saved: {e}"));
             } else {
                 tracing::info!("memory card saved");
             }
