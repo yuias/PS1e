@@ -842,10 +842,7 @@ impl eframe::App for App {
             .store(self.volume.to_bits(), Ordering::Relaxed);
 
         let status = self.emu.shared.status.lock().unwrap().clone();
-        let debugger_active = matches!(
-            status.debugger,
-            DebuggerState::Running | DebuggerState::Halted
-        ) || status.debugger == DebuggerState::Waiting;
+        let debugger_active = status.debugger.owns_execution();
 
         // Save-state hotkeys; gating (debugger owns loads) is in the worker
         let (save, load) = ctx.input(|i| {

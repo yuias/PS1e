@@ -73,6 +73,15 @@ pub enum DebuggerState {
     Halted,
 }
 
+impl DebuggerState {
+    /// The debugger holds run control, so the UI must not offer it and the
+    /// worker must drop the commands that would take it. Both sides ask
+    /// this rather than each spelling the rule out.
+    pub fn owns_execution(self) -> bool {
+        matches!(self, Self::Waiting | Self::Running | Self::Halted)
+    }
+}
+
 /// Cheap per-slice snapshot for the UI panels.
 #[derive(Clone, Default)]
 pub struct Status {
@@ -231,9 +240,20 @@ impl Worker {
         }
     }
 
+    /// What the UI is told about the debugger, and the same value the
+    /// worker gates commands on — one rule, not two that can drift.
+    fn debugger_state(&self) -> DebuggerState {
+        match &self.cfg.debugger {
+            None => DebuggerState::None,
+            Some(d) if d.attached() && d.halted() => DebuggerState::Halted,
+            Some(d) if d.attached() => DebuggerState::Running,
+            Some(_) if self.cfg.wait_debugger && !self.debugger_seen => DebuggerState::Waiting,
+            Some(_) => DebuggerState::Listening,
+        }
+    }
+
     fn debugger_active(&self) -> bool {
-        self.cfg.debugger.as_ref().is_some_and(|d| d.attached())
-            || (self.cfg.wait_debugger && !self.debugger_seen)
+        self.debugger_state().owns_execution()
     }
 
     fn run(mut self) {
@@ -445,13 +465,7 @@ impl Worker {
                 st.lo = self.sys.cpu.lo;
             }
             st.running = self.running;
-            st.debugger = match &self.cfg.debugger {
-                None => DebuggerState::None,
-                Some(d) if d.attached() && d.halted() => DebuggerState::Halted,
-                Some(d) if d.attached() => DebuggerState::Running,
-                Some(_) if self.cfg.wait_debugger && !self.debugger_seen => DebuggerState::Waiting,
-                Some(_) => DebuggerState::Listening,
-            };
+            st.debugger = self.debugger_state();
             if let Some(audio) = &self.audio {
                 st.audio_buffered = audio.buffered_frames();
                 st.audio_underruns = audio.underruns();

@@ -197,6 +197,12 @@ fn main() -> eframe::Result {
     let debugger = args
         .debug_port
         .map(|port| psx_debug::DebugServer::bind(port).expect("failed to bind debug port"));
+    if args.wait_debugger && args.debug_port.is_none() {
+        // Otherwise the machine holds at the reset vector for a client that
+        // has nothing to connect to.
+        eprintln!("--wait-debugger requires --debug-port");
+        std::process::exit(2);
+    }
     if args.control_port.is_some() && !args.headless {
         eprintln!("--control-port requires --headless (lockstep control needs no window)");
         std::process::exit(2);
