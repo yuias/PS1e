@@ -59,9 +59,14 @@ keyboard: face buttons to Cross/Circle/Square/Triangle, shoulders and
 triggers to L1/R1/L2/R2, D-pad and Start/Select as labelled. Analog
 sticks do nothing yet — the emulated controller is a digital pad.
 
-The pad and the save/load hotkeys are rebindable; see the `[keys]`, `[pad]`
-and `[hotkeys]` tables under [Configuration](#configuration). Fullscreen
-and screenshot are fixed.
+Settings > Input > Keyboard opens a controller diagram with a box against
+every button: click one and press a key to bind it. A key bound to two
+buttons is outlined in red, which is allowed but rarely meant. OK writes
+the bindings back and they persist with the rest of the settings.
+
+The pad and the save/load hotkeys are also rebindable by hand; see the
+`[keys]`, `[pad]` and `[hotkeys]` tables under
+[Configuration](#configuration). Fullscreen and screenshot are fixed.
 
 A screenshot writes the displayed frame as `screenshot_<epoch>.bmp` in the
 working directory, the same encoding as headless `--dump-frame`.

@@ -11,6 +11,7 @@ use crate::disc::DiscInfo;
 use crate::emu;
 use crate::emu::{Command, DebuggerState, Emu, FrameSnapshot, NoticeLevel, Status};
 use crate::gamepad::Gamepad;
+use crate::keymap::{self, BUTTON_NAMES};
 use crate::scan;
 use eframe::egui;
 use std::path::PathBuf;
@@ -41,13 +42,6 @@ const REG_NAMES: [&str; 32] = [
     "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7", //
     "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", //
     "t8", "t9", "k0", "k1", "gp", "sp", "fp", "ra",
-];
-
-/// Pad button names, index-aligned with [`config::KeyBindings::pairs`], for
-/// listing the configured bindings in the Help menu.
-const BUTTON_NAMES: [&str; 14] = [
-    "up", "down", "left", "right", "cross", "circle", "square", "triangle", "L1", "R1", "L2", "R2",
-    "start", "select",
 ];
 
 /// One tab of the side pane. Adding a page means an arm in each of
@@ -164,8 +158,13 @@ pub struct App {
     volume: f32,
     config: Config,
     config_path: Option<PathBuf>,
-    /// Key -> pad bit, resolved from the config once at startup.
+    /// Key -> pad bit, resolved from `keys` whenever it changes.
     keymap: Vec<(egui::Key, u16)>,
+    /// The live keyboard bindings. Kept out of `config` so `Drop` can see
+    /// that they changed, the way every other UI-owned setting works.
+    keys: config::KeyBindings,
+    /// The binding dialog, while it is open.
+    binder: Option<keymap::Binder>,
     hotkey_save: Option<egui::Key>,
     hotkey_load: Option<egui::Key>,
     /// Absent when no gamepad backend is available.
@@ -213,7 +212,8 @@ impl App {
         let volume = config.volume.clamp(0.0, 1.0);
         let window_size = egui::vec2(config.window_width, config.window_height);
         let maximized = config.maximized;
-        let keymap = resolve_keymap(&config.keys);
+        let keys = config.keys.clone();
+        let keymap = resolve_keymap(&keys);
         let gamepad = Gamepad::new(&config.pad);
         let hotkey_save = egui::Key::from_name(&config.hotkeys.save_state);
         let hotkey_load = egui::Key::from_name(&config.hotkeys.load_state);
@@ -256,6 +256,8 @@ impl App {
             config,
             config_path,
             keymap,
+            keys,
+            binder: None,
             hotkey_save,
             hotkey_load,
             gamepad,
@@ -370,6 +372,16 @@ impl App {
                 .text("volume")
                 .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
         );
+        ui.separator();
+        ui.heading("Input");
+        if ui
+            .button("Keyboard...")
+            .on_hover_text("bind a key to each pad button on a controller diagram")
+            .clicked()
+            && self.binder.is_none()
+        {
+            self.binder = Some(keymap::Binder::new(&self.keys));
+        }
         ui.separator();
         ui.heading("Debug");
         if ui
@@ -733,8 +745,8 @@ impl App {
                     });
                 });
                 ui.menu_button("Help", |ui| {
-                    ui.label("Pad, as bound in the config file:");
-                    for (name, (key, _)) in BUTTON_NAMES.iter().zip(self.config.keys.pairs()) {
+                    ui.label("Pad (Settings > Input rebinds the keyboard):");
+                    for (name, (key, _)) in BUTTON_NAMES.iter().zip(self.keys.pairs()) {
                         ui.monospace(format!("{name:>8} = {key}"));
                     }
                     ui.separator();
@@ -818,6 +830,7 @@ impl Drop for App {
         cfg.window_height = self.window_size.y.round();
         cfg.maximized = self.maximized;
         cfg.scaler = self.scaler;
+        cfg.keys = self.keys.clone();
         if cfg != self.config {
             cfg.save(path);
         }
@@ -912,10 +925,12 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
         // A focused text field in the pane would otherwise type into the
-        // pad as well. Only the pad is gated: the function-key shortcuts
-        // below stay live, and Esc needs no handling because egui drops
+        // pad as well; a pad button waiting for its key gates the frontend's
+        // own shortcuts too, so that binding F12 does not also take a
+        // screenshot on the way in. Esc needs no handling because egui drops
         // focus in its own begin_pass before this runs.
-        let typing = ctx.egui_wants_keyboard_input();
+        let capturing = self.binder.as_ref().is_some_and(keymap::Binder::capturing);
+        let typing = capturing || ctx.egui_wants_keyboard_input();
         let buttons = ctx.input(|i| {
             self.keymap
                 .iter()
@@ -932,7 +947,26 @@ impl eframe::App for App {
         let status = self.emu.shared.status.lock().unwrap().clone();
         let debugger_active = status.debugger.owns_execution();
 
-        // Save-state hotkeys; gating (debugger owns loads) is in the worker
+        // Re-read after the dialog has drawn: it clears `armed` on the frame
+        // it takes a key, and everything below has to see that.
+        let capturing = match self.binder.as_mut().map(|b| b.show(ctx)) {
+            Some(keymap::Outcome::Accept(keys)) => {
+                self.keys = *keys;
+                self.keymap = resolve_keymap(&self.keys);
+                self.binder = None;
+                false
+            }
+            Some(keymap::Outcome::Cancel) => {
+                self.binder = None;
+                false
+            }
+            _ => self.binder.as_ref().is_some_and(keymap::Binder::capturing),
+        };
+
+        // Save-state hotkeys; gating (debugger owns loads) is in the worker.
+        // Read after the dialog, which has by then taken the press it was
+        // waiting for out of the event queue, so binding F5 does not also
+        // save a state on the way in.
         let (save, load) = ctx.input(|i| {
             let pressed = |k: Option<egui::Key>| k.is_some_and(|k| i.key_pressed(k));
             (pressed(self.hotkey_save), pressed(self.hotkey_load))
@@ -943,17 +977,17 @@ impl eframe::App for App {
         if load {
             self.emu.send(Command::LoadState);
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::F12)) {
+        if !capturing && ctx.input(|i| i.key_pressed(egui::Key::F12)) {
             self.take_screenshot();
         }
 
         // F11 toggles fullscreen; the chrome (menu, status bar, panels) hides
         // while fullscreen so only the display shows.
-        if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
+        if !capturing && ctx.input(|i| i.key_pressed(egui::Key::F11)) {
             self.fullscreen = !self.fullscreen;
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
         }
-        if self.fullscreen && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        if self.fullscreen && !capturing && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.fullscreen = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
         }

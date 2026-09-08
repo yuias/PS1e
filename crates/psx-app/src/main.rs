@@ -24,6 +24,7 @@ mod disc;
 mod display;
 mod emu;
 mod gamepad;
+mod keymap;
 mod scan;
 mod ui;
 

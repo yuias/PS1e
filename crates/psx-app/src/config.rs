@@ -34,10 +34,11 @@ cheats = false
 # multiple, then linear) or "lanczos".
 scaler = "sharp"
 
-# Keyboard bindings for the digital pad. Values are egui key names:
-# letters and digits as themselves ("X", "1"), arrows as "Up"/"Down"/
-# "Left"/"Right", plus "Enter", "Backspace", "Space", "F1".."F20" and so
-# on. An unrecognized name falls back to the default for that button.
+# Keyboard bindings for the digital pad. Settings > Input > Keyboard edits
+# these from the window; the names it writes are egui key names: letters and
+# digits as themselves ("X", "1"), arrows as "Up"/"Down"/"Left"/"Right",
+# plus "Enter", "Backspace", "Space", "F1".."F20" and so on. An unrecognized
+# name falls back to the default for that button.
 #[keys]
 #up = "Up"
 #down = "Down"
@@ -143,6 +144,27 @@ impl KeyBindings {
             (&self.r2, button::R2),
             (&self.start, button::START),
             (&self.select, button::SELECT),
+        ]
+    }
+
+    /// The same bindings, mutably, in [`KeyBindings::pairs`] order, so the
+    /// binding dialog can write one back by the index it drew it at.
+    pub fn fields_mut(&mut self) -> [&mut String; 14] {
+        [
+            &mut self.up,
+            &mut self.down,
+            &mut self.left,
+            &mut self.right,
+            &mut self.cross,
+            &mut self.circle,
+            &mut self.square,
+            &mut self.triangle,
+            &mut self.l1,
+            &mut self.r1,
+            &mut self.l2,
+            &mut self.r2,
+            &mut self.start,
+            &mut self.select,
         ]
     }
 }
