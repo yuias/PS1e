@@ -26,7 +26,7 @@ eframe = { version = "0.32", default-features = false, features = [
 ] }
 cpal = "0.16"
 serde = { version = "1", features = ["derive"] }
-toml = "0.9"
+toml = "1.1"
 gilrs = "0.11.2"
 rfd = "0.17.2"
 
