@@ -141,10 +141,10 @@ pub struct Bus {
     pub mdec: Mdec,
     /// Current CPU cycle, updated by the system before each step; used by
     /// components that catch up lazily (timers).
-    pub now: u64,
+    pub(crate) now: u64,
     /// Wait-state cycles accumulated by accesses since the last step;
     /// drained by the system into the cycle counter.
-    pub penalty: u64,
+    pub(crate) penalty: u64,
     /// Expansion base / delay registers at 0x1f801000..0x1f801024, plus
     /// RAM_SIZE at 0x1f801060. Stored raw so BIOS read-back matches.
     mem_ctrl: [u32; 9],

@@ -221,7 +221,7 @@ impl Controller {
         match (cmd, args.as_slice()) {
             ("help", _) => Reply::ok(HELP.trim_end()),
             ("state", _) => {
-                let frame = &sys.bus.gpu.frame;
+                let frame = &sys.gpu().frame;
                 Reply::ok(format!(
                     "pc={:#010x} cycles={} frames={} held={} display={}x{}{}",
                     sys.cpu.pc,
@@ -276,7 +276,7 @@ impl Controller {
                 let mut out = String::new();
                 for base in (0..len).step_by(16) {
                     let row: Vec<String> = (base..(base + 16).min(len))
-                        .map(|i| match sys.bus.peek8(addr.wrapping_add(i)) {
+                        .map(|i| match sys.peek8(addr.wrapping_add(i)) {
                             Some(b) => format!("{b:02x}"),
                             None => "--".into(),
                         })
@@ -305,7 +305,7 @@ impl Controller {
                     return Reply::err("bad hex");
                 };
                 for (i, b) in bytes.iter().enumerate() {
-                    if !sys.bus.poke8(addr.wrapping_add(i as u32), *b) {
+                    if !sys.poke8(addr.wrapping_add(i as u32), *b) {
                         return Reply::err(format!(
                             "address {:#010x} not writable",
                             addr.wrapping_add(i as u32)
@@ -394,7 +394,7 @@ impl Controller {
                 Reply::ok(new)
             }
             ("frame", [path]) => {
-                let frame = &sys.bus.gpu.frame;
+                let frame = &sys.gpu().frame;
                 if frame.width == 0 || frame.height == 0 {
                     return Reply::err("no frame captured yet (run at least one frame)");
                 }
@@ -411,7 +411,7 @@ impl Controller {
                 }
             }
             ("vram", [path]) => {
-                crate::write_vram_bmp(path, &sys.bus.gpu.vram);
+                crate::write_vram_bmp(path, &sys.gpu().vram);
                 Reply::ok(format!("1024x512 -> {path}"))
             }
             ("savestate", [path]) => match sys.save_state() {
@@ -578,9 +578,9 @@ mod tests {
         let r = c.execute(&mut sys, "press CROSS+START 1", false);
         assert!(r.ok, "{}", r.payload);
         // After the press, only the held set remains applied.
-        assert_eq!(sys.bus.sio.buttons, psx_core::sio::button::UP);
+        assert_eq!(sys.sio().buttons, psx_core::sio::button::UP);
         assert!(c.execute(&mut sys, "input clear", false).ok);
-        assert_eq!(sys.bus.sio.buttons, 0);
+        assert_eq!(sys.sio().buttons, 0);
     }
 
     #[test]

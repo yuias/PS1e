@@ -11,8 +11,7 @@ fn fresh() -> PsxSystem {
 /// Snapshot of externally observable machine state for equality checks.
 fn observe(sys: &PsxSystem) -> (u32, [u32; 32], u64, u64) {
     let ram_sum = sys
-        .bus
-        .ram
+        .ram()
         .iter()
         .fold(0u64, |a, b| a.wrapping_mul(31).wrapping_add(*b as u64));
     (sys.cpu.pc, sys.cpu.regs, sys.cycles(), ram_sum)
@@ -51,7 +50,7 @@ fn bios_survives_load() {
     let mut sys = fresh();
     let state = sys.save_state().unwrap();
     sys.load_state(&state).unwrap();
-    assert_eq!(sys.bus.bios.len(), 512 * 1024);
+    assert_eq!(sys.bios().len(), 512 * 1024);
     // The machine still runs after a load.
     sys.run_cycles(1_000);
 }
@@ -85,6 +84,6 @@ fn cheats_survive_a_state_load_and_a_reset() {
 
     // One frame is enough to reach a vblank, which is where they apply.
     sys.run_cycles(psx_core::CPU_CLOCK_HZ / 50);
-    assert_eq!(sys.bus.peek8(0x8000_0100), Some(0xEF));
-    assert_eq!(sys.bus.peek8(0x8000_0101), Some(0xBE));
+    assert_eq!(sys.peek8(0x8000_0100), Some(0xEF));
+    assert_eq!(sys.peek8(0x8000_0101), Some(0xBE));
 }

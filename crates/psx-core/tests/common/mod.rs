@@ -268,7 +268,7 @@ pub fn run_to_marker(mut sys: PsxSystem, result_base: u32) -> Results {
 
 fn read_ram(sys: &PsxSystem, addr: u32) -> u32 {
     let a = addr as usize;
-    u32::from_le_bytes(sys.bus.ram[a..a + 4].try_into().unwrap())
+    u32::from_le_bytes(sys.ram()[a..a + 4].try_into().unwrap())
 }
 
 pub struct Results {

@@ -340,7 +340,7 @@ impl Worker {
                 Command::SetCheatsEnabled(on) => self.sys.set_cheats_enabled(on),
                 Command::Scan(req) => {
                     let (scan, outcome) =
-                        crate::scan::Scan::pass(self.scan.take(), req, &self.sys.bus.ram);
+                        crate::scan::Scan::pass(self.scan.take(), req, self.sys.ram());
                     self.scan = Some(scan);
                     *self.shared.scan.lock().unwrap() = Some(outcome);
                     self.ctx.request_repaint();
@@ -385,7 +385,7 @@ impl Worker {
 
     fn push_audio(&mut self) {
         self.scratch.clear();
-        self.sys.bus.spu.drain_output(&mut self.scratch);
+        self.sys.drain_audio(&mut self.scratch);
         if let Some(audio) = &self.audio {
             let vol = f32::from_bits(self.shared.volume.load(Ordering::Relaxed));
             for s in &mut self.scratch {
@@ -399,7 +399,7 @@ impl Worker {
     /// here rather than in the UI so a typo cannot ask for an out-of-range
     /// slice, and so the page always has a full row to draw.
     fn publish_memory(&mut self) {
-        let ram = &self.sys.bus.ram;
+        let ram = self.sys.ram();
         let base = (self.shared.view_base.load(Ordering::Relaxed) as usize & !0xF)
             .min(ram.len() - VIEW_BYTES);
         let mut m = self.shared.memory.lock().unwrap();
@@ -410,7 +410,7 @@ impl Worker {
 
     fn publish(&mut self) {
         let panels = self.shared.panels.load(Ordering::Relaxed);
-        let gpu = &self.sys.bus.gpu;
+        let gpu = self.sys.gpu();
         if gpu.frame_count != self.published_frame {
             self.published_frame = gpu.frame_count;
             {
@@ -470,8 +470,8 @@ impl Worker {
     }
 
     fn flush_memcard(&mut self) {
-        if self.sys.bus.sio.memcard.take_dirty() {
-            if let Err(e) = std::fs::write(&self.cfg.memcard_path, &self.sys.bus.sio.memcard.data) {
+        if self.sys.memcard_mut().take_dirty() {
+            if let Err(e) = std::fs::write(&self.cfg.memcard_path, &self.sys.memcard().data) {
                 tracing::error!("failed to save memory card: {e}");
             } else {
                 tracing::info!("memory card saved");

@@ -37,7 +37,7 @@ pub const SHELL_ENTRY: u32 = 0x8003_0000;
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct PsxSystem {
     pub cpu: Cpu,
-    pub bus: Bus,
+    bus: Bus,
     scheduler: Scheduler,
     cycles: u64,
     next_sample: u64,
@@ -218,6 +218,47 @@ impl PsxSystem {
         self.tty.since(pos)
     }
 
+    /// GPU state for the frontend to read (frame buffer, VRAM, timing).
+    /// Mutation only happens through the GP0/GP1 commands the CPU issues.
+    pub fn gpu(&self) -> &gpu::Gpu {
+        &self.bus.gpu
+    }
+
+    /// Interrupt controller state (I_STAT/I_MASK), for status reporting.
+    pub fn irq(&self) -> &bus::Irq {
+        &self.bus.irq
+    }
+
+    /// CD-ROM drive state (XA decode counters, drive status).
+    pub fn cdrom(&self) -> &cdrom::Cdrom {
+        &self.bus.cdrom
+    }
+
+    /// SPU state; see [`PsxSystem::drain_audio`] to pull generated samples.
+    pub fn spu(&self) -> &spu::Spu {
+        &self.bus.spu
+    }
+
+    /// Controller/memory-card port state (held buttons, memory card).
+    pub fn sio(&self) -> &sio::Sio {
+        &self.bus.sio
+    }
+
+    /// Main RAM, for memory viewers and scanners.
+    pub fn ram(&self) -> &[u8] {
+        &self.bus.ram
+    }
+
+    /// The BIOS image currently installed.
+    pub fn bios(&self) -> &[u8] {
+        &self.bus.bios
+    }
+
+    /// The memory card in slot 1.
+    pub fn memcard(&self) -> &memcard::MemCard {
+        &self.bus.sio.memcard
+    }
+
     /// Side-load a PS-X EXE image over the running machine.
     ///
     /// This is the shortcut the BIOS shell would otherwise take after
@@ -305,6 +346,34 @@ impl PsxSystem {
     /// Update controller state (bits per [`sio::button`], set = pressed).
     pub fn set_buttons(&mut self, buttons: u16) {
         self.bus.sio.buttons = buttons;
+    }
+
+    /// Drain generated audio samples (interleaved i16 stereo) into `out`.
+    pub fn drain_audio(&mut self, out: &mut Vec<i16>) {
+        self.bus.spu.drain_output(out);
+    }
+
+    /// Mutable access to the memory card in slot 1, e.g. to poll
+    /// [`memcard::MemCard::take_dirty`] for a pending save.
+    pub fn memcard_mut(&mut self) -> &mut memcard::MemCard {
+        &mut self.bus.sio.memcard
+    }
+
+    /// Replace the memory card in slot 1, e.g. once the frontend has loaded
+    /// or freshly created the card image.
+    pub fn set_memcard(&mut self, card: memcard::MemCard) {
+        self.bus.sio.memcard = card;
+    }
+
+    /// Side-effect-free byte read for debuggers and memory viewers; see
+    /// [`bus::Bus::peek8`].
+    pub fn peek8(&self, addr: u32) -> Option<u8> {
+        self.bus.peek8(addr)
+    }
+
+    /// Side-effect-free byte write for debuggers; see [`bus::Bus::poke8`].
+    pub fn poke8(&mut self, addr: u32, val: u8) -> bool {
+        self.bus.poke8(addr, val)
     }
 
     /// Execute a single CPU instruction, then fire any due events.

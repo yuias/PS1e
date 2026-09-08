@@ -169,7 +169,9 @@ fn main() -> eframe::Result {
     let memcard_path = cfg.memcard_path(cfg_path.as_ref());
     match std::fs::read(&memcard_path) {
         Ok(data) if data.len() == psx_core::memcard::CARD_SIZE => {
-            sys.bus.sio.memcard = psx_core::memcard::MemCard::with_data(data.into_boxed_slice());
+            sys.set_memcard(psx_core::memcard::MemCard::with_data(
+                data.into_boxed_slice(),
+            ));
             tracing::info!("memory card: {}", memcard_path.display());
         }
         Ok(_) => {
@@ -188,7 +190,7 @@ fn main() -> eframe::Result {
             } else {
                 tracing::info!("created memory card: {}", memcard_path.display());
             }
-            sys.bus.sio.memcard = card;
+            sys.set_memcard(card);
         }
     }
 
@@ -329,7 +331,7 @@ fn run_headless(
                 break;
             }
             if dump_wav.is_some() {
-                sys.bus.spu.drain_output(&mut wav_samples);
+                sys.drain_audio(&mut wav_samples);
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
@@ -353,7 +355,7 @@ fn run_headless(
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
                 if dump_wav.is_some() {
-                    sys.bus.spu.drain_output(&mut wav_samples);
+                    sys.drain_audio(&mut wav_samples);
                 }
                 continue;
             }
@@ -378,7 +380,7 @@ fn run_headless(
         sys.run_cycles(n);
         done += n;
         if dump_wav.is_some() {
-            sys.bus.spu.drain_output(&mut wav_samples);
+            sys.drain_audio(&mut wav_samples);
         }
     }
     finish_headless(&mut sys, args, wav_samples);
@@ -399,29 +401,29 @@ fn finish_headless(sys: &mut PsxSystem, args: &Args, wav_samples: Vec<i16>) {
         "done: pc={:#010x} cycles={} frames={} sr={:#010x} cause={:#010x} i_stat={:#06x} i_mask={:#06x}",
         sys.cpu.pc,
         sys.cycles(),
-        sys.bus.gpu.frame_count,
+        sys.gpu().frame_count,
         sys.cpu.cop0.sr,
         sys.cpu.cop0.cause,
-        sys.bus.irq.stat,
-        sys.bus.irq.mask,
+        sys.irq().stat,
+        sys.irq().mask,
     );
     let mut samples = Vec::new();
-    sys.bus.spu.drain_output(&mut samples);
+    sys.drain_audio(&mut samples);
     let peak = samples.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
     tracing::info!("audio: {} samples buffered, peak {peak}", samples.len() / 2);
     tracing::info!(
         "xa: {} sectors decoded, {} frames pushed ({:.1}/sector), dropped {} (cd_in {})",
-        sys.bus.cdrom.xa_sectors,
-        sys.bus.cdrom.xa_frames,
-        sys.bus.cdrom.xa_frames as f64 / sys.bus.cdrom.xa_sectors.max(1) as f64,
-        sys.bus.cdrom.xa_dropped,
-        sys.bus.spu.cd_dropped,
+        sys.cdrom().xa_sectors,
+        sys.cdrom().xa_frames,
+        sys.cdrom().xa_frames as f64 / sys.cdrom().xa_sectors.max(1) as f64,
+        sys.cdrom().xa_dropped,
+        sys.spu().cd_dropped,
     );
     print!("--- TTY ---\n{}\n-----------\n", sys.tty_output());
     // Dump the instructions around PC to identify wait loops during bring-up
     let pc = (sys.cpu.pc & 0x001f_ffff) as usize;
     for ofs in (pc.saturating_sub(16)..pc + 16).step_by(4) {
-        let w = u32::from_le_bytes(sys.bus.ram[ofs..ofs + 4].try_into().unwrap());
+        let w = u32::from_le_bytes(sys.ram()[ofs..ofs + 4].try_into().unwrap());
         println!(
             "{:#010x}: {w:08x}{}",
             ofs,
@@ -430,7 +432,7 @@ fn finish_headless(sys: &mut PsxSystem, args: &Args, wav_samples: Vec<i16>) {
     }
     // Dump the kernel event table (EvCB pointer at 0x120): one line per
     // entry as [index] class spec status — resolves TestEvent handles.
-    let ram = &sys.bus.ram;
+    let ram = sys.ram();
     let word =
         |a: usize| u32::from_le_bytes(ram[a & 0x1f_fffc..(a & 0x1f_fffc) + 4].try_into().unwrap());
     let evcb = word(0x120) as usize & 0x001f_ffff;
@@ -449,16 +451,16 @@ fn finish_headless(sys: &mut PsxSystem, args: &Args, wav_samples: Vec<i16>) {
         println!("--- peek {addr:#010x} ---");
         let base = (addr & 0x001f_fffc) as usize;
         for ofs in (base..base + 96).step_by(4) {
-            let w = u32::from_le_bytes(sys.bus.ram[ofs..ofs + 4].try_into().unwrap());
+            let w = u32::from_le_bytes(sys.ram()[ofs..ofs + 4].try_into().unwrap());
             println!("{:#010x}: {w:08x}", ofs);
         }
     }
     if let Some(path) = dump_vram {
-        write_vram_bmp(path, &sys.bus.gpu.vram);
+        write_vram_bmp(path, &sys.gpu().vram);
         tracing::info!("VRAM dumped to {path}");
     }
     if let Some(path) = args.dump_frame.as_deref() {
-        let frame = &sys.bus.gpu.frame;
+        let frame = &sys.gpu().frame;
         if frame.width == 0 || frame.height == 0 {
             tracing::warn!("no frame captured yet; skipping --dump-frame");
         } else {

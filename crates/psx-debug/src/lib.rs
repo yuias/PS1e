@@ -430,7 +430,7 @@ fn parse_addr_len(s: &str) -> Option<(u32, u32)> {
 fn read_memory(sys: &PsxSystem, addr: u32, len: u32) -> Vec<u8> {
     let mut hex = String::with_capacity(len as usize * 2);
     for i in 0..len {
-        match sys.bus.peek8(addr.wrapping_add(i)) {
+        match sys.peek8(addr.wrapping_add(i)) {
             Some(b) => hex.push_str(&format!("{b:02x}")),
             // Partial reads are legal; an unmapped first byte is an error.
             None if i == 0 => return b"E01".to_vec(),
@@ -442,7 +442,7 @@ fn read_memory(sys: &PsxSystem, addr: u32, len: u32) -> Vec<u8> {
 
 fn write_memory(sys: &mut PsxSystem, addr: u32, bytes: &[u8]) -> Vec<u8> {
     for (i, b) in bytes.iter().enumerate() {
-        if !sys.bus.poke8(addr.wrapping_add(i as u32), *b) {
+        if !sys.poke8(addr.wrapping_add(i as u32), *b) {
             return b"E01".to_vec();
         }
     }
