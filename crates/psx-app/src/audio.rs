@@ -90,7 +90,8 @@ impl Audio {
 
     pub fn push_samples(&self, samples: &[i16]) {
         let mut q = self.queue.lock().unwrap();
-        // Cap ~500ms so a paused UI doesn't accumulate unbounded latency
+        // Cap at 1s of frames so a stalled producer cannot accumulate
+        // unbounded latency. The queue is interleaved, hence `CAP * 2`.
         const CAP: usize = 44_100;
         q.extend(samples.iter().copied());
         while q.len() > CAP * 2 {

@@ -245,17 +245,26 @@ impl Worker {
             self.sys
                 .set_buttons(self.shared.buttons.load(Ordering::Relaxed));
 
+            // One pacer for both owners: a debugger's `continue` gets the
+            // same budget the free-running case does, so attaching gdb does
+            // not turn the machine into a fast-forward with unpaced audio
+            // piling up behind it.
+            let before = self.sys.cycles();
+            let budget = self.slice_budget();
+
             // While a debugger is attached (or awaited) it owns execution.
-            let mut worked = false;
             if let Some(dbg) = &mut self.cfg.debugger {
-                dbg.pump(&mut self.sys, SLICE);
+                dbg.pump(&mut self.sys, budget);
                 self.debugger_seen |= dbg.attached();
-                worked = dbg.attached() && !dbg.halted();
             }
 
-            if !self.debugger_active() && self.running {
-                worked |= self.pace_slice();
+            if budget > 0 && !self.debugger_active() && self.running {
+                self.sys.run_cycles(budget);
             }
+
+            // Whether anything ran, not whether someone was entitled to run:
+            // a paced-out iteration must still reach the sleep below.
+            let worked = self.sys.cycles() != before;
 
             self.push_audio();
             self.publish();
@@ -342,18 +351,21 @@ impl Worker {
         true
     }
 
-    /// Run one slice if the pacer allows it. With an audio device the SPU's
-    /// cycle-locked 44.1kHz output is the clock: run whenever the buffer is
-    /// below target, which also gives full-host-speed catch-up after a load
-    /// spike. Without one, pace against the wall clock.
-    fn pace_slice(&mut self) -> bool {
+    /// Cycles the owner of execution may advance this iteration: one slice,
+    /// or zero while the pacer is still ahead of the wall clock.
+    ///
+    /// With an audio device the SPU's cycle-locked 44.1kHz output is the
+    /// clock: run whenever the buffer is below target, which also gives
+    /// full-host-speed catch-up after a load spike. Without one, pace
+    /// against the wall clock; that branch consumes a deficit, so this must
+    /// be called exactly once per iteration.
+    fn slice_budget(&mut self) -> u64 {
         match &self.audio {
             Some(audio) => {
                 if audio.buffered_frames() < AUDIO_TARGET {
-                    self.sys.run_cycles(SLICE);
-                    true
+                    SLICE
                 } else {
-                    false
+                    0
                 }
             }
             None => {
@@ -363,10 +375,9 @@ impl Worker {
                 self.deficit = self.deficit.min(3.0 * SLICE as f64);
                 if self.deficit >= SLICE as f64 {
                     self.deficit -= SLICE as f64;
-                    self.sys.run_cycles(SLICE);
-                    true
+                    SLICE
                 } else {
-                    false
+                    0
                 }
             }
         }
