@@ -133,9 +133,11 @@ impl Reply {
     }
 }
 
+/// Number of in-memory save-state slots addressable as `@0`..`@15`.
+const STATE_SLOTS: usize = 16;
+
 /// Command executor: protocol state independent of the transport, so the
 /// whole command surface is unit-testable without sockets.
-#[derive(Default)]
 pub struct Controller {
     /// Buttons held across `run` commands (`input set`).
     held: u16,
@@ -146,6 +148,29 @@ pub struct Controller {
     /// write the enable marker back and `cheat reload` can re-read it.
     /// `None` when no disc with a cheat file has been opened.
     cheat_file: Option<PathBuf>,
+    /// In-memory save-state slots `@0`..`@15`. `psxctl` opens a new TCP
+    /// connection per command, so a slot cleared on reconnect would be
+    /// unusable from it; slots therefore persist until overwritten or the
+    /// process exits, never on reconnect.
+    slots: Vec<Option<Vec<u8>>>,
+}
+
+impl Default for Controller {
+    fn default() -> Self {
+        Controller {
+            held: 0,
+            tty_read: 0,
+            frames_run: 0,
+            cheat_file: None,
+            slots: vec![None; STATE_SLOTS],
+        }
+    }
+}
+
+/// Parse `@<n>` (0-15) into a slot index.
+fn parse_slot(s: &str) -> Option<usize> {
+    let n: usize = s.strip_prefix('@')?.parse().ok()?;
+    (n < STATE_SLOTS).then_some(n)
 }
 
 impl Controller {
@@ -425,12 +450,33 @@ impl Controller {
                 crate::write_vram_bmp(path, &sys.gpu().vram);
                 Reply::ok(format!("1024x512 -> {path}"))
             }
+            ("savestate", [path]) if path.starts_with('@') => match parse_slot(path) {
+                Some(slot) => match sys.save_state() {
+                    Ok(data) => {
+                        let len = data.len();
+                        self.slots[slot] = Some(data);
+                        Reply::ok(format!("saved {len} bytes -> @{slot}"))
+                    }
+                    Err(e) => Reply::err(e),
+                },
+                None => Reply::err(format!("bad slot '{path}' (0-15)")),
+            },
             ("savestate", [path]) => match sys.save_state() {
                 Ok(data) => match std::fs::write(path, &data) {
                     Ok(()) => Reply::ok(format!("saved {} bytes -> {path}", data.len())),
                     Err(e) => Reply::err(format!("write {path}: {e}")),
                 },
                 Err(e) => Reply::err(e),
+            },
+            ("loadstate", [path]) if path.starts_with('@') => match parse_slot(path) {
+                Some(slot) => match &self.slots[slot] {
+                    Some(data) => match sys.load_state(data) {
+                        Ok(()) => Reply::ok(format!("loaded @{slot}, pc={:#010x}", sys.cpu.pc)),
+                        Err(e) => Reply::err(e),
+                    },
+                    None => Reply::err(format!("slot @{slot} is empty")),
+                },
+                None => Reply::err(format!("bad slot '{path}' (0-15)")),
             },
             ("loadstate", [path]) => match std::fs::read(path) {
                 Ok(data) => match sys.load_state(&data) {
@@ -474,8 +520,11 @@ cheat reload          re-read the .cht for the disc in the drive
 tty                   TTY output accumulated since the last `tty`
 loadexe <path> [now]  side-load a PS-X EXE (boots to the shell first unless
                       `now`, for a machine already run past it)
-savestate <path>      snapshot the full machine state to a file
-loadstate <path>      restore a snapshot (BIOS/disc/memcard carry over)
+savestate <path>|@<n>
+                      snapshot the full machine state to a file, or to
+                      in-memory slot n (0-15)
+loadstate <path>|@<n>
+                      restore a snapshot (BIOS/disc/memcard carry over)
 quit                  shut the emulator down
 ";
 
@@ -808,6 +857,34 @@ mod tests {
         assert!(c.execute(&mut sys, &format!("savestate {p}"), true).ok);
         assert!(!c.execute(&mut sys, &format!("loadstate {p}"), true).ok);
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn slot_savestate_loadstate_round_trip() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        assert!(c.execute(&mut sys, "run 1", false).ok);
+        let r = c.execute(&mut sys, "savestate @3", false);
+        assert!(r.ok, "{}", r.payload);
+        let cycles_at_save = sys.cycles();
+
+        assert!(c.execute(&mut sys, "run 1", false).ok);
+        assert_ne!(sys.cycles(), cycles_at_save);
+
+        let r = c.execute(&mut sys, "loadstate @3", false);
+        assert!(r.ok, "{}", r.payload);
+        assert_eq!(sys.cycles(), cycles_at_save);
+
+        // While a debugger owns execution, loading is refused (saving is ok).
+        assert!(c.execute(&mut sys, "savestate @3", true).ok);
+        assert!(!c.execute(&mut sys, "loadstate @3", true).ok);
+    }
+
+    #[test]
+    fn slot_errors() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        assert!(!c.execute(&mut sys, "loadstate @4", false).ok);
+        assert!(!c.execute(&mut sys, "savestate @16", false).ok);
+        assert!(!c.execute(&mut sys, "savestate @x", false).ok);
     }
 
     #[test]

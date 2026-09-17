@@ -180,6 +180,7 @@ psxctl cheat apply on         # nothing applies until this is on
 psxctl cheat on 0             # toggle one cheat; the marker goes back to the file
 psxctl loadexe probe.exe      # side-load a PS-X EXE over the running BIOS
 psxctl savestate s.sst        # snapshot; loadstate restores it
+psxctl savestate @0           # in-memory slot (0-15); loadstate @0 restores it
 psxctl state                  # pc, cycles, frames, held buttons, display
 psxctl quit
 ```
