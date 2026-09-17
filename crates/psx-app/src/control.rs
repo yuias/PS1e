@@ -253,7 +253,9 @@ pub struct Controller {
     /// unusable from it; slots therefore persist until overwritten or the
     /// process exits, never on reconnect.
     slots: Vec<Option<Vec<u8>>>,
-    /// Scanner session; persists across client connections (see Constraints).
+    /// Scanner session; persists across client connections, since `psxctl`
+    /// opens a new TCP connection per command and a session cleared on
+    /// reconnect would be unusable from it.
     scan: Option<crate::scan::Scan>,
 }
 
