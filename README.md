@@ -169,6 +169,7 @@ psxctl input set UP           # hold until changed; applied during run
 psxctl input clear            # release everything held
 psxctl reset                  # power-cycle; disc and memory card stay in
 psxctl frame shot.bmp         # dump the current display frame
+psxctl frameb png             # frame as base64 PNG over the socket
 psxctl vram vram.bmp          # dump the full 1024x512 VRAM
 psxctl peek 801ffc38 64       # hex dump memory (side-effect-free)
 psxctl peekb 80000000 2097152 # whole RAM as base64

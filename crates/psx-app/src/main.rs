@@ -526,9 +526,32 @@ fn write_wav(path: &str, samples: &[i16]) {
     std::fs::write(path, out).expect("failed to write WAV");
 }
 
-/// Dump a vblank-latched display frame (what the TV shows) as a 24-bit BMP,
-/// decoding 15-bit or packed 24-bit rows as appropriate. Takes the geometry
-/// loose so the GUI can pass its own snapshot instead of a `gpu::Frame`.
+/// Decode a latched frame to top-down, row-major RGB24, expanding 15-bit
+/// pixels the same way the BMP writer does. Takes the geometry loose so the
+/// GUI and the control port can pass their own snapshot instead of a
+/// `gpu::Frame`.
+fn frame_rgb24(width: u32, height: u32, stride: u32, is_24bit: bool, pixels: &[u16]) -> Vec<u8> {
+    let (w, h, stride) = (width as usize, height as usize, stride as usize);
+    let mut out = Vec::with_capacity(w * h * 3);
+    for y in 0..h {
+        let row = &pixels[y * stride..(y + 1) * stride];
+        for x in 0..w {
+            let (r, g, b) = if is_24bit {
+                let byte = x * 3;
+                let read = |b: usize| (row[(byte + b) / 2] >> (((byte + b) & 1) * 8)) as u8;
+                (read(0), read(1), read(2))
+            } else {
+                let px = row[x];
+                let e = |c: u16| ((c << 3) | (c >> 2)) as u8;
+                (e(px & 0x1f), e((px >> 5) & 0x1f), e((px >> 10) & 0x1f))
+            };
+            out.extend_from_slice(&[r, g, b]);
+        }
+    }
+    out
+}
+
+/// Dump a vblank-latched display frame (what the TV shows) as a 24-bit BMP.
 fn write_frame_bmp(
     path: &str,
     width: u32,
@@ -537,7 +560,8 @@ fn write_frame_bmp(
     is_24bit: bool,
     pixels: &[u16],
 ) -> std::io::Result<()> {
-    let (w, h, stride) = (width as usize, height as usize, stride as usize);
+    let (w, h) = (width as usize, height as usize);
+    let rgb = frame_rgb24(width, height, stride, is_24bit, pixels);
     let pad = (4 - (w * 3) % 4) % 4;
     let data_size = (w * 3 + pad) * h;
     let mut out = Vec::with_capacity(54 + data_size);
@@ -551,18 +575,10 @@ fn write_frame_bmp(
     out.extend_from_slice(&1u16.to_le_bytes());
     out.extend_from_slice(&24u16.to_le_bytes());
     out.extend_from_slice(&[0; 24]); // no compression, default resolution
+    // BMP rows are bottom-up and BGR; frame_rgb24 gives top-down RGB.
     for y in (0..h).rev() {
-        let row = &pixels[y * stride..(y + 1) * stride];
-        for x in 0..w {
-            let (r, g, b) = if is_24bit {
-                let byte = x * 3;
-                let read = |b: usize| (row[(byte + b) / 2] >> (((byte + b) & 1) * 8)) as u8;
-                (read(0), read(1), read(2))
-            } else {
-                let px = row[x];
-                let e = |c: u16| ((c << 3) | (c >> 2)) as u8;
-                (e(px & 0x1f), e((px >> 5) & 0x1f), e((px >> 10) & 0x1f))
-            };
+        let row = &rgb[y * w * 3..(y + 1) * w * 3];
+        for &[r, g, b] in row.as_chunks::<3>().0 {
             out.extend_from_slice(&[b, g, r]);
         }
         out.extend_from_slice(&[0, 0, 0][..pad]);

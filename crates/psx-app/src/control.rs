@@ -166,6 +166,14 @@ fn read_range(sys: &PsxSystem, addr: u32, len: u32) -> Result<Vec<u8>, String> {
         .collect()
 }
 
+/// Encode top-down RGB24 pixels as a PNG, for `frameb png`.
+fn encode_png(out: &mut Vec<u8>, w: u32, h: u32, rgb: &[u8]) -> Result<(), png::EncodingError> {
+    let mut encoder = png::Encoder::new(out, w, h);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.write_header()?.write_image_data(rgb)
+}
+
 /// Cycles allowed for the BIOS to reach the shell entry on `loadexe`. A
 /// retail image gets there in about 80 million; well past that means the
 /// image is not going to arrive, and the port must not wedge waiting.
@@ -552,6 +560,27 @@ impl Controller {
                     Err(e) => Reply::err(format!("write {path}: {e}")),
                 }
             }
+            ("frameb", fmt_arg @ ([] | [_])) => {
+                let fmt = fmt_arg.first().copied().unwrap_or("rgb24");
+                if fmt != "rgb24" && fmt != "png" {
+                    return Reply::err(format!("bad format '{fmt}' (rgb24 or png)"));
+                }
+                let frame = &sys.gpu().frame;
+                if frame.width == 0 || frame.height == 0 {
+                    return Reply::err("no frame captured yet (run at least one frame)");
+                }
+                let (w, h) = (frame.width, frame.height);
+                let rgb = crate::frame_rgb24(w, h, frame.stride, frame.is_24bit, &frame.pixels);
+                if fmt == "rgb24" {
+                    Reply::ok(format!("{w} {h} rgb24\n{}", base64_encode(&rgb)))
+                } else {
+                    let mut png_bytes = Vec::new();
+                    match encode_png(&mut png_bytes, w, h, &rgb) {
+                        Ok(()) => Reply::ok(format!("{w} {h} png\n{}", base64_encode(&png_bytes))),
+                        Err(e) => Reply::err(format!("png encode: {e}")),
+                    }
+                }
+            }
             ("vram", [path]) => {
                 crate::write_vram_bmp(path, &sys.gpu().vram);
                 Reply::ok(format!("1024x512 -> {path}"))
@@ -614,6 +643,8 @@ input set <BTN+BTN>   hold buttons until changed (applied during run)
 input clear           release all held buttons
 reset                 power-cycle: disc and memory card stay in, held buttons cleared
 frame <path>          dump the latched display frame as BMP
+frameb [rgb24|png]    latched display frame over the socket: <w> <h> <fmt>
+                      then one base64 line (top-down RGB24, or a PNG file)
 vram <path>           dump full 1024x512 VRAM as BMP
 peek <hexaddr> <len>  hex dump memory (side-effect-free, MMIO shows --)
 peekb <hexaddr> <len> memory as one base64 line (up to 2 MiB; err if any
@@ -753,6 +784,31 @@ mod tests {
     fn sys() -> PsxSystem {
         PsxSystem::new(vec![0; 512 * 1024]).unwrap()
     }
+
+    /// Poke a program into RAM and point the CPU at it.
+    fn load_program(sys: &mut PsxSystem, words: &[u32]) {
+        for (i, w) in words.iter().enumerate() {
+            for (j, b) in w.to_le_bytes().iter().enumerate() {
+                assert!(sys.poke8(0x8001_0000 + (i * 4 + j) as u32, *b));
+            }
+        }
+        sys.cpu.set_pc(0x8001_0000);
+    }
+
+    /// GP0(02h) fill 16x16 red at (0,0), then spin.
+    const FILL_PROGRAM: [u32; 11] = [
+        0x3c08_1f80, // lui   $t0, 0x1f80
+        0x3508_1810, // ori   $t0, $t0, 0x1810      GP0
+        0x3c09_0200, // lui   $t1, 0x0200
+        0x3529_00ff, // ori   $t1, $t1, 0x00ff      fill, colour R=0xff
+        0xad09_0000, // sw    $t1, 0($t0)
+        0xad00_0000, // sw    $zero, 0($t0)         top-left (0,0)
+        0x3c09_0010, // lui   $t1, 0x0010
+        0x3529_0010, // ori   $t1, $t1, 0x0010      16x16
+        0xad09_0000, // sw    $t1, 0($t0)
+        0x0800_4009, // loop: j loop                (0x80010024)
+        0x0000_0000, // nop
+    ];
 
     #[test]
     fn run_advances_by_frames() {
@@ -1130,5 +1186,79 @@ mod tests {
     fn quit_flag_propagates() {
         let (mut sys, mut c) = (sys(), Controller::default());
         assert!(c.execute(&mut sys, "quit", false).quit);
+    }
+
+    #[test]
+    fn frameb_matches_the_bmp_written_by_frame() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        load_program(&mut sys, &FILL_PROGRAM);
+        assert!(c.execute(&mut sys, "run 1", false).ok);
+
+        let r = c.execute(&mut sys, "frameb", false);
+        assert!(r.ok, "{}", r.payload);
+        let mut lines = r.payload.lines();
+        assert_eq!(lines.next().unwrap(), "320 240 rgb24");
+        let rgb = base64_decode(lines.next().unwrap()).unwrap();
+        assert_eq!(rgb.len(), 320 * 240 * 3);
+        assert_eq!(&rgb[..3], &[0xff, 0, 0]);
+        let px = |x: usize, y: usize| &rgb[(y * 320 + x) * 3..(y * 320 + x) * 3 + 3];
+        assert_eq!(px(100, 100), &[0, 0, 0]);
+
+        let path = temp_path("frameb.bmp");
+        let p = path.to_str().unwrap();
+        assert!(c.execute(&mut sys, &format!("frame {p}"), false).ok);
+        let bmp = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let (w, h) = (320usize, 240usize);
+        let pad = (4 - (w * 3) % 4) % 4;
+        let row_bytes = w * 3 + pad;
+        for y in 0..h {
+            let bmp_row = &bmp[54 + (h - 1 - y) * row_bytes..54 + (h - 1 - y) * row_bytes + w * 3];
+            let rgb_row = &rgb[y * w * 3..(y + 1) * w * 3];
+            for x in 0..w {
+                let bgr = &bmp_row[x * 3..x * 3 + 3];
+                let rgb_px = &rgb_row[x * 3..x * 3 + 3];
+                assert_eq!(
+                    [bgr[2], bgr[1], bgr[0]],
+                    [rgb_px[0], rgb_px[1], rgb_px[2]],
+                    "row {y} col {x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn frameb_png_decodes_to_the_same_pixels() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        load_program(&mut sys, &FILL_PROGRAM);
+        assert!(c.execute(&mut sys, "run 1", false).ok);
+
+        let r = c.execute(&mut sys, "frameb", false);
+        assert!(r.ok, "{}", r.payload);
+        let mut lines = r.payload.lines();
+        lines.next();
+        let rgb = base64_decode(lines.next().unwrap()).unwrap();
+
+        let r = c.execute(&mut sys, "frameb png", false);
+        assert!(r.ok, "{}", r.payload);
+        let mut lines = r.payload.lines();
+        assert_eq!(lines.next().unwrap(), "320 240 png");
+        let png_bytes = base64_decode(lines.next().unwrap()).unwrap();
+
+        let decoder = png::Decoder::new(std::io::Cursor::new(png_bytes));
+        let mut reader = decoder.read_info().unwrap();
+        let mut buf = vec![0; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut buf).unwrap();
+        assert_eq!(&buf[..info.buffer_size()], rgb.as_slice());
+    }
+
+    #[test]
+    fn frameb_rejects_unknown_formats() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        assert!(!c.execute(&mut sys, "frameb", false).ok);
+        load_program(&mut sys, &FILL_PROGRAM);
+        assert!(c.execute(&mut sys, "run 1", false).ok);
+        assert!(!c.execute(&mut sys, "frameb bmp", false).ok);
     }
 }
