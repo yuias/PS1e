@@ -54,6 +54,15 @@ pub struct Scan {
     snapshot: Vec<u8>,
 }
 
+/// Scanner value syntax shared by the GUI and the control port:
+/// unsigned, decimal or `0x`-prefixed hex.
+pub fn parse_value(s: &str) -> Option<u32> {
+    match s.strip_prefix("0x") {
+        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+        None => s.parse::<u32>().ok(),
+    }
+}
+
 fn read(ram: &[u8], addr: u32, width: u8) -> u32 {
     let a = addr as usize;
     ram[a..a + width as usize]
@@ -105,6 +114,38 @@ impl Scan {
                 .collect(),
         };
         (scan, outcome)
+    }
+
+    /// Width of the pass that produced the current candidate set.
+    pub fn width(&self) -> u8 {
+        self.width
+    }
+
+    /// Number of candidates left.
+    pub fn count(&self) -> usize {
+        self.candidates.len()
+    }
+
+    /// The first `max` candidates as (RAM offset, value in `ram`, value
+    /// when the last pass ran). The two values are equal until something
+    /// writes RAM after the pass. Without a snapshot the last-pass value
+    /// repeats `ram`.
+    pub fn list(&self, ram: &[u8], max: usize) -> Vec<(u32, u32, u32)> {
+        let w = self.width;
+        let has_prev = self.snapshot.len() == ram.len();
+        self.candidates
+            .iter()
+            .take(max)
+            .map(|&a| {
+                let cur = read(ram, a, w);
+                let prev = if has_prev {
+                    read(&self.snapshot, a, w)
+                } else {
+                    cur
+                };
+                (a, cur, prev)
+            })
+            .collect()
     }
 }
 
@@ -166,6 +207,27 @@ mod tests {
         };
         let (_, r) = Scan::pass(Some(scan), narrow, &ram);
         assert_eq!(r.count, 16);
+    }
+
+    #[test]
+    fn parse_value_accepts_decimal_and_hex() {
+        assert_eq!(parse_value("100"), Some(100));
+        assert_eq!(parse_value("0x64"), Some(100));
+        assert_eq!(parse_value("-1"), None);
+        assert_eq!(parse_value(""), None);
+    }
+
+    #[test]
+    fn list_reports_current_and_last_pass_values() {
+        let mut ram = vec![0u8; 64];
+        ram[8..12].copy_from_slice(&100u32.to_le_bytes());
+        ram[40..44].copy_from_slice(&100u32.to_le_bytes());
+        let (scan, _) = Scan::pass(None, req(Filter::Exact(100), true), &ram);
+        // Mutate one candidate without another pass: the snapshot still
+        // holds the value as of the pass, so the columns diverge.
+        ram[8..12].copy_from_slice(&90u32.to_le_bytes());
+        assert_eq!(scan.list(&ram, 100), vec![(8, 90, 100), (40, 100, 100)]);
+        assert_eq!(scan.list(&ram, 1), vec![(8, 90, 100)]);
     }
 
     #[test]

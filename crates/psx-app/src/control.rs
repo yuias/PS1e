@@ -122,6 +122,14 @@ fn parse_addr(s: &str) -> Result<u32, String> {
     u32::from_str_radix(s.trim_start_matches("0x"), 16).map_err(|_| format!("bad address '{s}'"))
 }
 
+/// Scanner width, restricted to what `scan.rs` supports.
+fn parse_scan_width(s: &str) -> Result<u8, String> {
+    match s {
+        "1" | "2" | "4" => Ok(s.parse().unwrap()),
+        _ => Err(format!("bad width '{s}' (1, 2 or 4)")),
+    }
+}
+
 /// Largest reply a `peekb`/`peekm` will encode, per command (summed over
 /// ranges for `peekm`). Bounds the base64 line the client has to buffer.
 const PEEK_BYTES_MAX: u32 = 2 * 1024 * 1024;
@@ -224,6 +232,10 @@ impl Reply {
 /// Number of in-memory save-state slots addressable as `@0`..`@15`.
 const STATE_SLOTS: usize = 16;
 
+/// Ceiling on `scan list <max>`, so a huge max cannot build a reply covering
+/// the whole of RAM; the header already reports the true hit count.
+const SCAN_LIST_MAX: usize = 4096;
+
 /// Command executor: protocol state independent of the transport, so the
 /// whole command surface is unit-testable without sockets.
 pub struct Controller {
@@ -241,6 +253,8 @@ pub struct Controller {
     /// unusable from it; slots therefore persist until overwritten or the
     /// process exits, never on reconnect.
     slots: Vec<Option<Vec<u8>>>,
+    /// Scanner session; persists across client connections (see Constraints).
+    scan: Option<crate::scan::Scan>,
 }
 
 impl Default for Controller {
@@ -251,6 +265,7 @@ impl Default for Controller {
             frames_run: 0,
             cheat_file: None,
             slots: vec![None; STATE_SLOTS],
+            scan: None,
         }
     }
 }
@@ -297,6 +312,32 @@ impl Controller {
             }
         }
         sys.cycles() - before
+    }
+
+    /// Run one scanner pass, the same rule the GUI scanner uses
+    /// (`crate::scan::Scan::pass`), and report the hit count.
+    fn scan_pass(&mut self, sys: &PsxSystem, req: crate::scan::Request) -> Reply {
+        let (scan, outcome) = crate::scan::Scan::pass(self.scan.take(), req, sys.ram());
+        self.scan = Some(scan);
+        Reply::ok(format!("{} hits (width {})", outcome.count, outcome.width))
+    }
+
+    /// List the current scan's candidates, addressed the way `peek` expects
+    /// them back (KSEG0), current value and value at the last pass.
+    fn scan_list(&self, sys: &PsxSystem, max: usize) -> Reply {
+        let Some(scan) = &self.scan else {
+            return Reply::err("no scan (use scan start)");
+        };
+        let hits = scan.list(sys.ram(), max);
+        let digits = 2 * scan.width() as usize;
+        let mut out = format!("{} hits, showing {}\n", scan.count(), hits.len());
+        for (addr, value, previous) in hits {
+            out.push_str(&format!(
+                "{:08x} {value:0digits$x} {previous:0digits$x}\n",
+                0x8000_0000u32 + addr
+            ));
+        }
+        Reply::ok(out.trim_end().to_string())
     }
 
     /// Read a PS-X EXE and hand it to the machine, optionally booting the
@@ -505,6 +546,79 @@ impl Controller {
                 }
                 Reply::ok(format!("wrote {} bytes", bytes.len()))
             }
+            // Observation, not execution: a scan never advances the machine,
+            // so it is not gated by `debugger_owns`.
+            ("scan", ["start", w]) | ("scan", ["start", w, "unknown"]) => match parse_scan_width(w)
+            {
+                Ok(width) => self.scan_pass(
+                    sys,
+                    crate::scan::Request {
+                        width,
+                        filter: crate::scan::Filter::Unknown,
+                        restart: true,
+                    },
+                ),
+                Err(e) => Reply::err(e),
+            },
+            ("scan", ["start", w, "exact", v]) => {
+                match (parse_scan_width(w), crate::scan::parse_value(v)) {
+                    (Ok(width), Some(value)) => self.scan_pass(
+                        sys,
+                        crate::scan::Request {
+                            width,
+                            filter: crate::scan::Filter::Exact(value),
+                            restart: true,
+                        },
+                    ),
+                    (Err(e), _) => Reply::err(e),
+                    (_, None) => Reply::err(format!("bad value '{v}'")),
+                }
+            }
+            ("scan", ["filter", "exact", v]) => {
+                let Some(width) = self.scan.as_ref().map(|s| s.width()) else {
+                    return Reply::err("no scan (use scan start)");
+                };
+                match crate::scan::parse_value(v) {
+                    Some(value) => self.scan_pass(
+                        sys,
+                        crate::scan::Request {
+                            width,
+                            filter: crate::scan::Filter::Exact(value),
+                            restart: false,
+                        },
+                    ),
+                    None => Reply::err(format!("bad value '{v}'")),
+                }
+            }
+            ("scan", ["filter", f]) => {
+                let Some(width) = self.scan.as_ref().map(|s| s.width()) else {
+                    return Reply::err("no scan (use scan start)");
+                };
+                let filter = match *f {
+                    "changed" => crate::scan::Filter::Changed,
+                    "unchanged" => crate::scan::Filter::Unchanged,
+                    "increased" => crate::scan::Filter::Increased,
+                    "decreased" => crate::scan::Filter::Decreased,
+                    _ => return Reply::err(format!("bad filter '{f}'")),
+                };
+                self.scan_pass(
+                    sys,
+                    crate::scan::Request {
+                        width,
+                        filter,
+                        restart: false,
+                    },
+                )
+            }
+            ("scan", ["list"]) => self.scan_list(sys, 100),
+            ("scan", ["list", max]) => match max.parse::<usize>() {
+                Ok(max) => self.scan_list(sys, max.min(SCAN_LIST_MAX)),
+                Err(_) => Reply::err(format!("bad max '{max}'")),
+            },
+            ("scan", ["clear"]) => {
+                self.scan = None;
+                Reply::ok("scan cleared")
+            }
             // Disc swap, split into the two halves a real drive has, so a
             // script can leave the lid open across several `run`s and watch
             // how the game reacts before the new disc goes in.
@@ -697,6 +811,15 @@ peekm <hexaddr>:<len> ...
                       one base64 line per range, 2 MiB in total, same rule
                       as peekb
 poke <hexaddr> <hex>  write bytes to RAM/scratchpad
+scan start <1|2|4> [exact <value>|unknown]
+                      new RAM scan (value: decimal or 0x hex, unsigned);
+                      reports the hit count
+scan filter exact <value>|changed|unchanged|increased|decreased
+                      narrow the candidates against the last pass
+scan list [max]       `<addr> <value> <previous>` per hit, hex, default
+                      100, capped at 4096; previous = value at the last pass
+scan clear            drop the scan session (it otherwise survives
+                      reconnects)
 disc open             open the drive lid (stops the drive, flags shell open)
 disc close [path]     close the lid, on a new image if given, else the old one
 cheat list            cheats from the disc's .cht, with their enable state
@@ -1377,5 +1500,138 @@ mod tests {
         load_program(&mut sys, &FILL_PROGRAM);
         assert!(c.execute(&mut sys, "run 1", false).ok);
         assert!(!c.execute(&mut sys, "frameb bmp", false).ok);
+    }
+
+    #[test]
+    fn scan_over_the_control_port_matches_the_scanner() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        assert!(c.execute(&mut sys, "poke 80100000 64000000", false).ok);
+        assert!(c.execute(&mut sys, "poke 80100040 64000000", false).ok);
+
+        let r = c.execute(&mut sys, "scan start 4 exact 100", false);
+        assert_eq!(r.payload, "2 hits (width 4)");
+
+        assert!(c.execute(&mut sys, "poke 80100000 5a000000", false).ok);
+        let r = c.execute(&mut sys, "scan filter decreased", false);
+        assert_eq!(r.payload, "1 hits (width 4)");
+
+        // Right after a pass, the snapshot was just refreshed with current
+        // RAM, so the two columns still agree.
+        let r = c.execute(&mut sys, "scan list", false);
+        assert!(r.ok, "{}", r.payload);
+        let mut lines = r.payload.lines();
+        assert_eq!(lines.next().unwrap(), "1 hits, showing 1");
+        assert_eq!(lines.next().unwrap(), "80100000 0000005a 0000005a");
+
+        // A poke with no further pass leaves the snapshot behind.
+        assert!(c.execute(&mut sys, "poke 80100000 50000000", false).ok);
+        let r = c.execute(&mut sys, "scan list", false);
+        assert_eq!(
+            r.payload.lines().nth(1).unwrap(),
+            "80100000 00000050 0000005a"
+        );
+
+        assert!(c.execute(&mut sys, "scan clear", false).ok);
+        assert!(!c.execute(&mut sys, "scan list", false).ok);
+    }
+
+    #[test]
+    fn scan_start_unknown_then_changed() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        // `scan start 1` with no filter defaults to unknown.
+        let r = c.execute(&mut sys, "scan start 1", false);
+        assert_eq!(r.payload, "2097152 hits (width 1)");
+
+        assert!(c.execute(&mut sys, "poke 80100000 ff", false).ok);
+        let r = c.execute(&mut sys, "scan filter changed", false);
+        assert_eq!(r.payload, "1 hits (width 1)");
+    }
+
+    #[test]
+    fn scan_filter_exact_needs_a_session_and_narrows_when_present() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        // No session yet: nothing to narrow.
+        assert!(!c.execute(&mut sys, "scan filter exact 100", false).ok);
+
+        assert!(c.execute(&mut sys, "poke 80100000 64000000", false).ok);
+        assert!(c.execute(&mut sys, "poke 80100040 64000000", false).ok);
+        let r = c.execute(&mut sys, "scan start 4 unknown", false);
+        assert_eq!(r.payload, "524288 hits (width 4)");
+
+        let r = c.execute(&mut sys, "scan filter exact 100", false);
+        assert_eq!(r.payload, "2 hits (width 4)");
+    }
+
+    #[test]
+    fn scan_filter_rejects_a_bad_name() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        assert!(c.execute(&mut sys, "scan start 1", false).ok);
+        assert!(!c.execute(&mut sys, "scan filter bogus", false).ok);
+    }
+
+    /// Each comparative filter keeps only the candidate it names, so a
+    /// mapping swapped between `Increased`/`Decreased`/`Unchanged` in the
+    /// dispatch would show up as the wrong address surviving.
+    #[test]
+    fn scan_filter_increased_decreased_and_unchanged_pick_the_right_candidate() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        fn restart_with_three_hundreds(c: &mut Controller, sys: &mut PsxSystem) {
+            assert!(c.execute(sys, "poke 80100000 64000000", false).ok); // 100
+            assert!(c.execute(sys, "poke 80100004 64000000", false).ok); // 100
+            assert!(c.execute(sys, "poke 80100008 64000000", false).ok); // 100
+            let r = c.execute(sys, "scan start 4 exact 100", false);
+            assert_eq!(r.payload, "3 hits (width 4)");
+        }
+
+        restart_with_three_hundreds(&mut c, &mut sys);
+        assert!(c.execute(&mut sys, "poke 80100000 6e000000", false).ok); // 110: up
+        assert!(c.execute(&mut sys, "poke 80100004 5a000000", false).ok); // 90: down
+        let r = c.execute(&mut sys, "scan filter increased", false);
+        assert_eq!(r.payload, "1 hits (width 4)");
+        let list = c.execute(&mut sys, "scan list", false);
+        assert!(list.payload.contains("80100000"), "{}", list.payload);
+
+        restart_with_three_hundreds(&mut c, &mut sys);
+        assert!(c.execute(&mut sys, "poke 80100000 6e000000", false).ok);
+        assert!(c.execute(&mut sys, "poke 80100004 5a000000", false).ok);
+        let r = c.execute(&mut sys, "scan filter decreased", false);
+        assert_eq!(r.payload, "1 hits (width 4)");
+        let list = c.execute(&mut sys, "scan list", false);
+        assert!(list.payload.contains("80100004"), "{}", list.payload);
+
+        restart_with_three_hundreds(&mut c, &mut sys);
+        assert!(c.execute(&mut sys, "poke 80100000 6e000000", false).ok);
+        assert!(c.execute(&mut sys, "poke 80100004 5a000000", false).ok);
+        let r = c.execute(&mut sys, "scan filter unchanged", false);
+        assert_eq!(r.payload, "1 hits (width 4)");
+        let list = c.execute(&mut sys, "scan list", false);
+        assert!(list.payload.contains("80100008"), "{}", list.payload);
+    }
+
+    #[test]
+    fn scan_list_clamps_to_a_maximum() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        let r = c.execute(&mut sys, "scan start 1", false);
+        assert_eq!(r.payload, "2097152 hits (width 1)");
+
+        let r = c.execute(&mut sys, "scan list 999999999", false);
+        assert!(r.ok, "{}", r.payload);
+        let mut lines = r.payload.lines();
+        assert_eq!(
+            lines.next().unwrap(),
+            format!("2097152 hits, showing {SCAN_LIST_MAX}")
+        );
+        assert_eq!(lines.count(), SCAN_LIST_MAX);
+    }
+
+    #[test]
+    fn scan_rejects_bad_input() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        assert!(!c.execute(&mut sys, "scan start 3", false).ok);
+        assert!(!c.execute(&mut sys, "scan start 4 exact zz", false).ok);
+        // No session yet: a filter has nothing to narrow.
+        assert!(!c.execute(&mut sys, "scan filter changed", false).ok);
+        assert!(c.execute(&mut sys, "scan start 4 exact 1", false).ok);
+        assert!(!c.execute(&mut sys, "scan list -1", false).ok);
     }
 }

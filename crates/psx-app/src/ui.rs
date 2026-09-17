@@ -526,11 +526,7 @@ impl App {
                     .desired_width(80.0),
             );
         });
-        let value = self.scan_value.trim();
-        let parsed = match value.strip_prefix("0x") {
-            Some(hex) => u32::from_str_radix(hex, 16).ok(),
-            None => value.parse::<u32>().ok(),
-        };
+        let parsed = scan::parse_value(self.scan_value.trim());
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(parsed.is_some(), egui::Button::new("First scan"))
