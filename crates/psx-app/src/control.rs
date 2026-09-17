@@ -104,6 +104,68 @@ fn parse_addr(s: &str) -> Result<u32, String> {
     u32::from_str_radix(s.trim_start_matches("0x"), 16).map_err(|_| format!("bad address '{s}'"))
 }
 
+/// Largest reply a `peekb`/`peekm` will encode, per command (summed over
+/// ranges for `peekm`). Bounds the base64 line the client has to buffer.
+const PEEK_BYTES_MAX: u32 = 2 * 1024 * 1024;
+
+/// Standard base64 with `=` padding.
+fn base64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+        let n = (b0 as u32) << 16 | (b1 as u32) << 8 | b2 as u32;
+        out.push(ALPHABET[(n >> 18 & 0x3f) as usize] as char);
+        out.push(ALPHABET[(n >> 12 & 0x3f) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6 & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(n & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Inverse of [`base64_encode`], used only by the tests that round-trip it.
+#[cfg(test)]
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let s = s.trim_end_matches('=');
+    let mut bits: u32 = 0;
+    let mut nbits: u32 = 0;
+    let mut out = Vec::new();
+    for c in s.bytes() {
+        let v = ALPHABET.iter().position(|&a| a == c)? as u32;
+        bits = (bits << 6) | v;
+        nbits += 6;
+        if nbits >= 8 {
+            nbits -= 8;
+            out.push((bits >> nbits) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Read `len` bytes starting at `addr`, one `peek8` at a time, failing on
+/// the first byte that is not RAM/scratchpad/BIOS (base64 has no room for a
+/// per-byte "unmapped" marker).
+fn read_range(sys: &PsxSystem, addr: u32, len: u32) -> Result<Vec<u8>, String> {
+    (0..len)
+        .map(|i| {
+            let a = addr.wrapping_add(i);
+            sys.peek8(a)
+                .ok_or_else(|| format!("address {a:#010x} not readable"))
+        })
+        .collect()
+}
+
 /// Cycles allowed for the BIOS to reach the shell entry on `loadexe`. A
 /// retail image gets there in about 80 million; well past that means the
 /// image is not going to arrive, and the port must not wedge waiting.
@@ -325,6 +387,50 @@ impl Controller {
                 }
                 Reply::ok(out.trim_end().to_string())
             }
+            ("peekb", [addr, len]) => {
+                let (addr, len) = match (parse_addr(addr), len.parse::<u32>()) {
+                    (Ok(a), Ok(l)) if l > 0 && l <= PEEK_BYTES_MAX => (a, l),
+                    (Err(e), _) => return Reply::err(e),
+                    _ => return Reply::err(format!("bad length (1-{PEEK_BYTES_MAX})")),
+                };
+                match read_range(sys, addr, len) {
+                    Ok(bytes) => Reply::ok(base64_encode(&bytes)),
+                    Err(e) => Reply::err(e),
+                }
+            }
+            ("peekm", []) => Reply::err("peekm needs at least one <hexaddr>:<len>"),
+            ("peekm", ranges @ [_, ..]) => {
+                // Validate and size every range before reading any of them,
+                // so a bad range further down the list changes nothing.
+                let mut parsed = Vec::with_capacity(ranges.len());
+                let mut total: u64 = 0;
+                for r in ranges {
+                    let Some((addr, len)) = r.split_once(':') else {
+                        return Reply::err(format!("bad range '{r}' (want <hexaddr>:<len>)"));
+                    };
+                    let addr = match parse_addr(addr) {
+                        Ok(a) => a,
+                        Err(e) => return Reply::err(e),
+                    };
+                    let len: u32 = match len.parse() {
+                        Ok(l) if l > 0 => l,
+                        _ => return Reply::err(format!("bad length (1-{PEEK_BYTES_MAX})")),
+                    };
+                    total += len as u64;
+                    parsed.push((addr, len));
+                }
+                if total > PEEK_BYTES_MAX as u64 {
+                    return Reply::err(format!("bad length (max {PEEK_BYTES_MAX})"));
+                }
+                let mut lines = Vec::with_capacity(parsed.len());
+                for (addr, len) in parsed {
+                    match read_range(sys, addr, len) {
+                        Ok(bytes) => lines.push(base64_encode(&bytes)),
+                        Err(e) => return Reply::err(e),
+                    }
+                }
+                Reply::ok(lines.join("\n"))
+            }
             ("poke", [addr, hex]) => {
                 let addr = match parse_addr(addr) {
                     Ok(a) => a,
@@ -510,6 +616,11 @@ reset                 power-cycle: disc and memory card stay in, held buttons cl
 frame <path>          dump the latched display frame as BMP
 vram <path>           dump full 1024x512 VRAM as BMP
 peek <hexaddr> <len>  hex dump memory (side-effect-free, MMIO shows --)
+peekb <hexaddr> <len> memory as one base64 line (up to 2 MiB; err if any
+                      byte is not RAM/scratchpad/BIOS)
+peekm <hexaddr>:<len> ...
+                      one base64 line per range, 2 MiB in total, same rule
+                      as peekb
 poke <hexaddr> <hex>  write bytes to RAM/scratchpad
 disc open             open the drive lid (stops the drive, flags shell open)
 disc close [path]     close the lid, on a new image if given, else the old one
@@ -528,6 +639,11 @@ loadstate <path>|@<n>
 quit                  shut the emulator down
 ";
 
+/// Ceiling on the blocking reply write in [`ControlServer::pump`], so a
+/// client that never drains its socket gets dropped instead of wedging the
+/// emulator forever.
+const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// TCP transport: accepts one client at a time, reads newline-terminated
 /// commands, writes dot-terminated replies.
 pub struct ControlServer {
@@ -541,13 +657,20 @@ impl ControlServer {
     pub fn bind(port: u16) -> std::io::Result<Self> {
         let listener = TcpListener::bind(("127.0.0.1", port))?;
         listener.set_nonblocking(true)?;
-        info!("control port listening on {}", listener.local_addr()?);
-        Ok(Self {
+        let server = Self {
             listener,
             client: None,
             buf: Vec::new(),
             controller: Controller::default(),
-        })
+        };
+        info!("control port listening on {}", server.local_addr()?);
+        Ok(server)
+    }
+
+    /// Address the listener bound to (tests bind port 0 and read back the
+    /// assigned one).
+    pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        self.listener.local_addr()
     }
 
     /// Service the connection; executes at most one command per call.
@@ -602,10 +725,22 @@ impl ControlServer {
             out.push('\n');
         }
         out.push_str(".\n");
-        if let Some(stream) = &mut self.client
-            && stream.write_all(out.as_bytes()).is_err()
-        {
-            self.client = None;
+        // Blocking write: under lockstep the client is always reading its
+        // reply, so this costs nothing, and it is the only way a multi-MB
+        // reply (peekb/peekm/frameb) survives instead of hitting WouldBlock
+        // mid-write and dropping the client. A write timeout bounds the
+        // remaining risk, a client that connects and never reads its
+        // reply: instead of wedging the emulator forever, that client gets
+        // dropped after `WRITE_TIMEOUT`.
+        if let Some(stream) = &mut self.client {
+            stream.set_nonblocking(false).ok();
+            stream.set_write_timeout(Some(WRITE_TIMEOUT)).ok();
+            let sent = stream.write_all(out.as_bytes());
+            stream.set_write_timeout(None).ok();
+            stream.set_nonblocking(true).ok();
+            if sent.is_err() {
+                self.client = None;
+            }
         }
         !reply.quit
     }
@@ -885,6 +1020,110 @@ mod tests {
         assert!(!c.execute(&mut sys, "loadstate @4", false).ok);
         assert!(!c.execute(&mut sys, "savestate @16", false).ok);
         assert!(!c.execute(&mut sys, "savestate @x", false).ok);
+    }
+
+    #[test]
+    fn base64_round_trips() {
+        let cases: Vec<Vec<u8>> = vec![
+            vec![],
+            vec![0],
+            vec![0, 0],
+            vec![0xff; 3],
+            (0..1000).map(|i| (i % 251) as u8).collect(),
+        ];
+        for data in cases {
+            let encoded = base64_encode(&data);
+            assert_eq!(base64_decode(&encoded).unwrap(), data, "{encoded}");
+        }
+    }
+
+    #[test]
+    fn peekb_matches_peek_and_covers_all_of_ram() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        assert!(c.execute(&mut sys, "poke 80100000 deadbeef", false).ok);
+
+        let r = c.execute(&mut sys, "peekb 80100000 4", false);
+        assert!(r.ok, "{}", r.payload);
+        assert_eq!(
+            base64_decode(r.payload.trim()).unwrap(),
+            vec![0xde, 0xad, 0xbe, 0xef]
+        );
+
+        let r = c.execute(&mut sys, "peekb 80000000 2097152", false);
+        assert!(r.ok, "{}", r.payload);
+        assert_eq!(base64_decode(r.payload.trim()).unwrap(), sys.ram());
+
+        assert!(!c.execute(&mut sys, "peekb 80000000 2097153", false).ok);
+        assert!(!c.execute(&mut sys, "peekb 1f801800 4", false).ok);
+        // A zero-length reply would encode to an empty base64 line, which
+        // `payload.lines()` drops, breaking the one-line reply contract.
+        assert!(!c.execute(&mut sys, "peekb 80100000 0", false).ok);
+    }
+
+    #[test]
+    fn peekm_returns_one_line_per_range() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        assert!(c.execute(&mut sys, "poke 80100000 deadbeef", false).ok);
+
+        let r = c.execute(&mut sys, "peekm 80100000:4 bfc00000:2 1f800000:1", false);
+        assert!(r.ok, "{}", r.payload);
+        let lines: Vec<&str> = r.payload.lines().collect();
+        assert_eq!(lines.len(), 3, "{}", r.payload);
+        assert_eq!(base64_decode(lines[0]).unwrap().len(), 4);
+        assert_eq!(base64_decode(lines[1]).unwrap().len(), 2);
+        assert_eq!(base64_decode(lines[2]).unwrap().len(), 1);
+
+        assert!(!c.execute(&mut sys, "peekm", false).ok);
+        assert!(!c.execute(&mut sys, "peekm 1f801800:4", false).ok);
+        // Same zero-length rejection as peekb, for each range.
+        assert!(!c.execute(&mut sys, "peekm 80100000:0", false).ok);
+        assert!(!c.execute(&mut sys, "peekm 80100000:4 bfc00000:0", false).ok);
+    }
+
+    /// Regression for the nonblocking `write_all` that dropped the client
+    /// mid-reply: this fails against that version because the client sees
+    /// the connection close before the base64 line completes.
+    #[test]
+    fn a_full_ram_reply_reaches_the_client() {
+        use std::io::{BufRead, BufReader};
+        use std::net::TcpStream;
+        use std::time::{Duration, Instant};
+
+        let mut server = ControlServer::bind(0).unwrap();
+        let addr = server.local_addr().unwrap();
+        let mut sys = sys();
+
+        let handle = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            // A hang here (e.g. a regression in the transport) must fail
+            // the test rather than block the run indefinitely.
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            stream.write_all(b"peekb 80000000 2097152\n").unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            let mut payload = String::new();
+            loop {
+                line.clear();
+                let n = reader.read_line(&mut line).unwrap();
+                if n == 0 || line.trim_end() == "." {
+                    break;
+                }
+                if line.trim_end() != "ok" {
+                    payload.push_str(&line);
+                }
+            }
+            base64_decode(payload.trim_end()).unwrap().len()
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !handle.is_finished() {
+            assert!(Instant::now() < deadline, "pump loop did not finish");
+            server.pump(&mut sys, false);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(handle.join().unwrap(), 2 * 1024 * 1024);
     }
 
     #[test]

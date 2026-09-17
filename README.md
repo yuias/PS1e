@@ -171,6 +171,8 @@ psxctl reset                  # power-cycle; disc and memory card stay in
 psxctl frame shot.bmp         # dump the current display frame
 psxctl vram vram.bmp          # dump the full 1024x512 VRAM
 psxctl peek 801ffc38 64       # hex dump memory (side-effect-free)
+psxctl peekb 80000000 2097152 # whole RAM as base64
+psxctl peekm 80100000:4 bfc00000:2  # several ranges, one base64 line each
 psxctl poke 80100000 deadbeef # write RAM
 psxctl disc open              # open the drive lid
 psxctl disc close game.cue    # close it on a new image (or bare: the old one)
