@@ -22,7 +22,7 @@ Produces `ps1e` (emulator) and `psxctl` (automation client) in
 ## Run
 
 ```
-ps1e [--bios <path>] [--disc <image>]
+ps1e [--bios <path>] [--disc <image>] [--memcard <path>]
 ```
 
 A disc image is either a `.cue` sheet or a raw image of 2352-byte sectors
@@ -129,6 +129,7 @@ count, audio and CD statistics). Useful flags:
 | `--dump-wav <p>` | Write captured audio as WAV |
 | `--log-gpu` | Decode every GP0/GP1 command to the log |
 | `--peek <hex>` | Hex dump 96 bytes of RAM at the end of the run |
+| `--memcard <p>` | Use this memory card image instead of the config's (created if missing); `none` inserts a blank card with no file behind it |
 
 ## Debugger (LLDB / GDB)
 

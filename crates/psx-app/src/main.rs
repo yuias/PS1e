@@ -51,6 +51,9 @@ struct Args {
     wait_debugger: bool,
     /// Lockstep control port for interactive automation (headless only).
     control_port: Option<u16>,
+    /// Memory card image overriding the config (`none`: a blank card that
+    /// never touches the filesystem, headless only).
+    memcard: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -69,6 +72,7 @@ fn parse_args() -> Args {
         debug_port: None,
         wait_debugger: false,
         control_port: None,
+        memcard: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -94,6 +98,9 @@ fn parse_args() -> Args {
             "--input" => args.input = Some(it.next().expect("--input needs a path")),
             "--bios" => args.bios = Some(it.next().expect("--bios needs a path")),
             "--disc" => args.disc = Some(it.next().expect("--disc needs a path")),
+            "--memcard" => {
+                args.memcard = Some(it.next().expect("--memcard needs a path or `none`"))
+            }
             "--cycles" => {
                 args.cycles = it
                     .next()
@@ -167,22 +174,37 @@ fn main() -> eframe::Result {
         }
     }
 
-    // Memory card: load the image, or create a freshly formatted one
-    let memcard_path = cfg.memcard_path(cfg_path.as_ref());
-    match std::fs::read(&memcard_path) {
-        Ok(data) if data.len() == psx_core::memcard::CARD_SIZE => {
+    // Memory card: load the image, or create a freshly formatted one. With
+    // `--memcard none` the card is blank and never read from or written to
+    // disk, so scripted runs see no saves regardless of the user's card.
+    let blank_card = args.memcard.as_deref() == Some("none");
+    if blank_card && !args.headless {
+        eprintln!("--memcard none requires --headless (the GUI saves the card to a file)");
+        std::process::exit(2);
+    }
+    let memcard_path = args
+        .memcard
+        .clone()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| cfg.memcard_path(cfg_path.as_ref()));
+    match (!blank_card).then(|| std::fs::read(&memcard_path)) {
+        None => {
+            sys.set_memcard(psx_core::memcard::MemCard::new());
+            tracing::info!("memory card: blank, not backed by a file");
+        }
+        Some(Ok(data)) if data.len() == psx_core::memcard::CARD_SIZE => {
             sys.set_memcard(psx_core::memcard::MemCard::with_data(
                 data.into_boxed_slice(),
             ));
             tracing::info!("memory card: {}", memcard_path.display());
         }
-        Ok(_) => {
+        Some(Ok(_)) => {
             tracing::error!(
                 "memory card {} has wrong size; using a fresh card (not saved over it)",
                 memcard_path.display()
             );
         }
-        Err(_) => {
+        Some(Err(_)) => {
             if let Some(dir) = memcard_path.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
