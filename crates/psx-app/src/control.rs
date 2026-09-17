@@ -3,7 +3,9 @@
 //! Designed for LLM/script operators: a line-based text protocol over TCP
 //! where the emulator runs in *lockstep* — it only advances when a `run` or
 //! `press` command says so, making every observation deterministic and
-//! repeatable. One command per line; the reply is `ok`/`err <msg>` followed
+//! repeatable. Duration arguments take an `s` (seconds), `c` (cycles) or
+//! `v` (whole vblanks, stopping right after the edge) suffix, or default to
+//! frames. One command per line; the reply is `ok`/`err <msg>` followed
 //! by payload lines, terminated by a single `.` line (payload lines starting
 //! with `.` are dot-stuffed, SMTP-style).
 //!
@@ -86,8 +88,24 @@ fn parse_buttons(s: &str) -> Result<u16, String> {
     })
 }
 
-/// Parse `10` (frames), `2s` (seconds) or `50000c` (cycles) into cycles.
-fn parse_duration(s: &str) -> Result<u64, String> {
+/// How far a `run`-style command advances.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunLength {
+    Cycles(u64),
+    /// Whole vblanks; the machine stops right after the edge.
+    Vblanks(u64),
+}
+
+/// Parse `10` (frames), `2s`, `50000c` or `3v` (vblanks; integer >= 1).
+fn parse_duration(s: &str) -> Result<RunLength, String> {
+    if let Some(num) = s.strip_suffix('v') {
+        // Vblanks are a whole-edge unit, not a fraction of a field, so this
+        // parses as an integer rather than sharing the f64 path below.
+        return match num.parse::<u64>() {
+            Ok(n) if n >= 1 => Ok(RunLength::Vblanks(n)),
+            _ => Err(format!("bad duration '{s}'")),
+        };
+    }
     let (num, unit) = match s.chars().last() {
         Some('s') => (&s[..s.len() - 1], CPU_CLOCK_HZ),
         Some('c') => (&s[..s.len() - 1], 1),
@@ -97,7 +115,7 @@ fn parse_duration(s: &str) -> Result<u64, String> {
     if !n.is_finite() || n <= 0.0 {
         return Err(format!("bad duration '{s}'"));
     }
-    Ok((n * unit as f64) as u64)
+    Ok(RunLength::Cycles((n * unit as f64) as u64))
 }
 
 fn parse_addr(s: &str) -> Result<u32, String> {
@@ -263,11 +281,22 @@ impl Controller {
         }
     }
 
-    /// Advance emulation, keeping the held-button state applied.
-    fn advance(&mut self, sys: &mut PsxSystem, cycles: u64) {
+    /// Advance emulation, keeping the held-button state applied; returns
+    /// cycles elapsed.
+    fn advance(&mut self, sys: &mut PsxSystem, len: RunLength) -> u64 {
         sys.set_buttons(self.held);
-        sys.run_cycles(cycles);
-        self.frames_run += cycles / CYCLES_PER_FRAME;
+        let before = sys.cycles();
+        match len {
+            RunLength::Cycles(cycles) => {
+                sys.run_cycles(cycles);
+                self.frames_run += cycles / CYCLES_PER_FRAME;
+            }
+            RunLength::Vblanks(n) => {
+                sys.run_vblanks(n);
+                self.frames_run = self.frames_run.saturating_add(n);
+            }
+        }
+        sys.cycles() - before
     }
 
     /// Read a PS-X EXE and hand it to the machine, optionally booting the
@@ -317,11 +346,15 @@ impl Controller {
             ("help", _) => Reply::ok(HELP.trim_end()),
             ("state", _) => {
                 let frame = &sys.gpu().frame;
+                let video = if sys.gpu().is_pal() { "PAL" } else { "NTSC" };
+                let field_hz =
+                    CPU_CLOCK_HZ as f64 / sys.gpu().video_timing().cycles_per_frame() as f64;
                 Reply::ok(format!(
-                    "pc={:#010x} cycles={} frames={} held={} display={}x{}{}",
+                    "pc={:#010x} cycles={} frames={} vblanks={} video={video} field_hz={field_hz:.2} held={} display={}x{}{}",
                     sys.cpu.pc,
                     sys.cycles(),
                     self.frames_run,
+                    sys.vblanks(),
                     buttons_to_names(self.held),
                     frame.width,
                     frame.height,
@@ -329,17 +362,25 @@ impl Controller {
                 ))
             }
             ("run", [dur]) => match parse_duration(dur) {
-                Ok(cycles) => {
-                    self.advance(sys, cycles);
+                Ok(len @ RunLength::Cycles(cycles)) => {
+                    self.advance(sys, len);
                     Reply::ok(format!("ran {cycles} cycles, pc={:#010x}", sys.cpu.pc))
+                }
+                Ok(len @ RunLength::Vblanks(n)) => {
+                    let cycles = self.advance(sys, len);
+                    Reply::ok(format!(
+                        "ran {n} vblanks ({cycles} cycles), vblanks={}, pc={:#010x}",
+                        sys.vblanks(),
+                        sys.cpu.pc
+                    ))
                 }
                 Err(e) => Reply::err(e),
             },
             ("press", [buttons, dur]) => match (parse_buttons(buttons), parse_duration(dur)) {
-                (Ok(mask), Ok(cycles)) => {
+                (Ok(mask), Ok(len)) => {
                     let prev = self.held;
                     self.held |= mask;
-                    self.advance(sys, cycles);
+                    let cycles = self.advance(sys, len);
                     self.held = prev;
                     sys.set_buttons(self.held);
                     Reply::ok(format!(
@@ -636,9 +677,12 @@ impl Controller {
 }
 
 const HELP: &str = "\
-state                 pc, cycles, frames run, held buttons, display mode
-run <n>[s|c]          advance n frames (s=seconds, c=cycles), inputs held
-press <BTN+BTN> <n>   hold buttons for n frames on top of held set, release
+state                 pc, cycles, frames run, vblanks, video standard and
+                      field rate, held buttons, display mode
+run <n>[s|c|v]        advance n frames (s=seconds, c=cycles, v=vblanks:
+                      stop right after the edge), inputs held
+press <BTN+BTN> <n>[s|c|v]
+                      hold buttons for n frames on top of held set, release
 input set <BTN+BTN>   hold buttons until changed (applied during run)
 input clear           release all held buttons
 reset                 power-cycle: disc and memory card stay in, held buttons cleared
@@ -810,6 +854,26 @@ mod tests {
         0x0000_0000, // nop
     ];
 
+    /// GP1(08h) with the PAL bit, then spin.
+    const PAL_PROGRAM: [u32; 7] = [
+        0x3c08_1f80, // lui   $t0, 0x1f80
+        0x3508_1814, // ori   $t0, $t0, 0x1814      GP1
+        0x3c09_0800, // lui   $t1, 0x0800
+        0x3529_0008, // ori   $t1, $t1, 0x0008      display mode 320x240, PAL
+        0xad09_0000, // sw    $t1, 0($t0)
+        0x0800_4005, // loop: j loop                (0x80010014)
+        0x0000_0000, // nop
+    ];
+
+    /// Cost of one uncached nop from KSEG1 with the reset-value bus delays:
+    /// the most a single instruction can overshoot a vblank deadline by,
+    /// since the step that crosses it always completes first.
+    fn measure_slack() -> u64 {
+        let mut probe = sys();
+        probe.step();
+        probe.cycles()
+    }
+
     #[test]
     fn run_advances_by_frames() {
         let (mut sys, mut c) = (sys(), Controller::default());
@@ -824,6 +888,46 @@ mod tests {
     }
 
     #[test]
+    fn run_v_advances_exactly_one_vblank() {
+        let slack = measure_slack();
+        let (mut sys, mut c) = (sys(), Controller::default());
+        assert!(c.execute(&mut sys, "run 1v", false).ok);
+        assert_eq!(sys.vblanks(), 1);
+
+        let before = sys.cycles();
+        assert!(c.execute(&mut sys, "run 1v", false).ok);
+        assert_eq!(sys.vblanks(), 2);
+        let cpf = psx_core::gpu::VideoTiming::NTSC.cycles_per_frame();
+        let delta = sys.cycles() - before;
+        assert!(cpf <= delta && delta < cpf + slack, "delta={delta}");
+
+        let r = c.execute(&mut sys, "state", false);
+        assert!(r.payload.contains("vblanks=2"), "{}", r.payload);
+        assert!(r.payload.contains("video=NTSC"), "{}", r.payload);
+        assert!(r.payload.contains("field_hz=59.81"), "{}", r.payload);
+        assert!(r.payload.contains("frames=2"), "{}", r.payload);
+    }
+
+    #[test]
+    fn run_v_follows_pal_timing() {
+        let slack = measure_slack();
+        let (mut sys, mut c) = (sys(), Controller::default());
+        load_program(&mut sys, &PAL_PROGRAM);
+
+        // This vblank was scheduled with NTSC timing before the mode write.
+        assert!(c.execute(&mut sys, "run 1v", false).ok);
+        let before = sys.cycles();
+        assert!(c.execute(&mut sys, "run 1v", false).ok);
+        let pal_cpf = psx_core::gpu::VideoTiming::PAL.cycles_per_frame();
+        let delta = sys.cycles() - before;
+        assert!(pal_cpf <= delta && delta < pal_cpf + slack, "delta={delta}");
+
+        let r = c.execute(&mut sys, "state", false);
+        assert!(r.payload.contains("video=PAL"), "{}", r.payload);
+        assert!(r.payload.contains("field_hz=49.75"), "{}", r.payload);
+    }
+
+    #[test]
     fn press_restores_held_set() {
         let (mut sys, mut c) = (sys(), Controller::default());
         assert!(c.execute(&mut sys, "input set UP", false).ok);
@@ -833,6 +937,16 @@ mod tests {
         assert_eq!(sys.sio().buttons, psx_core::sio::button::UP);
         assert!(c.execute(&mut sys, "input clear", false).ok);
         assert_eq!(sys.sio().buttons, 0);
+    }
+
+    #[test]
+    fn press_accepts_vblank_lengths() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        assert!(c.execute(&mut sys, "input set UP", false).ok);
+        let r = c.execute(&mut sys, "press CROSS 1v", false);
+        assert!(r.ok, "{}", r.payload);
+        assert_eq!(sys.vblanks(), 1);
+        assert_eq!(sys.sio().buttons, psx_core::sio::button::UP);
     }
 
     #[test]
@@ -946,6 +1060,9 @@ mod tests {
         assert!(!c.execute(&mut sys, "dance", false).ok);
         assert!(!c.execute(&mut sys, "run zero", false).ok);
         assert!(!c.execute(&mut sys, "run -5", false).ok);
+        assert!(!c.execute(&mut sys, "run 0v", false).ok);
+        assert!(!c.execute(&mut sys, "run 1.5v", false).ok);
+        assert!(!c.execute(&mut sys, "run v", false).ok);
         assert!(!c.execute(&mut sys, "press NOPE 1", false).ok);
         assert!(!c.execute(&mut sys, "peek xyz 4", false).ok);
     }

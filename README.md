@@ -164,6 +164,7 @@ over TCP:
 
 ```
 psxctl run 20s                # advance (frames by default; s/c suffixes)
+psxctl run 3v                 # exactly three vblanks; state shows vblanks= and video=
 psxctl press START 30         # hold buttons for 30 frames, then release
 psxctl input set UP           # hold until changed; applied during run
 psxctl input clear            # release everything held
