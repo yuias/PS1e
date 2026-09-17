@@ -205,6 +205,61 @@ fn read_range(sys: &PsxSystem, addr: u32, len: u32) -> Result<Vec<u8>, String> {
         .collect()
 }
 
+/// Read a little-endian value of `width` bytes (1, 2 or 4) at `addr`, for
+/// `until`. Reachability rule and error text match `peekb`.
+fn read_value(sys: &PsxSystem, addr: u32, width: u8) -> Result<u32, String> {
+    let bytes = read_range(sys, addr, width as u32)?;
+    Ok(bytes
+        .iter()
+        .rev()
+        .fold(0u32, |acc, &b| (acc << 8) | b as u32))
+}
+
+/// Condition an `until` command waits for, checked against the value at its
+/// address.
+enum UntilCond {
+    Eq(u32),
+    Ne(u32),
+    /// Compares against the value read when the command started.
+    Changed,
+}
+
+/// Parse the condition, its optional value and the trailing `max <n>[..]` of
+/// an `until` command. `width` masks the value the same way memory is read,
+/// so e.g. `eq 0x163` on a 1-byte read compares against `0x63`.
+fn parse_until(cond: &str, tail: &[&str], width: u8) -> Result<(UntilCond, RunLength), String> {
+    let mask: u32 = match width {
+        1 => 0xff,
+        2 => 0xffff,
+        _ => u32::MAX,
+    };
+    let (parsed, rest) = match cond {
+        "eq" | "ne" => match tail {
+            [] | ["max", ..] => return Err("eq/ne need a value".into()),
+            [value, rest @ ..] => {
+                let v = crate::scan::parse_value(value)
+                    .ok_or_else(|| format!("bad value '{value}'"))?
+                    & mask;
+                let c = if cond == "eq" {
+                    UntilCond::Eq(v)
+                } else {
+                    UntilCond::Ne(v)
+                };
+                (c, rest)
+            }
+        },
+        "changed" => match tail {
+            [] | ["max", ..] => (UntilCond::Changed, tail),
+            _ => return Err("changed takes no value".into()),
+        },
+        _ => return Err(format!("bad condition '{cond}'")),
+    };
+    match rest {
+        ["max", dur] => Ok((parsed, parse_duration(dur)?)),
+        _ => Err("until needs `max <n>[s|c|v]`".into()),
+    }
+}
+
 /// Encode top-down RGB24 pixels as a PNG, for `frameb png`.
 fn encode_png(out: &mut Vec<u8>, w: u32, h: u32, rgb: &[u8]) -> Result<(), png::EncodingError> {
     let mut encoder = png::Encoder::new(out, w, h);
@@ -398,7 +453,7 @@ impl Controller {
         if debugger_owns
             && matches!(
                 cmd,
-                "run" | "press" | "loadstate" | "loadexe" | "reset" | "seq"
+                "run" | "press" | "loadstate" | "loadexe" | "reset" | "seq" | "until"
             )
         {
             return Reply::err("debugger attached; execution is owned by the debugger");
@@ -476,6 +531,54 @@ impl Controller {
                     sys.cpu.pc
                 ))
             }
+            ("until", [addr, width, cond, tail @ ..]) => {
+                let addr = match parse_addr(addr) {
+                    Ok(a) => a,
+                    Err(e) => return Reply::err(e),
+                };
+                let width = match parse_scan_width(width) {
+                    Ok(w) => w,
+                    Err(e) => return Reply::err(e),
+                };
+                let (cond, max) = match parse_until(cond, tail, width) {
+                    Ok(x) => x,
+                    Err(e) => return Reply::err(e),
+                };
+                let baseline = match read_value(sys, addr, width) {
+                    Ok(v) => v,
+                    Err(e) => return Reply::err(e),
+                };
+                sys.set_buttons(self.held);
+                let holds = |v: u32| match cond {
+                    UntilCond::Eq(target) => v == target,
+                    UntilCond::Ne(target) => v != target,
+                    UntilCond::Changed => v != baseline,
+                };
+                let (mut vblanks, mut cycles, mut value) = (0u64, 0u64, baseline);
+                let met = loop {
+                    if holds(value) {
+                        break true;
+                    }
+                    let budget_spent = match max {
+                        RunLength::Vblanks(n) => vblanks >= n,
+                        RunLength::Cycles(budget) => cycles >= budget,
+                    };
+                    if budget_spent {
+                        break false;
+                    }
+                    cycles = cycles.saturating_add(self.advance(sys, RunLength::Vblanks(1)));
+                    vblanks = vblanks.saturating_add(1);
+                    value = match read_value(sys, addr, width) {
+                        Ok(v) => v,
+                        Err(e) => return Reply::err(e),
+                    };
+                };
+                let status = if met { "met" } else { "timeout" };
+                Reply::ok(format!(
+                    "{status} after {vblanks} vblanks ({cycles} cycles), value={value:#x}"
+                ))
+            }
+            ("until", _) => Reply::err("until needs `max <n>[s|c|v]`"),
             ("input", ["set", buttons]) => match parse_buttons(buttons) {
                 Ok(mask) => {
                     self.held = mask;
@@ -845,6 +948,9 @@ press <BTN+BTN> <n>[s|c|v]
 seq <BTN+BTN|none>:<n>[s|c|v] ...
                       hold each set for its span in turn (exact set per
                       segment), then restore the held set
+until <hexaddr> <1|2|4> <eq|ne|changed> [<value>] max <n>[s|c|v]
+                      run until the value matches (checked at each vblank)
+                      or max elapses; reply starts with met/timeout
 input set <BTN+BTN>   hold buttons until changed (applied during run)
 input clear           release all held buttons
 reset                 power-cycle: disc and memory card stay in, held buttons cleared
@@ -1822,5 +1928,102 @@ mod tests {
     fn seq_is_refused_while_the_debugger_owns_execution() {
         let (mut sys, mut c) = (sys(), Controller::default());
         assert!(!c.execute(&mut sys, "seq CROSS:1", true).ok);
+    }
+
+    #[test]
+    fn until_meets_a_condition_written_at_vblank() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        sys.set_cheats(psx_core::cheats::CheatList::parse(
+            "[*Health]
+80100000 0063
+",
+        ));
+
+        let r = c.execute(&mut sys, "until 80100000 1 eq 0x63 max 5v", false);
+        assert!(r.ok, "{}", r.payload);
+        assert!(
+            r.payload.starts_with("met after 1 vblanks"),
+            "{}",
+            r.payload
+        );
+        assert_eq!(sys.vblanks(), 1);
+
+        // Already at 99 (0x63): no vblank needed to reach it.
+        let r = c.execute(&mut sys, "until 80100000 1 eq 99 max 5v", false);
+        assert!(r.ok, "{}", r.payload);
+        assert!(
+            r.payload.starts_with("met after 0 vblanks"),
+            "{}",
+            r.payload
+        );
+    }
+
+    #[test]
+    fn until_changed_meets_a_condition_written_at_vblank() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        sys.set_cheats(psx_core::cheats::CheatList::parse(
+            "[*Health]
+80100000 0063
+",
+        ));
+
+        let r = c.execute(&mut sys, "until 80100000 1 changed max 5v", false);
+        assert!(r.ok, "{}", r.payload);
+        assert!(
+            r.payload.starts_with("met after 1 vblanks"),
+            "{}",
+            r.payload
+        );
+    }
+
+    #[test]
+    fn until_times_out() {
+        {
+            let (mut sys, mut c) = (sys(), Controller::default());
+            let r = c.execute(&mut sys, "until 80100000 1 changed max 2", false);
+            assert!(r.ok, "{}", r.payload);
+            assert!(
+                r.payload.starts_with("timeout after 2 vblanks"),
+                "{}",
+                r.payload
+            );
+        }
+
+        let (mut sys, mut c) = (sys(), Controller::default());
+        let r = c.execute(&mut sys, "until 80100000 4 ne 0 max 1v", false);
+        assert!(r.ok, "{}", r.payload);
+        assert!(
+            r.payload.starts_with("timeout after 1 vblanks"),
+            "{}",
+            r.payload
+        );
+    }
+
+    #[test]
+    fn until_rejects_bad_input() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        let before = sys.cycles();
+        assert!(!c.execute(&mut sys, "until 80100000 1 changed", false).ok);
+        assert!(!c.execute(&mut sys, "until 80100000 1 eq max 5v", false).ok);
+        assert!(
+            !c.execute(&mut sys, "until 80100000 1 changed 5 max 10", false)
+                .ok
+        );
+        assert!(
+            !c.execute(&mut sys, "until 80100000 3 eq 5 max 10", false)
+                .ok
+        );
+        // Set the wire state directly (bypassing `self.held`) so a bug that
+        // applies the held set before validating the address would show up
+        // as a changed `buttons` even though the command never advanced.
+        sys.set_buttons(psx_core::sio::button::CROSS);
+        assert!(
+            !c.execute(&mut sys, "until 1f801800 1 eq 5 max 10", false)
+                .ok
+        );
+        assert_eq!(sys.sio().buttons, psx_core::sio::button::CROSS);
+        assert_eq!(sys.cycles(), before);
+
+        assert!(!c.execute(&mut sys, "until 80100000 1 eq 1 max 1v", true).ok);
     }
 }
