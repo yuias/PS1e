@@ -422,6 +422,20 @@ impl PsxSystem {
         }
     }
 
+    /// Run until `n` more vblanks have fired, stopping right after the edge
+    /// (the instruction whose event pop raised it has completed).
+    pub fn run_vblanks(&mut self, n: u64) {
+        let target = self.bus.gpu.frame_count.saturating_add(n);
+        while self.bus.gpu.frame_count < target {
+            self.step();
+        }
+    }
+
+    /// Vblanks since reset: the GPU's frame counter.
+    pub fn vblanks(&self) -> u64 {
+        self.bus.gpu.frame_count
+    }
+
     fn handle_event(&mut self, event: EventKind) {
         if event == EventKind::VBlank {
             let timing = self.bus.gpu.video_timing();
@@ -528,6 +542,24 @@ mod tests {
         assert_ambient_intact(&sys);
         assert_eq!(sys.cycles(), 0);
         assert_eq!(sys.cpu.pc, 0xbfc0_0000);
+    }
+
+    #[test]
+    fn run_vblanks_stops_right_after_each_edge() {
+        let mut probe = PsxSystem::new(vec![0; bus::BIOS_SIZE]).unwrap();
+        probe.step();
+        let slack = probe.cycles();
+
+        let mut sys = PsxSystem::new(vec![0; bus::BIOS_SIZE]).unwrap();
+        sys.run_vblanks(1);
+        assert_eq!(sys.vblanks(), 1);
+        assert!(CYCLES_PER_FRAME <= sys.cycles() && sys.cycles() < CYCLES_PER_FRAME + slack);
+
+        let before = sys.cycles();
+        sys.run_vblanks(1);
+        assert_eq!(sys.vblanks(), 2);
+        let delta = sys.cycles() - before;
+        assert!(CYCLES_PER_FRAME <= delta && delta < CYCLES_PER_FRAME + slack);
     }
 
     #[test]

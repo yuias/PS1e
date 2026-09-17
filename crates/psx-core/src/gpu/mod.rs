@@ -319,6 +319,11 @@ impl Gpu {
         !self.display_disabled
     }
 
+    /// Whether the display mode (GP1(08h) bit 3) selects PAL timing.
+    pub fn is_pal(&self) -> bool {
+        self.pal_mode
+    }
+
     /// Video timing for the current display mode: region-dependent field
     /// geometry, refined by the configured display window and horizontal
     /// resolution. A degenerate window (some titles leave one zeroed)
