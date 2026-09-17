@@ -167,6 +167,7 @@ psxctl run 20s                # advance (frames by default; s/c suffixes)
 psxctl press START 30         # hold buttons for 30 frames, then release
 psxctl input set UP           # hold until changed; applied during run
 psxctl input clear            # release everything held
+psxctl reset                  # power-cycle; disc and memory card stay in
 psxctl frame shot.bmp         # dump the current display frame
 psxctl vram vram.bmp          # dump the full 1024x512 VRAM
 psxctl peek 801ffc38 64       # hex dump memory (side-effect-free)

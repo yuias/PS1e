@@ -215,7 +215,7 @@ impl Controller {
         let args: Vec<&str> = words.collect();
         // The debugger and the control port must not both drive execution
         // (loadstate mutates it just as much as running does).
-        if debugger_owns && matches!(cmd, "run" | "press" | "loadstate" | "loadexe") {
+        if debugger_owns && matches!(cmd, "run" | "press" | "loadstate" | "loadexe" | "reset") {
             return Reply::err("debugger attached; execution is owned by the debugger");
         }
         match (cmd, args.as_slice()) {
@@ -266,6 +266,17 @@ impl Controller {
                 self.held = 0;
                 sys.set_buttons(0);
                 Reply::ok("holding none")
+            }
+            // Power-cycle: `PsxSystem::reset` keeps disc, memory card, BIOS,
+            // TTY and cheats (they are ambient), but held buttons are the
+            // control port's own state and must not survive into the fresh
+            // machine.
+            ("reset", []) => {
+                sys.reset();
+                self.held = 0;
+                sys.set_buttons(0);
+                self.frames_run = 0;
+                Reply::ok(format!("reset, pc={:#010x}", sys.cpu.pc))
             }
             ("peek", [addr, len]) => {
                 let (addr, len) = match (parse_addr(addr), len.parse::<u32>()) {
@@ -449,6 +460,7 @@ run <n>[s|c]          advance n frames (s=seconds, c=cycles), inputs held
 press <BTN+BTN> <n>   hold buttons for n frames on top of held set, release
 input set <BTN+BTN>   hold buttons until changed (applied during run)
 input clear           release all held buttons
+reset                 power-cycle: disc and memory card stay in, held buttons cleared
 frame <path>          dump the latched display frame as BMP
 vram <path>           dump full 1024x512 VRAM as BMP
 peek <hexaddr> <len>  hex dump memory (side-effect-free, MMIO shows --)
@@ -656,6 +668,27 @@ mod tests {
         let (mut sys, mut c) = (sys(), Controller::default());
         assert!(!c.execute(&mut sys, "run 1", true).ok);
         assert!(c.execute(&mut sys, "peek 80000000 4", true).ok); // observation is fine
+    }
+
+    #[test]
+    fn reset_restarts_the_machine_and_clears_held_buttons() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        assert!(c.execute(&mut sys, "input set UP", false).ok);
+        assert!(c.execute(&mut sys, "run 2", false).ok);
+        let r = c.execute(&mut sys, "reset", false);
+        assert!(r.ok, "{}", r.payload);
+        assert_eq!(sys.cycles(), 0);
+        assert_eq!(sys.cpu.pc, 0xbfc0_0000);
+        assert_eq!(sys.sio().buttons, 0);
+        let r = c.execute(&mut sys, "state", false);
+        assert!(r.payload.contains("frames=0"), "{}", r.payload);
+        assert!(r.payload.contains("held=none"), "{}", r.payload);
+    }
+
+    #[test]
+    fn reset_is_refused_while_the_debugger_owns_execution() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        assert!(!c.execute(&mut sys, "reset", true).ok);
     }
 
     #[test]
