@@ -118,6 +118,19 @@ fn parse_duration(s: &str) -> Result<RunLength, String> {
     Ok(RunLength::Cycles((n * unit as f64) as u64))
 }
 
+/// Parse one `seq` segment: `BTN+BTN:<n>[s|c|v]` or `none:<n>[s|c|v]`.
+fn parse_segment(s: &str) -> Result<(u16, RunLength), String> {
+    let bad = || format!("bad segment '{s}' (want BTN+BTN:<n>[s|c|v] or none:<n>[s|c|v])");
+    let (buttons, dur) = s.rsplit_once(':').ok_or_else(bad)?;
+    let mask = if buttons == "none" {
+        0
+    } else {
+        parse_buttons(buttons).map_err(|_| bad())?
+    };
+    let len = parse_duration(dur).map_err(|_| bad())?;
+    Ok((mask, len))
+}
+
 fn parse_addr(s: &str) -> Result<u32, String> {
     u32::from_str_radix(s.trim_start_matches("0x"), 16).map_err(|_| format!("bad address '{s}'"))
 }
@@ -382,7 +395,12 @@ impl Controller {
         let args: Vec<&str> = words.collect();
         // The debugger and the control port must not both drive execution
         // (loadstate mutates it just as much as running does).
-        if debugger_owns && matches!(cmd, "run" | "press" | "loadstate" | "loadexe" | "reset") {
+        if debugger_owns
+            && matches!(
+                cmd,
+                "run" | "press" | "loadstate" | "loadexe" | "reset" | "seq"
+            )
+        {
             return Reply::err("debugger attached; execution is owned by the debugger");
         }
         match (cmd, args.as_slice()) {
@@ -433,6 +451,31 @@ impl Controller {
                 }
                 (Err(e), _) | (_, Err(e)) => Reply::err(e),
             },
+            ("seq", []) => Reply::err("seq needs at least one segment"),
+            ("seq", segs @ [_, ..]) => {
+                // Parse every segment before advancing anything, so a bad
+                // one further down the list changes nothing.
+                let mut parsed = Vec::with_capacity(segs.len());
+                for s in segs {
+                    match parse_segment(s) {
+                        Ok(seg) => parsed.push(seg),
+                        Err(e) => return Reply::err(e),
+                    }
+                }
+                let prev = self.held;
+                let mut cycles = 0;
+                for (mask, len) in parsed {
+                    self.held = mask;
+                    cycles += self.advance(sys, len);
+                }
+                self.held = prev;
+                sys.set_buttons(prev);
+                Reply::ok(format!(
+                    "ran {} segments in {cycles} cycles, pc={:#010x}",
+                    segs.len(),
+                    sys.cpu.pc
+                ))
+            }
             ("input", ["set", buttons]) => match parse_buttons(buttons) {
                 Ok(mask) => {
                     self.held = mask;
@@ -799,6 +842,9 @@ run <n>[s|c|v]        advance n frames (s=seconds, c=cycles, v=vblanks:
                       stop right after the edge), inputs held
 press <BTN+BTN> <n>[s|c|v]
                       hold buttons for n frames on top of held set, release
+seq <BTN+BTN|none>:<n>[s|c|v] ...
+                      hold each set for its span in turn (exact set per
+                      segment), then restore the held set
 input set <BTN+BTN>   hold buttons until changed (applied during run)
 input clear           release all held buttons
 reset                 power-cycle: disc and memory card stay in, held buttons cleared
@@ -988,6 +1034,41 @@ mod tests {
         0xad09_0000, // sw    $t1, 0($t0)
         0x0800_4005, // loop: j loop                (0x80010014)
         0x0000_0000, // nop
+    ];
+
+    /// Poll the digital pad in a loop; append the 16-bit wire word to
+    /// `0x80100000` whenever it changes (active-low, little-endian, so
+    /// CROSS held = `0xbfff`, nothing = `0xffff`).
+    const PAD_LOGGER: [u32; 29] = [
+        0x3c08_1f80, //  0 lui   $t0, 0x1f80
+        0x3508_1040, //  1 ori   $t0, $t0, 0x1040   JOY_DATA; JOY_CTRL is +0xa
+        0x3c0a_8010, //  2 lui   $t2, 0x8010        record pointer 0x80100000
+        0x240b_ffff, //  3 addiu $t3, $zero, -1     prev = nothing seen yet
+        0x2409_1003, //  4 loop: addiu $t1, $zero, 0x1003
+        0xa509_000a, //  5 sh    $t1, 0xa($t0)      TX enable, /JOY1 select, ACK irq
+        0x2409_0001, //  6 addiu $t1, $zero, 0x01
+        0xa109_0000, //  7 sb    $t1, 0($t0)        01: address the pad
+        0x910e_0000, //  8 lbu   $t6, 0($t0)        ff (discarded)
+        0x2409_0042, //  9 addiu $t1, $zero, 0x42
+        0xa109_0000, // 10 sb    $t1, 0($t0)        42: read buttons
+        0x910e_0000, // 11 lbu   $t6, 0($t0)        41
+        0xa100_0000, // 12 sb    $zero, 0($t0)
+        0x910e_0000, // 13 lbu   $t6, 0($t0)        5a
+        0xa100_0000, // 14 sb    $zero, 0($t0)
+        0x910c_0000, // 15 lbu   $t4, 0($t0)        buttons lo
+        0xa100_0000, // 16 sb    $zero, 0($t0)
+        0x910d_0000, // 17 lbu   $t5, 0($t0)        buttons hi
+        0x0000_0000, // 18 nop                      load delay slot
+        0x000d_6a00, // 19 sll   $t5, $t5, 8
+        0x018d_6025, // 20 or    $t4, $t4, $t5
+        0xa500_000a, // 21 sh    $zero, 0xa($t0)    deselect: ends the transaction
+        0x118b_ffed, // 22 beq   $t4, $t3, loop     unchanged: poll again
+        0x0000_0000, // 23 nop
+        0xa54c_0000, // 24 sh    $t4, 0($t2)        record the new word
+        0x254a_0002, // 25 addiu $t2, $t2, 2
+        0x0180_5821, // 26 addu  $t3, $t4, $zero
+        0x0800_4004, // 27 j     loop               (0x80010010)
+        0x0000_0000, // 28 nop
     ];
 
     /// Cost of one uncached nop from KSEG1 with the reset-value bus delays:
@@ -1635,5 +1716,111 @@ mod tests {
         assert!(!c.execute(&mut sys, "scan filter changed", false).ok);
         assert!(c.execute(&mut sys, "scan start 4 exact 1", false).ok);
         assert!(!c.execute(&mut sys, "scan list -1", false).ok);
+    }
+
+    /// Sanity test for `PAD_LOGGER`, run before anything relies on it: a
+    /// held button changes the recorded wire word, and releasing it changes
+    /// it back.
+    #[test]
+    fn pad_logger_sees_a_held_button() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        load_program(&mut sys, &PAD_LOGGER);
+
+        assert!(c.execute(&mut sys, "input set CROSS", false).ok);
+        assert!(c.execute(&mut sys, "run 1", false).ok);
+        let r = c.execute(&mut sys, "peek 80100000 4", false);
+        assert!(r.payload.contains("ff bf 00 00"), "{}", r.payload);
+
+        assert!(c.execute(&mut sys, "input clear", false).ok);
+        assert!(c.execute(&mut sys, "run 1", false).ok);
+        let r = c.execute(&mut sys, "peek 80100000 4", false);
+        assert!(r.payload.contains("ff bf ff ff"), "{}", r.payload);
+    }
+
+    #[test]
+    fn seq_produces_distinct_button_edges() {
+        // Frame-form durations (the README's `seq CROSS:2 none:1 CROSS:2`)
+        // still produce the three distinct edges, but the exact vblank count
+        // below needs `v` durations, not frame counts: each VBlank is
+        // rescheduled from the overshot cycle of the one before it, so a
+        // `5 * CYCLES_PER_FRAME` budget can end before the fifth edge.
+        {
+            let (mut sys, mut c) = (sys(), Controller::default());
+            load_program(&mut sys, &PAD_LOGGER);
+
+            let r = c.execute(&mut sys, "seq CROSS:2 none:1 CROSS:2", false);
+            assert!(r.ok, "{}", r.payload);
+            let peek = c.execute(&mut sys, "peek 80100000 8", false);
+            assert!(
+                peek.payload.contains("ff bf ff ff ff bf 00 00"),
+                "{}",
+                peek.payload
+            );
+            assert_eq!(sys.sio().buttons, 0);
+        }
+
+        let (mut sys, mut c) = (sys(), Controller::default());
+        load_program(&mut sys, &PAD_LOGGER);
+        let r = c.execute(&mut sys, "seq CROSS:2v none:1v CROSS:2v", false);
+        assert!(r.ok, "{}", r.payload);
+        let peek = c.execute(&mut sys, "peek 80100000 8", false);
+        assert!(
+            peek.payload.contains("ff bf ff ff ff bf 00 00"),
+            "{}",
+            peek.payload
+        );
+        assert_eq!(sys.sio().buttons, 0);
+        assert_eq!(sys.vblanks(), 5);
+    }
+
+    #[test]
+    fn seq_restores_the_held_set() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        assert!(c.execute(&mut sys, "input set UP", false).ok);
+        let r = c.execute(&mut sys, "seq CROSS:1 none:1", false);
+        assert!(r.ok, "{}", r.payload);
+        assert_eq!(sys.sio().buttons, psx_core::sio::button::UP);
+        let r = c.execute(&mut sys, "state", false);
+        assert!(r.payload.contains("held=UP"), "{}", r.payload);
+    }
+
+    /// `seq` must set the held mask per segment, not OR it into the
+    /// existing held set. `run 1v` first lets the logger observe CROSS
+    /// held, so the `none` segment's release is a visible edge rather
+    /// than mistaken for the logger's own initial "released" state.
+    #[test]
+    fn seq_segments_replace_rather_than_or_the_held_set() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        load_program(&mut sys, &PAD_LOGGER);
+
+        assert!(c.execute(&mut sys, "input set CROSS", false).ok);
+        assert!(c.execute(&mut sys, "run 1v", false).ok);
+        let r = c.execute(&mut sys, "seq none:1v CROSS:1v", false);
+        assert!(r.ok, "{}", r.payload);
+
+        let peek = c.execute(&mut sys, "peek 80100000 12", false);
+        assert!(
+            peek.payload.contains("ff bf ff ff ff bf"),
+            "{}",
+            peek.payload
+        );
+        assert_eq!(sys.sio().buttons, psx_core::sio::button::CROSS);
+    }
+
+    #[test]
+    fn seq_rejects_bad_segments() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        let before = sys.cycles();
+        assert!(!c.execute(&mut sys, "seq", false).ok);
+        assert!(!c.execute(&mut sys, "seq CROSS", false).ok);
+        assert!(!c.execute(&mut sys, "seq NOPE:1", false).ok);
+        assert!(!c.execute(&mut sys, "seq CROSS:0v", false).ok);
+        assert_eq!(sys.cycles(), before);
+    }
+
+    #[test]
+    fn seq_is_refused_while_the_debugger_owns_execution() {
+        let (mut sys, mut c) = (sys(), Controller::default());
+        assert!(!c.execute(&mut sys, "seq CROSS:1", true).ok);
     }
 }
