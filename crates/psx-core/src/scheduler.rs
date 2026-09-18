@@ -8,7 +8,7 @@
 //! are never cancelled, so a superseded entry is a harmless early wake-up,
 //! and a re-arm at a past cycle simply means "again next instruction".
 //!
-//! VBlank is the only event scheduled so far.
+//! VBlank and the CD-ROM drive are scheduled so far.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -19,6 +19,8 @@ use std::collections::BinaryHeap;
 )]
 pub enum EventKind {
     VBlank,
+    /// CD-ROM: a queued response or the next sector under the head.
+    Cdrom,
 }
 
 #[derive(
@@ -119,5 +121,15 @@ mod tests {
         assert_eq!(s.pop_due(15), Some(EventKind::VBlank));
         assert_eq!(s.pop_due(25), Some(EventKind::VBlank));
         assert_eq!(s.pop_due(25), None);
+    }
+
+    #[test]
+    fn wake_by_keeps_kinds_apart() {
+        let mut s = Scheduler::new();
+        s.wake_by(10, EventKind::VBlank);
+        s.wake_by(10, EventKind::Cdrom);
+        assert_eq!(s.pop_due(10), Some(EventKind::VBlank));
+        assert_eq!(s.pop_due(10), Some(EventKind::Cdrom));
+        assert_eq!(s.pop_due(10), None);
     }
 }

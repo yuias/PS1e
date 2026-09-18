@@ -74,7 +74,7 @@ pub struct Ambient {
 /// Save-state file magic + format version. Bump the version on any change
 /// to a serialized struct.
 const STATE_MAGIC: &[u8; 4] = b"PS1E";
-const STATE_VERSION: u16 = 11;
+const STATE_VERSION: u16 = 12;
 
 /// Cheap content fingerprint (FNV-1a) to flag cross-BIOS state loads.
 fn bios_fingerprint(bios: &[u8]) -> u32 {
@@ -332,6 +332,7 @@ impl PsxSystem {
     /// game runs — resetting instead would defeat the point.
     pub fn open_shell(&mut self) {
         self.bus.cdrom.open_shell(self.cycles);
+        self.bus.arm_cdrom();
     }
 
     /// Close the lid, optionally over a new disc (`None` keeps the current
@@ -386,10 +387,18 @@ impl PsxSystem {
         // reschedules into the future. Component servicing happens after
         // the loop so a re-arm at a past deadline is seen by the next
         // instruction, not this one.
-        while let Some(event) = self.bus.scheduler.pop_due(self.cycles) {
+        let now = self.cycles;
+        let mut cdrom_due = false;
+        while let Some(event) = self.bus.scheduler.pop_due(now) {
             match event {
                 EventKind::VBlank => self.vblank(),
+                EventKind::Cdrom => cdrom_due = true,
             }
+        }
+        if cdrom_due {
+            let bus::Bus { cdrom, irq, .. } = &mut self.bus;
+            cdrom.service(now, irq);
+            self.bus.arm_cdrom();
         }
 
         let bus::Bus {
@@ -399,7 +408,6 @@ impl PsxSystem {
             irq,
             ..
         } = &mut self.bus;
-        cdrom.tick(self.cycles, irq);
         sio.tick(self.cycles, irq);
         // Route decoded XA audio into the SPU's CD input. Cap the SPU-side
         // level so backlog stays in the drive's buffer, where it throttles

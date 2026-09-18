@@ -10,7 +10,7 @@ use crate::cdrom::Cdrom;
 use crate::dma::Dma;
 use crate::gpu::Gpu;
 use crate::mdec::Mdec;
-use crate::scheduler::Scheduler;
+use crate::scheduler::{EventKind, Scheduler};
 use crate::sio::Sio;
 use crate::spu::Spu;
 use crate::timers::Timers;
@@ -203,6 +203,14 @@ impl Bus {
         };
         bus.refresh_access();
         bus
+    }
+
+    /// Wake the drive at its earliest deadline. Call after anything that can
+    /// move one: register writes, lid events, the drive's own service.
+    pub(crate) fn arm_cdrom(&mut self) {
+        if let Some(at) = self.cdrom.next_deadline() {
+            self.scheduler.wake_by(at, EventKind::Cdrom);
+        }
     }
 
     /// Strip the virtual-memory segment, yielding a physical address.
@@ -514,7 +522,10 @@ impl Bus {
                 } = self;
                 timers.write(p, val, *now, gpu.video_timing(), irq);
             }
-            0x1f80_1800..0x1f80_1804 => self.cdrom.write8(p, val as u8, self.now),
+            0x1f80_1800..0x1f80_1804 => {
+                self.cdrom.write8(p, val as u8, self.now);
+                self.arm_cdrom();
+            }
             0x1f80_1810 => self.gpu.gp0(val),
             0x1f80_1814 => self.gpu.gp1(val),
             0x1f80_1820 => self.mdec.write_data(val),

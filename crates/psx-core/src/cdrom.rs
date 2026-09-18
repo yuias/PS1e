@@ -393,8 +393,9 @@ impl Cdrom {
         }
     }
 
-    /// Called every instruction; front-of-queue checks are cheap.
-    pub fn tick(&mut self, now: u64, irq: &mut Irq) {
+    /// Serve a due response or sector. Called at the deadlines
+    /// [`Cdrom::next_deadline`] reports; safe to call when nothing is due.
+    pub fn service(&mut self, now: u64, irq: &mut Irq) {
         // Queued command responses (need the previous INT acknowledged)
         if self.int_flag & 7 == 0
             && let Some((deadline, _, _)) = self.pending.front()
@@ -410,6 +411,22 @@ impl Cdrom {
             self.process_sector(now, irq);
         } else if self.playing && now >= self.next_sector_at {
             self.process_cdda_sector(now, irq);
+        }
+    }
+
+    /// Earliest cycle at which [`Cdrom::service`] has something to do, if
+    /// any.
+    pub fn next_deadline(&self) -> Option<u64> {
+        // A queued response is only deliverable once the previous INT is
+        // acknowledged; the acknowledge write re-arms it.
+        let response = match self.pending.front() {
+            Some((at, _, _)) if self.int_flag & 7 == 0 => Some(*at),
+            _ => None,
+        };
+        let sector = (self.reading || self.playing).then_some(self.next_sector_at);
+        match (response, sector) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
         }
     }
 
@@ -1061,7 +1078,7 @@ mod tests {
     use super::*;
 
     fn acked(cd: &mut Cdrom, irq: &mut Irq, now: u64) -> (u8, Vec<u8>) {
-        cd.tick(now, irq);
+        cd.service(now, irq);
         let int = cd.int_flag & 7;
         let resp: Vec<u8> = cd.response.iter().copied().collect();
         cd.write8(3, 0x1f, now); // ack (index must be 1)
@@ -1316,7 +1333,7 @@ mod tests {
         let t = ACK_RUNNING + 2;
         acked(&mut cd, &mut irq, t);
         let t = t + cd.seek_cycles(0) + CPU_HZ / 150 + ACK_RUNNING;
-        cd.tick(t, &mut irq); // XA sector consumed silently
+        cd.service(t, &mut irq); // XA sector consumed silently
         cd.write8(0, 0, 0);
         cd.write8(1, 0x10, t); // GetlocL
         cd.write8(0, 1, 0);
@@ -1352,7 +1369,7 @@ mod tests {
         // Drain aggressively so back-pressure never holds
         for _ in 0..2_000_000 {
             now += 768;
-            cd.tick(now, &mut irq);
+            cd.service(now, &mut irq);
             cd.xa_out.clear();
             if cd.xa_sectors + 4 >= 8 {
                 break;
@@ -1390,7 +1407,7 @@ mod tests {
         // Mono 37800 sector -> 4704 output frames; 20 sectors ~ 2.1s audio
         for _ in 0..150_000_000u64 / 768 {
             now += 768;
-            cd.tick(now, &mut irq);
+            cd.service(now, &mut irq);
             if cd.xa_out.len() >= 2 {
                 cd.xa_out.pop_front();
                 cd.xa_out.pop_front();
@@ -1439,7 +1456,7 @@ mod tests {
         let mut first = None;
         for _ in 0..10_000_000u64 / 768 {
             now += 768;
-            cd.tick(now, &mut irq);
+            cd.service(now, &mut irq);
             if first.is_none() && !cd.xa_out.is_empty() {
                 first = cd.xa_out.front().copied();
                 break;
@@ -1470,7 +1487,7 @@ mod tests {
         let mut int4 = false;
         for _ in 0..200_000_000u64 / 768 {
             now += 768;
-            cd.tick(now, &mut irq);
+            cd.service(now, &mut irq);
             frames += cd.xa_out.len() as u64 / 2;
             cd.xa_out.clear();
             if cd.int_flag & 7 == 4 {
@@ -1541,5 +1558,28 @@ mod tests {
             "got {} frames",
             cd.xa_out.len() / 2
         );
+    }
+
+    #[test]
+    fn a_gated_sector_keeps_its_deadline_for_the_next_retry() {
+        let mut cd = Cdrom::new();
+        let mut irq = Irq::default();
+        cd.insert_disc(Disc::new(vec![0; RAW_SECTOR * 4]).unwrap());
+        cd.reading = true;
+        cd.next_sector_at = 500;
+        cd.int_flag = 3; // an INT still asserted
+        cd.service(600, &mut irq);
+        assert_eq!(cd.read_lba, 0, "gated by the unacknowledged INT");
+        assert_eq!(
+            cd.next_deadline(),
+            Some(500),
+            "the past deadline is the retry"
+        );
+        cd.write8(0, 1, 600);
+        cd.write8(3, 0x1f, 600); // ack (index must be 1)
+        cd.service(601, &mut irq);
+        assert_eq!(cd.int_flag & 7, 1);
+        assert_eq!(cd.read_lba, 1);
+        assert_eq!(cd.next_deadline(), Some(601 + CPU_HZ / 75));
     }
 }
