@@ -213,6 +213,14 @@ impl Bus {
         }
     }
 
+    /// Wake the SIO port at its pending /ACK deadline. Call after a byte
+    /// write, which is the only thing that can set it.
+    pub(crate) fn arm_sio(&mut self) {
+        if let Some(at) = self.sio.next_deadline() {
+            self.scheduler.wake_by(at, EventKind::Sio);
+        }
+    }
+
     /// Strip the virtual-memory segment, yielding a physical address.
     /// KSEG2 addresses are passed through (only CACHE_CONTROL lives there).
     pub fn mask_address(addr: u32) -> u32 {
@@ -476,7 +484,10 @@ impl Bus {
             0x1f80_1060 => self.ram_size = val,
             0x1f80_1070 => self.irq.stat &= val, // write-0-to-acknowledge
             0x1f80_1074 => self.irq.mask = val,
-            0x1f80_1040 => self.sio.write_data(val as u8, self.now),
+            0x1f80_1040 => {
+                self.sio.write_data(val as u8, self.now);
+                self.arm_sio();
+            }
             0x1f80_1044..0x1f80_1050 => {
                 if width == 4 && p == 0x1f80_1048 {
                     self.sio.write_reg16(0x8, val as u16);

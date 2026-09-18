@@ -77,8 +77,9 @@ impl Sio {
         }
     }
 
-    /// Fire a due /ACK interrupt. Called every instruction; cheap check.
-    pub fn tick(&mut self, now: u64, irq: &mut Irq) {
+    /// Fire a due /ACK interrupt. Called at the deadline [`Sio::next_deadline`]
+    /// reports; safe to call when nothing is due.
+    pub fn service(&mut self, now: u64, irq: &mut Irq) {
         if let Some(at) = self.ack_at
             && now >= at
         {
@@ -88,6 +89,11 @@ impl Sio {
                 irq.raise(7);
             }
         }
+    }
+
+    /// Earliest cycle at which [`Sio::service`] has something to do, if any.
+    pub fn next_deadline(&self) -> Option<u64> {
+        self.ack_at
     }
 
     pub fn read_data(&mut self) -> u8 {
@@ -218,7 +224,7 @@ mod tests {
         fn exchange(sio: &mut Sio, irq: &mut Irq, now: &mut u64, tx: u8) -> u8 {
             sio.write_data(tx, *now);
             *now += ACK_DELAY_CYCLES + 1;
-            sio.tick(*now, irq);
+            sio.service(*now, irq);
             sio.read_data()
         }
         assert_eq!(exchange(&mut sio, &mut irq, &mut now, 0x01), 0xff);

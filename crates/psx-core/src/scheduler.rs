@@ -8,7 +8,7 @@
 //! are never cancelled, so a superseded entry is a harmless early wake-up,
 //! and a re-arm at a past cycle simply means "again next instruction".
 //!
-//! VBlank and the CD-ROM drive are scheduled so far.
+//! VBlank, the CD-ROM drive and the SIO0 /ACK delay are scheduled so far.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -21,6 +21,8 @@ pub enum EventKind {
     VBlank,
     /// CD-ROM: a queued response or the next sector under the head.
     Cdrom,
+    /// SIO0: the delayed /ACK after a byte exchange.
+    Sio,
 }
 
 #[derive(

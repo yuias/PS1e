@@ -74,7 +74,7 @@ pub struct Ambient {
 /// Save-state file magic + format version. Bump the version on any change
 /// to a serialized struct.
 const STATE_MAGIC: &[u8; 4] = b"PS1E";
-const STATE_VERSION: u16 = 12;
+const STATE_VERSION: u16 = 13;
 
 /// Cheap content fingerprint (FNV-1a) to flag cross-BIOS state loads.
 fn bios_fingerprint(bios: &[u8]) -> u32 {
@@ -374,7 +374,8 @@ impl PsxSystem {
         self.bus.poke8(addr, val)
     }
 
-    /// Execute a single CPU instruction, then fire any due events.
+    /// Execute one instruction, serve the events it made due, then route CD
+    /// audio and generate SPU samples.
     pub fn step(&mut self) {
         self.observe_tty();
         self.bus.now = self.cycles;
@@ -389,10 +390,12 @@ impl PsxSystem {
         // instruction, not this one.
         let now = self.cycles;
         let mut cdrom_due = false;
+        let mut sio_due = false;
         while let Some(event) = self.bus.scheduler.pop_due(now) {
             match event {
                 EventKind::VBlank => self.vblank(),
                 EventKind::Cdrom => cdrom_due = true,
+                EventKind::Sio => sio_due = true,
             }
         }
         if cdrom_due {
@@ -400,15 +403,15 @@ impl PsxSystem {
             cdrom.service(now, irq);
             self.bus.arm_cdrom();
         }
+        if sio_due {
+            let bus::Bus { sio, irq, .. } = &mut self.bus;
+            sio.service(now, irq);
+            self.bus.arm_sio();
+        }
 
         let bus::Bus {
-            cdrom,
-            sio,
-            spu,
-            irq,
-            ..
+            cdrom, spu, irq, ..
         } = &mut self.bus;
-        sio.tick(self.cycles, irq);
         // Route decoded XA audio into the SPU's CD input. Cap the SPU-side
         // level so backlog stays in the drive's buffer, where it throttles
         // further sector reads (see cdrom back-pressure).
