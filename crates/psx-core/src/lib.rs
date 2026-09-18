@@ -606,6 +606,88 @@ mod tests {
     }
 
     #[test]
+    fn timer_irq_fires_on_its_cycle_without_register_access() {
+        let mut probe = PsxSystem::new(vec![0; bus::BIOS_SIZE]).unwrap();
+        probe.step();
+        let slack = probe.cycles();
+
+        // Arms timer 2 for an IRQ at target 0x8000 on the system clock, then
+        // spins with no further access to any timer register: the scheduler
+        // wake-up, not a register read, is what has to deliver the IRQ.
+        let program: [u32; 7] = [
+            0x3c08_1f80, // lui   $t0, 0x1f80
+            0x3409_8000, // ori   $t1, $zero, 0x8000
+            0xad09_1128, // sw    $t1, 0x1128($t0)   timer 2 target
+            0x3409_0010, // ori   $t1, $zero, 0x0010 IRQ on target
+            0xad09_1124, // sw    $t1, 0x1124($t0)   arms; pc 0x80010010
+            0x0800_4005, // loop: j loop             (0x80010014)
+            0x0000_0000, // nop (delay slot)
+        ];
+        let mut sys = PsxSystem::new(vec![0; bus::BIOS_SIZE]).unwrap();
+        for (i, word) in program.iter().enumerate() {
+            for (j, byte) in word.to_le_bytes().into_iter().enumerate() {
+                sys.poke8(0x8001_0000 + (i * 4 + j) as u32, byte);
+            }
+        }
+        sys.cpu.set_pc(0x8001_0000);
+
+        let mut armed = None;
+        let limit = 2 * CYCLES_PER_FRAME;
+        while armed.is_none() || sys.irq().stat & (1 << 6) == 0 {
+            if armed.is_none() && sys.cpu.pc == 0x8001_0010 {
+                armed = Some(sys.cycles());
+            }
+            sys.step();
+            assert!(sys.cycles() < limit, "timer 2 IRQ never fired");
+        }
+        let delta = sys.cycles() - armed.unwrap();
+        assert!(0x8001 <= delta && delta < 0x8001 + slack);
+    }
+
+    #[test]
+    fn repeat_mode_timer_raises_once_per_crossing_across_frames() {
+        // Timer 2 at system clock / 8, repeat mode, reset-on-target, target
+        // 0x1000: every crossing should raise an IRQ, not just one per
+        // vblank as the old per-instruction tick collapsed them into.
+        let program: [u32; 14] = [
+            0x3c08_1f80, // lui   $t0, 0x1f80
+            0x3409_1000, // ori   $t1, $zero, 0x1000
+            0xad09_1128, // sw    $t1, 0x1128($t0)   timer 2 target
+            0x340c_ffbf, // ori   $t4, $zero, ~0x40  I_STAT ack word
+            0x3409_0258, // ori   $t1, $zero, 0x0258 src=2, repeat, reset-on-target, IRQ on target
+            0xad09_1124, // sw    $t1, 0x1124($t0)   arms
+            0x8d0a_1070, // loop: lw $t2, 0x1070($t0) I_STAT
+            0x0000_0000, // nop
+            0x314a_0040, // andi  $t2, $t2, 0x40
+            0x1140_fffc, // beq   $t2, $zero, loop
+            0x0000_0000, // nop (delay slot)
+            0xad0c_1070, // sw    $t4, 0x1070($t0)   ack
+            0x1000_fff9, // beq   $zero, $zero, loop
+            0x0000_0000, // nop (delay slot)
+        ];
+        let mut sys = PsxSystem::new(vec![0; bus::BIOS_SIZE]).unwrap();
+        for (i, word) in program.iter().enumerate() {
+            for (j, byte) in word.to_le_bytes().into_iter().enumerate() {
+                sys.poke8(0x8001_0000 + (i * 4 + j) as u32, byte);
+            }
+        }
+        sys.cpu.set_pc(0x8001_0000);
+
+        let mut raises = 0u64;
+        let mut prev = sys.irq().stat;
+        let start_frames = sys.vblanks();
+        while sys.vblanks() < start_frames + 10 {
+            sys.step();
+            let stat = sys.irq().stat;
+            if stat & !prev & (1 << 6) != 0 {
+                raises += 1;
+            }
+            prev = stat;
+        }
+        assert!((165..=180).contains(&raises), "raises = {raises}");
+    }
+
+    #[test]
     fn tty_cursor_survives_load_and_reset() {
         let mut sys = system();
         let (first, pos) = sys.tty_since(0);
