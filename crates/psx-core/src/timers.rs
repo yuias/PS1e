@@ -1,11 +1,17 @@
 //! Root counters (timers 0..2).
 //!
 //! Lazy catch-up model: counters advance only when their registers are
-//! accessed or when the system forces a sync (once per vblank), computing
-//! elapsed ticks from the CPU cycle count. The blanking windows the
-//! synchronization modes gate on are derived analytically from the current
-//! [`VideoTiming`] and the cycle the field started at, rather than driven
-//! by GPU scanout events.
+//! accessed, the system forces a sync (once per vblank), or the scheduler
+//! wakes a timer at [`Timers::next_deadline`], computing elapsed ticks from
+//! the CPU cycle count. The blanking windows the synchronization modes gate
+//! on are derived analytically from the current [`VideoTiming`] and the
+//! cycle the field started at, rather than driven by GPU scanout events.
+//! `next_deadline` gives a conservative lower bound on the next IRQ-relevant
+//! crossing so a scheduled wake-up raises the IRQ at the end of the
+//! instruction that reaches it, even when the program never touches the
+//! timer's registers; the exact
+//! accounting still happens in [`Timers::catch_up`], which the wake-up
+//! calls.
 
 use crate::bus::Irq;
 use crate::gpu::VideoTiming;
@@ -126,8 +132,12 @@ impl Timers {
         }
     }
 
-    /// Advance all timers (called once per vblank so IRQs cannot lag by
-    /// more than a frame even without register accesses).
+    /// Advance all timers to close out the current field before
+    /// [`Timers::set_frame_origin`] moves the boundary blanking phase is
+    /// measured from, so `catch_up` applies each origin only to the interval
+    /// it was in effect for. Also the fallback for a crossing
+    /// [`Timers::next_deadline`] treats as unreachable (see
+    /// `EDGE_OVERSHOOT_MARGIN_CYCLES`).
     pub fn sync_all(&mut self, now: u64, timing: VideoTiming, irq: &mut Irq) {
         for idx in 0..3 {
             self.catch_up(idx, now, timing, irq);

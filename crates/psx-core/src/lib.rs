@@ -74,7 +74,7 @@ pub struct Ambient {
 /// Save-state file magic + format version. Bump the version on any change
 /// to a serialized struct.
 const STATE_MAGIC: &[u8; 4] = b"PS1E";
-const STATE_VERSION: u16 = 13;
+const STATE_VERSION: u16 = 14;
 
 /// Cheap content fingerprint (FNV-1a) to flag cross-BIOS state loads.
 fn bios_fingerprint(bios: &[u8]) -> u32 {
@@ -384,29 +384,10 @@ impl PsxSystem {
         // accesses accumulated (I-cache hits in cached segments are free)
         self.cycles += 1 + std::mem::take(&mut self.bus.penalty);
 
-        // Collect what came due; VBlank is handled inline because it always
-        // reschedules into the future. Component servicing happens after
-        // the loop so a re-arm at a past deadline is seen by the next
-        // instruction, not this one.
-        let now = self.cycles;
-        let mut cdrom_due = false;
-        let mut sio_due = false;
-        while let Some(event) = self.bus.scheduler.pop_due(now) {
-            match event {
-                EventKind::VBlank => self.vblank(),
-                EventKind::Cdrom => cdrom_due = true,
-                EventKind::Sio => sio_due = true,
-            }
-        }
-        if cdrom_due {
-            let bus::Bus { cdrom, irq, .. } = &mut self.bus;
-            cdrom.service(now, irq);
-            self.bus.arm_cdrom();
-        }
-        if sio_due {
-            let bus::Bus { sio, irq, .. } = &mut self.bus;
-            sio.service(now, irq);
-            self.bus.arm_sio();
+        // Most instructions have nothing due; keep the servicing out of line
+        // so this path stays small
+        if self.bus.scheduler.is_due(self.cycles) {
+            self.serve_events();
         }
 
         let bus::Bus {
@@ -425,6 +406,54 @@ impl PsxSystem {
         while self.cycles >= self.next_sample {
             spu.generate_sample(irq);
             self.next_sample += spu::CYCLES_PER_SAMPLE;
+        }
+    }
+
+    /// Serve every event due at the current cycle. Collects first, then
+    /// services each component once, so a re-arm at a past deadline is seen
+    /// by the next instruction rather than looping here.
+    #[inline(never)]
+    fn serve_events(&mut self) {
+        // VBlank is handled inline because it always reschedules into the
+        // future
+        let now = self.cycles;
+        let mut cdrom_due = false;
+        let mut sio_due = false;
+        let mut timers_due = [false; 3];
+        while let Some(event) = self.bus.scheduler.pop_due(now) {
+            match event {
+                EventKind::VBlank => self.vblank(),
+                EventKind::Cdrom => cdrom_due = true,
+                EventKind::Sio => sio_due = true,
+                EventKind::Timer(idx) => {
+                    // A corrupt state file can carry any index; ignore it
+                    // rather than panic mid-run
+                    if let Some(due) = timers_due.get_mut(idx as usize) {
+                        *due = true;
+                    }
+                }
+            }
+        }
+        if cdrom_due {
+            let bus::Bus { cdrom, irq, .. } = &mut self.bus;
+            cdrom.service(now, irq);
+            self.bus.arm_cdrom();
+        }
+        if sio_due {
+            let bus::Bus { sio, irq, .. } = &mut self.bus;
+            sio.service(now, irq);
+            self.bus.arm_sio();
+        }
+        // Deriving the video timing is not free; skip it when no timer is due
+        if timers_due.contains(&true) {
+            let timing = self.bus.gpu.video_timing();
+            for (idx, &due) in timers_due.iter().enumerate() {
+                if due {
+                    let bus::Bus { timers, irq, .. } = &mut self.bus;
+                    timers.catch_up(idx, now, timing, irq);
+                    self.bus.arm_timer(idx);
+                }
+            }
         }
     }
 
@@ -462,8 +491,9 @@ impl PsxSystem {
         if self.cheats_enabled {
             self.cheats.apply(&mut self.bus);
         }
-        // Keep lazily-synced components from lagging more than a frame,
-        // then hand them the field boundary they measure blanking from
+        // Close out the field under the old origin before the next line
+        // moves it: `catch_up` applies the origin in effect to its whole
+        // interval, so the boundary has to be crossed one field at a time.
         self.bus
             .timers
             .sync_all(self.cycles, timing, &mut self.bus.irq);

@@ -8,7 +8,9 @@
 //! are never cancelled, so a superseded entry is a harmless early wake-up,
 //! and a re-arm at a past cycle simply means "again next instruction".
 //!
-//! VBlank, the CD-ROM drive and the SIO0 /ACK delay are scheduled so far.
+//! Scheduled events: vblank, the CD-ROM drive, the SIO0 /ACK delay and the
+//! timers' target/overflow crossings. SPU sample generation stays a cycle
+//! counter checked every instruction.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -23,6 +25,8 @@ pub enum EventKind {
     Cdrom,
     /// SIO0: the delayed /ACK after a byte exchange.
     Sio,
+    /// Root counter `n`: its next target or overflow crossing.
+    Timer(u8),
 }
 
 #[derive(
@@ -70,6 +74,12 @@ impl Scheduler {
         if !already_covered {
             self.schedule(deadline, kind);
         }
+    }
+
+    /// Whether any event is due at or before `now`.
+    #[inline]
+    pub fn is_due(&self, now: u64) -> bool {
+        self.heap.peek().is_some_and(|Reverse(e)| e.deadline <= now)
     }
 
     /// Pop the next event if it is due at or before `now`.

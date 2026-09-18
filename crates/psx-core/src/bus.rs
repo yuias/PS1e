@@ -221,6 +221,25 @@ impl Bus {
         }
     }
 
+    /// Wake timer `idx` at its next IRQ-relevant crossing. Call after
+    /// anything that can move it: a counter/mode/target write, or the
+    /// timer's own service.
+    pub(crate) fn arm_timer(&mut self, idx: usize) {
+        let timing = self.gpu.video_timing();
+        if let Some(at) = self.timers.next_deadline(idx, timing) {
+            self.scheduler.wake_by(at, EventKind::Timer(idx as u8));
+        }
+    }
+
+    /// Wake all three timers. Call after a display-mode change: the video
+    /// timing feeds every timer's clock ratio and blanking periods, so a
+    /// new mode can move any of their estimates.
+    pub(crate) fn arm_timers(&mut self) {
+        for idx in 0..3 {
+            self.arm_timer(idx);
+        }
+    }
+
     /// Strip the virtual-memory segment, yielding a physical address.
     /// KSEG2 addresses are passed through (only CACHE_CONTROL lives there).
     pub fn mask_address(addr: u32) -> u32 {
@@ -532,13 +551,19 @@ impl Bus {
                     ..
                 } = self;
                 timers.write(p, val, *now, gpu.video_timing(), irq);
+                self.arm_timer(((p - 0x1f80_1100) >> 4) as usize);
             }
             0x1f80_1800..0x1f80_1804 => {
                 self.cdrom.write8(p, val as u8, self.now);
                 self.arm_cdrom();
             }
             0x1f80_1810 => self.gpu.gp0(val),
-            0x1f80_1814 => self.gpu.gp1(val),
+            0x1f80_1814 => {
+                self.gpu.gp1(val);
+                // A display-mode change can move any timer's dotclock or
+                // hblank/vblank ratio, so all three estimates may be stale.
+                self.arm_timers();
+            }
             0x1f80_1820 => self.mdec.write_data(val),
             0x1f80_1824 => self.mdec.write_control(val),
             0x1f80_1c00..0x1f80_1e00 => {
