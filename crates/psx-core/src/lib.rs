@@ -19,7 +19,7 @@ pub mod tty;
 
 use bus::Bus;
 use cpu::Cpu;
-use scheduler::{EventKind, Scheduler};
+use scheduler::EventKind;
 use tracing::info;
 use tty::Tty;
 
@@ -38,7 +38,6 @@ pub const SHELL_ENTRY: u32 = 0x8003_0000;
 pub struct PsxSystem {
     pub cpu: Cpu,
     bus: Bus,
-    scheduler: Scheduler,
     cycles: u64,
     next_sample: u64,
     #[serde(skip)]
@@ -75,7 +74,7 @@ pub struct Ambient {
 /// Save-state file magic + format version. Bump the version on any change
 /// to a serialized struct.
 const STATE_MAGIC: &[u8; 4] = b"PS1E";
-const STATE_VERSION: u16 = 10;
+const STATE_VERSION: u16 = 11;
 
 /// Cheap content fingerprint (FNV-1a) to flag cross-BIOS state loads.
 fn bios_fingerprint(bios: &[u8]) -> u32 {
@@ -89,13 +88,11 @@ impl PsxSystem {
         Ok(Self::with_bus(Bus::new(bios)?))
     }
 
-    fn with_bus(bus: Bus) -> Self {
-        let mut scheduler = Scheduler::new();
-        scheduler.schedule(CYCLES_PER_FRAME, EventKind::VBlank);
+    fn with_bus(mut bus: Bus) -> Self {
+        bus.scheduler.schedule(CYCLES_PER_FRAME, EventKind::VBlank);
         Self {
             cpu: Cpu::new(),
             bus,
-            scheduler,
             cycles: 0,
             next_sample: spu::CYCLES_PER_SAMPLE,
             tty: Tty::default(),
@@ -385,6 +382,16 @@ impl PsxSystem {
         // accesses accumulated (I-cache hits in cached segments are free)
         self.cycles += 1 + std::mem::take(&mut self.bus.penalty);
 
+        // Collect what came due; VBlank is handled inline because it always
+        // reschedules into the future. Component servicing happens after
+        // the loop so a re-arm at a past deadline is seen by the next
+        // instruction, not this one.
+        while let Some(event) = self.bus.scheduler.pop_due(self.cycles) {
+            match event {
+                EventKind::VBlank => self.vblank(),
+            }
+        }
+
         let bus::Bus {
             cdrom,
             sio,
@@ -407,10 +414,6 @@ impl PsxSystem {
         while self.cycles >= self.next_sample {
             spu.generate_sample(irq);
             self.next_sample += spu::CYCLES_PER_SAMPLE;
-        }
-
-        while let Some(event) = self.scheduler.pop_due(self.cycles) {
-            self.handle_event(event);
         }
     }
 
@@ -436,28 +439,27 @@ impl PsxSystem {
         self.bus.gpu.frame_count
     }
 
-    fn handle_event(&mut self, event: EventKind) {
-        if event == EventKind::VBlank {
-            let timing = self.bus.gpu.video_timing();
-            self.bus.irq.raise(0);
-            self.bus.gpu.vblank(self.cycles);
-            // The cartridge got control once a frame, and this is the only
-            // vblank edge in the tree. It has to be here rather than in the
-            // worker loop: the gdb server drives `step()` directly, so a
-            // frontend-side hook would quietly stop applying under the
-            // debugger.
-            if self.cheats_enabled {
-                self.cheats.apply(&mut self.bus);
-            }
-            // Keep lazily-synced components from lagging more than a frame,
-            // then hand them the field boundary they measure blanking from
-            self.bus
-                .timers
-                .sync_all(self.cycles, timing, &mut self.bus.irq);
-            self.bus.timers.set_frame_origin(self.cycles);
-            self.scheduler
-                .schedule(self.cycles + timing.cycles_per_frame(), EventKind::VBlank);
+    fn vblank(&mut self) {
+        let timing = self.bus.gpu.video_timing();
+        self.bus.irq.raise(0);
+        self.bus.gpu.vblank(self.cycles);
+        // The cartridge got control once a frame, and this is the only
+        // vblank edge in the tree. It has to be here rather than in the
+        // worker loop: the gdb server drives `step()` directly, so a
+        // frontend-side hook would quietly stop applying under the
+        // debugger.
+        if self.cheats_enabled {
+            self.cheats.apply(&mut self.bus);
         }
+        // Keep lazily-synced components from lagging more than a frame,
+        // then hand them the field boundary they measure blanking from
+        self.bus
+            .timers
+            .sync_all(self.cycles, timing, &mut self.bus.irq);
+        self.bus.timers.set_frame_origin(self.cycles);
+        self.bus
+            .scheduler
+            .schedule(self.cycles + timing.cycles_per_frame(), EventKind::VBlank);
     }
 
     /// Observation-only PC watch on the kernel entry points (A0h/B0h/C0h).

@@ -1,20 +1,24 @@
 //! Event-driven scheduler.
 //!
-//! Components register events at absolute cycle deadlines instead of being
-//! ticked every CPU cycle; the system runs the CPU until the earliest
-//! deadline, then fires due events. Accuracy comes from scheduling events at
-//! the exact cycle they occur on hardware.
+//! A heap of absolute cycle deadlines. `step()` pops every entry due at or
+//! before the current cycle count after each instruction, so an event fires
+//! at the end of the first instruction whose cycle count reaches its
+//! deadline. Components re-arm themselves from their own state after being
+//! serviced and after register writes that can move their deadline; entries
+//! are never cancelled, so a superseded entry is a harmless early wake-up,
+//! and a re-arm at a past cycle simply means "again next instruction".
+//!
+//! VBlank is the only event scheduled so far.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
+/// What a due event wakes up.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
 pub enum EventKind {
     VBlank,
-    TimerTarget(u8),
-    DmaComplete(u8),
 }
 
 #[derive(
@@ -40,6 +44,7 @@ impl Scheduler {
         }
     }
 
+    /// Push unconditionally (VBlank: exactly one entry is ever pending).
     pub fn schedule(&mut self, deadline: u64, kind: EventKind) {
         self.heap.push(Reverse(Entry {
             deadline,
@@ -49,9 +54,18 @@ impl Scheduler {
         self.seq += 1;
     }
 
-    /// Cycle of the earliest pending event, if any.
-    pub fn next_deadline(&self) -> Option<u64> {
-        self.heap.peek().map(|Reverse(e)| e.deadline)
+    /// Make sure `kind` fires no later than `deadline`: push unless an entry
+    /// of the same kind is already pending at or before it. Components whose
+    /// handler recomputes their own deadline use this from register writes
+    /// without growing the heap on every access.
+    pub fn wake_by(&mut self, deadline: u64, kind: EventKind) {
+        let already_covered = self
+            .heap
+            .iter()
+            .any(|Reverse(e)| e.kind == kind && e.deadline <= deadline);
+        if !already_covered {
+            self.schedule(deadline, kind);
+        }
     }
 
     /// Pop the next event if it is due at or before `now`.
@@ -80,10 +94,30 @@ mod tests {
     fn fires_in_deadline_order() {
         let mut s = Scheduler::new();
         s.schedule(20, EventKind::VBlank);
-        s.schedule(10, EventKind::TimerTarget(1));
-        assert_eq!(s.next_deadline(), Some(10));
-        assert_eq!(s.pop_due(15), Some(EventKind::TimerTarget(1)));
-        assert_eq!(s.pop_due(15), None); // vblank not due yet
+        s.schedule(10, EventKind::VBlank);
+        assert_eq!(s.pop_due(5), None); // nothing due yet
+        assert_eq!(s.pop_due(15), Some(EventKind::VBlank)); // the 10 entry
+        assert_eq!(s.pop_due(15), None); // the 20 entry not due yet
         assert_eq!(s.pop_due(25), Some(EventKind::VBlank));
+        assert_eq!(s.pop_due(25), None);
+    }
+
+    #[test]
+    fn wake_by_skips_when_an_earlier_entry_is_pending() {
+        let mut s = Scheduler::new();
+        s.wake_by(10, EventKind::VBlank);
+        s.wake_by(20, EventKind::VBlank);
+        assert_eq!(s.pop_due(30), Some(EventKind::VBlank));
+        assert_eq!(s.pop_due(30), None);
+    }
+
+    #[test]
+    fn wake_by_adds_an_earlier_entry() {
+        let mut s = Scheduler::new();
+        s.wake_by(20, EventKind::VBlank);
+        s.wake_by(10, EventKind::VBlank);
+        assert_eq!(s.pop_due(15), Some(EventKind::VBlank));
+        assert_eq!(s.pop_due(25), Some(EventKind::VBlank));
+        assert_eq!(s.pop_due(25), None);
     }
 }

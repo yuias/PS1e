@@ -10,6 +10,7 @@ use crate::cdrom::Cdrom;
 use crate::dma::Dma;
 use crate::gpu::Gpu;
 use crate::mdec::Mdec;
+use crate::scheduler::Scheduler;
 use crate::sio::Sio;
 use crate::spu::Spu;
 use crate::timers::Timers;
@@ -139,6 +140,9 @@ pub struct Bus {
     pub sio: Sio,
     pub spu: Spu,
     pub mdec: Mdec,
+    /// Deadline heap. Lives here, not on `PsxSystem`, so that register
+    /// writes can re-arm the component they touch.
+    pub(crate) scheduler: Scheduler,
     /// Current CPU cycle, updated by the system before each step; used by
     /// components that catch up lazily (timers).
     pub(crate) now: u64,
@@ -188,6 +192,7 @@ impl Bus {
             sio: Sio::new(),
             spu: Spu::new(),
             mdec: Mdec::new(),
+            scheduler: Scheduler::new(),
             now: 0,
             penalty: 0,
             mem_ctrl,
